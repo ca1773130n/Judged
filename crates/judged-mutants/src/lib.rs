@@ -1,0 +1,21 @@
+//! E2 — mutation injection, the precision eval nobody runs (§10).
+//!
+//! §10 E2 says build this **first**, before any analyzer integration. The
+//! method comes from the Android static-analysis literature (muSE / Bonett et
+//! al., ACM TOSEM 3439802): inject known-live artifacts reachable through one
+//! mechanism each, and treat any "dead" verdict on one as a hard failure.
+//!
+//! The consequence is pre-committed and it is not a threshold to tune. §10 E2:
+//! "if no signal combination clears all 14 at zero false removals, the product
+//! is report+quarantine and the auto-act tier must be DELETED from the design
+//! rather than tuned." This crate exists to make that question answerable in
+//! weeks rather than after an incident.
+
+pub mod fixtures;
+pub mod mutant;
+pub mod runner;
+pub mod sut;
+
+pub use mutant::{Ecosystem, GroundTruth, Mutant};
+pub use runner::{run_suite, MutantReport, SuiteReport};
+pub use sut::{NaiveSut, RefusingSut, Sut, SutVerdict};

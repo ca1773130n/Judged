@@ -1,0 +1,121 @@
+# The gate.
+#
+# Six checks in one job, in the order that fails fastest. Four of them are the
+# usual ones — format, lint, build, test. The last two are the point: they run
+# `judged mutants` against both controls and assert the exit code each one is
+# required to produce, because §9.8 is blunt about what a gate that cannot fail
+# is worth. `refusing` must exit 0 and `naive` must exit 1, and the second of
+# those is the assertion that matters. A naive cleaner passing the E2 suite
+# would mean the fixtures had gone soft, and every green result the suite has
+# ever produced would be unsupported — a state CI must not be able to reach
+# quietly.
+#
+# There is deliberately no job that installs Vulture. `judged mutants --sut
+# vulture` exists and works, but pinning a Python analyzer's version, its
+# transitive parser behaviour and its exit codes reproducibly is work that has
+# not been done yet, and an unpinned `pip install vulture` in CI is a build that
+# turns red on somebody else's release with nothing in this repository to fix.
+# A red build nobody can fix is worse than a path CI does not cover: it gets
+# muted, and then the checks beside it get muted too. The vulture numbers are
+# produced by running the command by hand and recording what it said; when they
+# are reproducible enough to gate on, they get a job here.
+
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+
+# A superseded run has nothing to say. Cancel it rather than paying for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  gate:
+    name: build, lint, test, and both headline results
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain rust-toolchain.toml pins
+        # No version is named here on purpose. rust-toolchain.toml already pins
+        # the channel and the rustfmt/clippy components, and rustup installs
+        # what it names on first use; repeating "1.94" in this file would create
+        # a second place to update and, in between, a green build against a
+        # compiler nobody chose. `rustup show` is only here to make that install
+        # a named step with its own log line.
+        run: |
+          rustup show
+          cargo --version
+          rustc --version
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          # Keyed on the lockfile and the toolchain, because those are the two
+          # things that invalidate compiled artifacts. The restore-keys line
+          # lets a run that changed one dependency start from the previous
+          # build rather than from nothing.
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: test
+        # `git` is on the runner already, which the suite needs: nothing is
+        # mocked in the two places a mock would encode our beliefs rather than
+        # reality, so the git tests shell out and the mutant fixtures write real
+        # files to real temporary directories.
+        run: cargo test --workspace --locked
+
+      - name: E2 headline — the refusing control must clear the gate (exit 0)
+        run: |
+          cargo run --quiet --locked -p judged-cli -- mutants --sut refusing
+          echo "refusing exited $? as required"
+
+      - name: E2 headline — the naive control must FAIL the gate (exit 1)
+        # The assertion is that this command FAILS, and that it fails with 1
+        # rather than with 2. Exit 1 is "false removals were found", which is
+        # the result this suite exists to produce against a bad cleaner. Exit 2
+        # is "the suite refused to run", which would also be non-zero and would
+        # also look like a working gate in a naive `if ! cmd` check, while
+        # actually meaning nothing was graded at all (§9.2's contract: 0 clean,
+        # 1 findings, 2 abnormal termination).
+        run: |
+          set +e
+          cargo run --quiet --locked -p judged-cli -- mutants --sut naive
+          code=$?
+          set -e
+          if [ "$code" -ne 1 ]; then
+            echo "::error title=E2 positive control::\`judged mutants --sut naive\` exited $code, expected 1."
+            if [ "$code" -eq 0 ]; then
+              echo "::error::A deliberately bad cleaner just passed the E2 suite. The fixtures have gone soft, and every green result this suite has produced is unsupported. Do not fix this by relaxing the gate."
+            fi
+            exit 1
+          fi
+          echo "naive exited 1 as required"

@@ -48,8 +48,7 @@ const LIVE_PTH: &str = "vendor/site-packages/zzz_ledger_bootstrap.pth";
 const LIVE_PYTHON_HOOK: &str = "vendor/site-packages/ledger_startup_hook.py";
 
 /// The broadcast receiver named only by the Android manifest.
-const LIVE_RECEIVER: &str =
-    "android/app/src/main/java/com/example/ledger/ota/OtaUpdateReceiver.kt";
+const LIVE_RECEIVER: &str = "android/app/src/main/java/com/example/ledger/ota/OtaUpdateReceiver.kt";
 
 /// The manifest that names it.
 const MECHANISM_ANDROID: &str = "android/app/src/main/AndroidManifest.xml";

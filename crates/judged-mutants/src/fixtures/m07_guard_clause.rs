@@ -50,6 +50,9 @@ const MECHANISM: &str = "src/lib.rs";
 /// The parent-link literal, as it appears in source. It must exist in exactly
 /// one place in the fixture — inside the guard — because a test input
 /// containing it would make the guard observable and dissolve the mutant.
+///
+/// `cfg(test)`, because it names an invariant rather than any file's contents.
+#[cfg(test)]
 const PARENT_LINK_LITERAL: &str = "\"..\"";
 
 /// Files written into the mutant repository, as `(repo-relative path, body)`.
@@ -181,6 +184,7 @@ impl GuardClause {
     /// `/bin` while its own test suite ran. A fixture modelling that shape must
     /// be incapable of touching a filesystem, and "incapable" has to be checked
     /// rather than intended.
+    #[cfg(test)]
     const FORBIDDEN_EFFECTS: [&'static str; 5] =
         ["std::fs", "remove_file", "remove_dir", "read_dir", "unlink"];
 }
@@ -198,8 +202,32 @@ impl Mutant for GuardClause {
     fn research_ref(&self) -> &str {
         "§10 E2 class 7"
     }
-    fn materialize(&self, _dir: &Path) -> Result<GroundTruth> {
-        todo!("m07: guard clause whose removal changes nothing observable")
+    fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
+        let repo = Repo::init(dir)?;
+        for (relative, body) in FILES {
+            let path = repo.root().join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|source| Error::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            std::fs::write(&path, body).map_err(|source| Error::Io { path, source })?;
+        }
+        repo.add_all()?;
+        repo.commit("m07: walk planner whose dot-entry guard no test can observe")?;
+
+        Ok(GroundTruth {
+            // Repo-relative, because the runner keys ground truth and SUT
+            // claims on the same repo-relative rendering and the fixture's own
+            // canonicalized root is not the path the runner holds.
+            live_paths: vec![PathBuf::from(LIVE)],
+            // The file is live because the symbol in it is. §3.4 Issue 3 is
+            // about the symbol: the whole point is that deleting one `if` is
+            // as catastrophic and as invisible as deleting the module.
+            live_symbols: vec![LIVE_SYMBOL.to_string()],
+            decoy_dead_paths: Self::DECOYS.iter().copied().map(PathBuf::from).collect(),
+        })
     }
 }
 
@@ -230,7 +258,9 @@ mod tests {
 
     fn materialize_into_tempdir() -> (tempfile::TempDir, GroundTruth) {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let truth = GuardClause.materialize(dir.path()).expect("m07 materializes");
+        let truth = GuardClause
+            .materialize(dir.path())
+            .expect("m07 materializes");
         (dir, truth)
     }
 
@@ -272,6 +302,38 @@ mod tests {
             files_mentioning(dir.path(), LIVE_SYMBOL),
             vec![LIVE.to_string(), MECHANISM.to_string()],
             "only the definition and the one traversal may name the guard"
+        );
+    }
+
+    #[test]
+    fn m07_the_guard_module_is_never_named_by_its_filename() {
+        let (dir, _truth) = materialize_into_tempdir();
+        let live = Path::new(LIVE);
+        let basename = live
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("LIVE has a UTF-8 basename");
+        let stem = live
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("LIVE has a UTF-8 stem");
+
+        // Rust links a module with `mod dot_entry;`, never with a filename, so
+        // the basename occurs nowhere in the repository. A cleaner that greps
+        // for `dot_entry.rs` before deleting it finds nothing to stop it —
+        // which is the point of the class, and has to be true for the mutant
+        // to be measuring anything.
+        assert!(
+            files_mentioning(dir.path(), basename).is_empty(),
+            "{basename} must be spelled nowhere; the only link is a `mod` declaration"
+        );
+
+        // One mechanism, per §10 E2: exactly one file names the module. If a
+        // second did, a rescue here would not tell us which signal did it.
+        assert_eq!(
+            files_mentioning(dir.path(), stem),
+            vec![MECHANISM.to_string()],
+            "only the traversal may name the guard's module"
         );
     }
 

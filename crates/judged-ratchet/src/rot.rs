@@ -106,7 +106,15 @@ fn referent_is_gone(repo: &Repo, uri: &str) -> bool {
 /// both would compare as far-future under a lexicographic rule — silently
 /// granting a longer amnesty than the author asked for. §12: fail loudly. The
 /// raw text is carried into the report so the author can see what they wrote.
-fn has_expired(expires: &str, now: &str) -> bool {
+/// Public because `--update` must ask the same question this module asks.
+///
+/// When it was private the CLI reimplemented it as `expires <= now`, which
+/// silently disagrees on the case this function exists for: an unevaluable
+/// date. `"next quarter" <= "2026-07-31"` is false, so the copy read a
+/// deadline nobody can evaluate as *not yet due* and carried it forward
+/// forever — laundering it into the permanent amnesty list §9.14 names as the
+/// ratchet's known failure mode. One definition, one answer.
+pub fn has_expired(expires: &str, now: &str) -> bool {
     !is_iso_dated(expires) || expires <= now
 }
 

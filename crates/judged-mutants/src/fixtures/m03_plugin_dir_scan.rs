@@ -200,7 +200,10 @@ mod tests {
     #[test]
     fn materializes_a_real_git_repo_with_one_commit() {
         let (_dir, repo, _truth) = materialize();
-        assert!(repo.root().join(".git").is_dir(), "expected a git directory");
+        assert!(
+            repo.root().join(".git").is_dir(),
+            "expected a git directory"
+        );
         assert!(
             repo.is_tracked(Path::new("pyproject.toml"))
                 .expect("query the index"),
@@ -211,7 +214,10 @@ mod tests {
     #[test]
     fn ground_truth_paths_all_exist_on_disk() {
         let (_dir, repo, truth) = materialize();
-        assert!(!truth.live_paths.is_empty(), "m03's live artifact is a file");
+        assert!(
+            !truth.live_paths.is_empty(),
+            "m03's live artifact is a file"
+        );
         assert!(
             !truth.decoy_dead_paths.is_empty(),
             "without a decoy, a tool that claims nothing passes m03 for free"

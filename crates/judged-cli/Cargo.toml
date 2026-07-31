@@ -15,3 +15,9 @@ path = "src/main.rs"
 judged-core = { workspace = true }
 judged-ratchet = { workspace = true }
 judged-mutants = { workspace = true }
+
+# The CLI is the process boundary, so it is where SARIF logs stop being bytes on
+# disk and become `judged_core::sarif` types, and where the `--json` report stops
+# being types and becomes bytes again. `judged-core` models the SARIF subset but
+# ships no reader, so the reader lives here.
+serde_json = { workspace = true }

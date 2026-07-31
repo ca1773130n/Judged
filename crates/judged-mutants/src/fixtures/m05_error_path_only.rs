@@ -47,11 +47,6 @@ const LIVE_SYMBOL: &str = "quarantine_partial_write";
 /// only from inside `except OSError`.
 const MECHANISM: &str = "ledger/writer.py";
 
-/// The line in [`MECHANISM`] that opens the failure branch. Every reference to
-/// the live symbol must appear after it; the test asserts exactly that, so the
-/// fixture cannot decay into an ordinary top-level import.
-const FAILURE_BRANCH: &str = "except OSError as cause:";
-
 /// Files written into the mutant repository, as `(repo-relative path, body)`.
 const FILES: &[(&str, &str)] = &[
     (
@@ -216,6 +211,11 @@ mod tests {
     use super::*;
     use judged_core::git::Repo;
     use std::process::Command;
+
+    /// The line in [`MECHANISM`] that opens the failure branch. Every reference
+    /// to the live symbol must appear after it; the test below asserts exactly
+    /// that, so the fixture cannot decay into an ordinary top-level import.
+    const FAILURE_BRANCH: &str = "except OSError as cause:";
 
     /// Every file in `root` whose bytes contain `needle`, repo-relative.
     ///

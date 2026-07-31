@@ -23,7 +23,8 @@
 
 use std::path::{Path, PathBuf};
 
-use judged_core::Result;
+use judged_core::git::Repo;
+use judged_core::{Error, Result};
 
 use crate::mutant::{Ecosystem, GroundTruth, Mutant};
 
@@ -45,6 +46,9 @@ const MECHANISM: &str = "README.md";
 const DOC_INCLUDE_SITE: &str = "src/lib.rs";
 
 /// The include that makes the README a doctest rather than prose.
+///
+/// `cfg(test)`, because it names an invariant rather than any file's contents.
+#[cfg(test)]
 const DOC_INCLUDE: &str = "include_str!(\"../README.md\")";
 
 /// The CI step that runs it. Without this the block is prose and the mutant
@@ -52,7 +56,143 @@ const DOC_INCLUDE: &str = "include_str!(\"../README.md\")";
 const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
 
 /// The command in [`CI_WORKFLOW`] that executes the README block.
+///
+/// `cfg(test)`, because it names an invariant rather than any file's contents.
+#[cfg(test)]
 const CI_DOCTEST_STEP: &str = "cargo test --doc";
+
+/// Files written into the mutant repository, as `(repo-relative path, body)`.
+const FILES: &[(&str, &str)] = &[
+    (
+        "Cargo.toml",
+        r#"[package]
+name = "m09-badgekit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+"#,
+    ),
+    (
+        DOC_INCLUDE_SITE,
+        r#"//! The crate root. The attribute below is what turns the README from
+//! prose into a compiled, executed test -- and it is the only line in the
+//! repository that connects the two files.
+#![doc = include_str!("../README.md")]
+
+pub mod badge;
+pub mod coverage;
+"#,
+    ),
+    (
+        "src/main.rs",
+        r#"//! The binary. It computes a percentage and prints it; it renders nothing.
+//! `cargo build` therefore does not need the renderer, and neither does any
+//! call graph rooted at `main` -- which is exactly the answer a reachability
+//! pass gives, and it is wrong.
+
+fn main() {
+    println!("{}", m09_badgekit::coverage::percent(41, 50));
+}
+"#,
+    ),
+    (
+        "src/coverage.rs",
+        r#"//! The routinely-exercised sibling, with the only unit test in the crate.
+//! Its presence is what makes the asymmetry legible: this module reads as hot,
+//! the renderer reads as dead, and the difference between them lives in a
+//! Markdown file.
+
+/// Covered lines as a whole percentage.
+pub fn percent(covered: usize, total: usize) -> u8 {
+    if total == 0 {
+        return 0;
+    }
+    ((covered * 100) / total) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rounds_down() {
+        assert_eq!(super::percent(41, 50), 82);
+    }
+}
+"#,
+    ),
+    // THE LIVE ARTIFACT.
+    (
+        LIVE,
+        r#"//! LIVE. Called from one place in the repository, and that place is
+//! Markdown. `pub` here is not an API claim: the package is `publish = false`,
+//! and the item is public only because a doctest compiles as a separate crate
+//! and can reach nothing else.
+
+/// Render one `label: value` status badge.
+pub fn render_badge(label: &str, value: &str) -> String {
+    format!("<svg role=\"img\"><title>{label}: {value}</title></svg>")
+}
+"#,
+    ),
+    // THE MECHANISM. The fenced block below is a doctest, not an illustration.
+    (
+        MECHANISM,
+        r#"# badgekit
+
+Status badges for the dashboards.
+
+```rust
+use m09_badgekit::badge::render_badge;
+
+let svg = render_badge("coverage", "82%");
+assert!(svg.contains("82%"));
+```
+
+The example above is compiled and executed as a documentation test on every
+push; see the workflow under `.github/workflows/`.
+"#,
+    ),
+    (
+        CI_WORKFLOW,
+        r#"name: ci
+
+on: [push]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The unit tests never touch the renderer. The second step is the only
+      # job anywhere that executes it, and no dependency-level tool models it:
+      # §4.1 records that cargo-udeps cannot see doc-tests at all.
+      - run: cargo test --lib
+      - run: cargo test --doc
+"#,
+    ),
+    (
+        "src/orphan_sparkline.rs",
+        r#"//! DEAD DECOY. The sparkline was dropped when the dashboard moved to
+//! server-rendered charts; no `mod` declares this file, so it is not even
+//! compiled, and nothing names it.
+
+pub fn spark(values: &[u8]) -> String {
+    values.iter().map(|v| char::from(b'0' + v % 10)).collect()
+}
+"#,
+    ),
+    (
+        "src/unused_palette.rs",
+        // `r##` because the body contains `"#`, which would close an `r#`
+        // string on the first colour literal.
+        r##"//! DEAD DECOY. A second one on purpose: decoy recall is a rate, and one
+//! decoy cannot tell a tool that reasoned from a tool that guessed once.
+
+pub const BRAND: [&str; 3] = ["#4c1", "#dfb317", "#e05d44"];
+"##,
+    ),
+];
 
 impl ReadmeExecutedBlock {
     /// Repo-relative paths of the genuinely-dead files planted here. Neither
@@ -73,8 +213,29 @@ impl Mutant for ReadmeExecutedBlock {
     fn research_ref(&self) -> &str {
         "§10 E2 class 9"
     }
-    fn materialize(&self, _dir: &Path) -> Result<GroundTruth> {
-        todo!("m09: doctest-style README block wired into the CI job")
+    fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
+        let repo = Repo::init(dir)?;
+        for (relative, body) in FILES {
+            let path = repo.root().join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|source| Error::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            std::fs::write(&path, body).map_err(|source| Error::Io { path, source })?;
+        }
+        repo.add_all()?;
+        repo.commit("m09: badgekit whose renderer is called only from the README")?;
+
+        Ok(GroundTruth {
+            // Repo-relative, because the runner keys ground truth and SUT
+            // claims on the same repo-relative rendering and the fixture's own
+            // canonicalized root is not the path the runner holds.
+            live_paths: vec![PathBuf::from(LIVE)],
+            live_symbols: vec![LIVE_SYMBOL.to_string()],
+            decoy_dead_paths: Self::DECOYS.iter().copied().map(PathBuf::from).collect(),
+        })
     }
 }
 
@@ -130,7 +291,10 @@ mod tests {
 
         assert_eq!(truth.live_paths, vec![Path::new(LIVE).to_path_buf()]);
         assert_eq!(truth.live_symbols, vec![LIVE_SYMBOL.to_string()]);
-        assert_eq!(truth.decoy_dead_paths.len(), ReadmeExecutedBlock::DECOYS.len());
+        assert_eq!(
+            truth.decoy_dead_paths.len(),
+            ReadmeExecutedBlock::DECOYS.len()
+        );
 
         for path in truth.live_paths.iter().chain(&truth.decoy_dead_paths) {
             assert!(
@@ -152,6 +316,25 @@ mod tests {
             files_mentioning(dir.path(), LIVE_SYMBOL),
             vec![MECHANISM.to_string(), LIVE.to_string()],
             "only the README example and the definition may name the API"
+        );
+    }
+
+    #[test]
+    fn m09_the_documented_module_is_never_named_by_its_filename() {
+        let (dir, _truth) = materialize_into_tempdir();
+        let live = Path::new(LIVE);
+        let basename = live
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("LIVE has a UTF-8 basename");
+
+        // The README rescues the *symbol*, never the path: a Markdown example
+        // spells `badge::render_badge`, not `src/badge.rs`. So a cleaner that
+        // greps for the filename before deleting the file finds nothing, and
+        // the mutant is hard for the reason it claims to be.
+        assert!(
+            files_mentioning(dir.path(), basename).is_empty(),
+            "{basename} must be spelled nowhere; the README names the item, not the file"
         );
     }
 

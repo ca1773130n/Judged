@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/judged-core",
+    "crates/judged-ratchet",
+    "crates/judged-mutants",
+    "crates/judged-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ca1773130n/judged"
+
+[workspace.dependencies]
+# Internal crates, so a sibling can depend on another without restating a version.
+judged-core = { path = "crates/judged-core" }
+judged-ratchet = { path = "crates/judged-ratchet" }
+judged-mutants = { path = "crates/judged-mutants" }
+
+# SARIF 2.1.0 is the whole integration contract (§9.2): adapters emit it, the
+# orchestrator only ever reads it. Everything else we persist (the ratchet
+# baseline, the tombstone index) is JSON or JSONL, so serde + serde_json are the
+# only serialization dependencies the workspace needs.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Fingerprints are content-derived SHA-256 over a canonical input (§9.2:
+# "fingerprints must be content-derived ... never line-based"). sha2 + hex give
+# exactly the `judged/v1:<64 hex>` shape and nothing more.
+sha2 = "0.10"
+hex = "0.4"
+
+# One error type per fallible boundary, spelled out rather than stringly typed.
+thiserror = "2"
+
+# The E2 mutant suite (§10) materializes each mutant into a throwaway repo.
+tempfile = "3"

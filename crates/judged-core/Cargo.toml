@@ -1,0 +1,15 @@
+[package]
+name = "judged-core"
+description = "Shared vocabulary for Judged: the SARIF 2.1.0 subset, content-derived fingerprints, and git recoverability classification."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "judged-ratchet"
+description = "Ship the ratchet before the reaper: baseline today's findings, fail CI only on new ones."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+judged-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

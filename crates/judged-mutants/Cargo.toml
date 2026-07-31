@@ -1,0 +1,12 @@
+[package]
+name = "judged-mutants"
+description = "The E2 mutation-injection suite: 19 known-live mutants a cleaner must never call dead."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+judged-core = { workspace = true }
+tempfile = { workspace = true }

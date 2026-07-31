@@ -1,0 +1,17 @@
+[package]
+name = "judged-cli"
+description = "Command-line entry point for Judged."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "judged"
+path = "src/main.rs"
+
+[dependencies]
+judged-core = { workspace = true }
+judged-ratchet = { workspace = true }
+judged-mutants = { workspace = true }

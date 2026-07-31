@@ -11,6 +11,7 @@
 //! rather than tuned." This crate exists to make that question answerable in
 //! weeks rather than after an incident.
 
+pub mod adapters;
 pub mod fixtures;
 pub mod mutant;
 pub mod runner;

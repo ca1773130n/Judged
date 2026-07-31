@@ -77,7 +77,7 @@ pub struct RatchetArgs {
     pub expected_targets: Option<usize>,
 }
 
-/// `judged mutants [--sut naive|refusing] [--json]`.
+/// `judged mutants [--sut naive|refusing|vulture|command] [--json] [-- <argv>]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutantsArgs {
     /// Which system under test to grade.
@@ -86,24 +86,64 @@ pub struct MutantsArgs {
     pub json: bool,
 }
 
-/// The two systems under test this build ships.
+/// The systems under test this build can grade.
 ///
-/// Both are controls, and neither is a cleaner. There is no third option yet
-/// because there is no cleaner yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The first two are controls we wrote ourselves, which is exactly what makes
+/// them insufficient: a suite that has only ever graded its own controls bounds
+/// the harness and says nothing about any real tool. The other two are how a
+/// real analyzer gets in — [`SutChoice::Vulture`] by name because §4.1 already
+/// has published numbers to compare against, and [`SutChoice::Command`] for
+/// everything else, so that adding a tool does not require a code change.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SutChoice {
     /// §7.5's heuristic, faithfully reproduced. The suite's positive control.
     Naive,
     /// Claims nothing is ever dead. The negative control.
     Refusing,
+    /// Vulture, invoked at its own defaults (§4.1).
+    Vulture,
+    /// An arbitrary analyzer, given after `--`. Never empty.
+    Command(Vec<String>),
 }
 
+/// The argv `--sut vulture` runs.
+///
+/// Vulture's **own** defaults, deliberately: no `--min-confidence`, no
+/// `--sort-by-size`, nothing tuned. §4.1's measurement (44 true positives
+/// against 644 false positives across 9 repos) is a measurement of vulture as
+/// people actually run it, and a score obtained by first finding a threshold
+/// that suits our fixtures would not be comparable to it — or to anything.
+/// Tuning is available, and it is spelled
+/// `--sut command -- vulture --min-confidence 100`, which is honest about being
+/// a different experiment.
+///
+/// No path argument: [`judged_mutants::sut::CommandSut`] appends the fixture
+/// repository as the last argument and runs from inside it, so adding `.` here
+/// would hand vulture the same directory twice.
+const VULTURE_ARGV: &[&str] = &["vulture"];
+
 impl SutChoice {
-    /// The spelling accepted on the command line.
-    pub fn as_str(self) -> &'static str {
+    /// How the report names this SUT.
+    ///
+    /// A `String` rather than a `&'static str` because the escape hatch's name
+    /// is the command line it was given. Printing `command` there would produce
+    /// reports that cannot be told apart, which for an evidence artifact is the
+    /// same as producing no report.
+    pub fn label(&self) -> String {
         match self {
-            SutChoice::Naive => "naive",
-            SutChoice::Refusing => "refusing",
+            SutChoice::Naive => "naive".to_string(),
+            SutChoice::Refusing => "refusing".to_string(),
+            SutChoice::Vulture => "vulture".to_string(),
+            SutChoice::Command(argv) => argv.join(" "),
+        }
+    }
+
+    /// The analyzer's argv, or `None` for the two in-process controls.
+    pub fn external_argv(&self) -> Option<Vec<String>> {
+        match self {
+            SutChoice::Naive | SutChoice::Refusing => None,
+            SutChoice::Vulture => Some(VULTURE_ARGV.iter().map(|w| w.to_string()).collect()),
+            SutChoice::Command(argv) => Some(argv.clone()),
         }
     }
 }
@@ -126,7 +166,8 @@ judged — evidence about what a repository is still using.
 USAGE:
     judged ratchet --sarif <path>... [--baseline <path>] [--update]
                                      [--expected-targets <n>]
-    judged mutants [--sut naive|refusing] [--json]
+    judged mutants [--sut <sut>] [--json]
+    judged mutants --sut command [--json] -- <analyzer> [args...]
 
 RATCHET (§9.14) — baseline today's findings, fail CI only on new ones.
     --sarif <path>             A SARIF 2.1.0 log to judge. Repeatable, required.
@@ -138,10 +179,27 @@ RATCHET (§9.14) — baseline today's findings, fail CI only on new ones.
     Exit 0 clean; 1 new findings or baseline rot; 2 refused to judge.
 
 MUTANTS (§10 E2) — inject 19 known-live artifacts and see what gets called dead.
-    --sut naive|refusing       Which control to grade. Default: naive.
+    --sut <sut>                Which system under test to grade. Default: naive.
+        naive                  A deliberately bad cleaner. The positive control:
+                               if it ever passes, the suite is theatre.
+        refusing               Calls nothing dead. The negative control.
+        vulture                The real analyzer, at its own defaults (§4.1).
+        command                An arbitrary analyzer, given after `--`. It runs
+                               once per fixture repository, from inside it, with
+                               the repository path appended as the last argument,
+                               and must exit 0. Its stdout is parsed as vulture's
+                               format, the only adapter that exists so far.
     --json                     Machine-readable report.
 
-    Exit 0 only when the false-removal count is zero.
+    Exit 0 only when the false-removal count is zero; 2 if the suite could not
+    be run at all — including when the selected analyzer is not installed. An
+    absent analyzer claims nothing dead, which scores zero false removals, so it
+    is refused rather than graded.
+
+Judged runs an analyzer to READ it. Adapters are read-only (§9.2), so a
+deletion-shaped flag is refused wherever it appears — including inside the argv
+after `--`, which judged would otherwise hand to a tool and let it edit the
+fixture repository.
 
 Neither subcommand writes to the working tree. There is no --fix and no flag
 that deletes (§9.13 invariant 1).
@@ -158,20 +216,48 @@ where
     // `judged mutants --fix` is refused for the same documented reason as
     // `judged ratchet --fix` rather than as an unknown flag on a subcommand
     // that happens not to have one.
+    //
+    // It deliberately sweeps *past* `--` as well, so a deletion flag cannot be
+    // smuggled into the analyzer's own argv. §9.2's second non-SARIF clause
+    // makes adapters read-only and gives the orchestrator 100% of mutations;
+    // handing `some-linter --fix` to a subprocess that runs inside a fixture
+    // repository would concede that. The cost is that an analyzer with an
+    // innocent `--force` cannot be run without renaming judged's list, and that
+    // is the right way round: the refusal explains itself, whereas a fixture
+    // repository quietly edited underneath the grader does not.
     for word in &words {
         if let Some(refused) = REFUSED_FLAGS.iter().find(|flag| *flag == word) {
             return Err(refusal(refused));
         }
     }
 
-    if words.iter().any(|w| is_help(w)) {
+    // Everything after the first `--` belongs to the analyzer, not to judged.
+    let (head, tail): (&[String], Option<&[String]>) = match words.iter().position(|w| w == "--") {
+        Some(at) => (&words[..at], Some(&words[at + 1..])),
+        None => (&words[..], None),
+    };
+
+    // Help is looked for in judged's own words only. `-- some-linter --help` is
+    // a question for some-linter, and answering it with judged's usage text
+    // would be judged talking over the tool the user is trying to debug.
+    if head.iter().any(|w| is_help(w)) {
         return Ok(Invocation::Help);
     }
 
-    let mut rest = words.iter().map(String::as_str);
+    let mut rest = head.iter().map(String::as_str);
     match rest.next() {
-        Some("ratchet") => parse_ratchet(rest).map(Invocation::Ratchet),
-        Some("mutants") => parse_mutants(rest).map(Invocation::Mutants),
+        Some("ratchet") => {
+            if tail.is_some() {
+                return Err(usage(
+                    "`--` is only meaningful for `judged mutants --sut command`, which runs the \
+                     words after it as an analyzer. `judged ratchet` reads SARIF logs off disk \
+                     and starts no subprocess."
+                        .to_string(),
+                ));
+            }
+            parse_ratchet(rest).map(Invocation::Ratchet)
+        }
+        Some("mutants") => parse_mutants(rest, tail).map(Invocation::Mutants),
         Some(unknown) => Err(usage(format!(
             "`{unknown}` is not a judged subcommand. There are two: `ratchet` and `mutants`."
         ))),
@@ -249,33 +335,75 @@ fn parse_ratchet<'a>(mut rest: impl Iterator<Item = &'a str>) -> Result<RatchetA
     })
 }
 
-fn parse_mutants<'a>(mut rest: impl Iterator<Item = &'a str>) -> Result<MutantsArgs, UsageError> {
+fn parse_mutants<'a>(
+    mut rest: impl Iterator<Item = &'a str>,
+    tail: Option<&[String]>,
+) -> Result<MutantsArgs, UsageError> {
     // The default is the positive control, not the negative one. A bare
     // `judged mutants` that exited 0 because it graded a SUT which claims
     // nothing would be a green result nobody earned.
-    let mut sut = SutChoice::Naive;
+    let mut sut = "naive";
     let mut json = false;
 
     while let Some(word) = rest.next() {
         match word {
-            "--sut" => {
-                sut = match value("--sut", &mut rest)? {
-                    "naive" => SutChoice::Naive,
-                    "refusing" => SutChoice::Refusing,
-                    other => {
-                        return Err(usage(format!(
-                            "`--sut` accepts `naive` or `refusing`, got `{other}`. Those are the \
-                             two controls this build ships; there is no cleaner to grade yet."
-                        )))
-                    }
-                }
-            }
+            "--sut" => sut = value("--sut", &mut rest)?,
             "--json" => json = true,
             other => return Err(usage(format!("`{other}` is not a `judged mutants` flag."))),
         }
     }
 
+    let sut = match sut {
+        "naive" => in_process(SutChoice::Naive, tail)?,
+        "refusing" => in_process(SutChoice::Refusing, tail)?,
+        "vulture" => in_process(SutChoice::Vulture, tail)?,
+        "command" => SutChoice::Command(analyzer_argv(tail)?),
+        other => {
+            return Err(usage(format!(
+                "`--sut` accepts `naive`, `refusing`, `vulture` or `command`, got `{other}`. \
+                 `naive` and `refusing` are the two controls that ship with the suite; `vulture` \
+                 runs the installed vulture at its own defaults; `command` runs whatever argv \
+                 follows `--`."
+            )))
+        }
+    };
+
     Ok(MutantsArgs { sut, json })
+}
+
+/// A SUT that takes no command line of its own, having checked it was not given
+/// one anyway.
+///
+/// Ignoring a stray `-- some-linter` would run the naive control while the
+/// operator believed they were grading some-linter, and the report would say
+/// `naive` in a line nobody reads twice.
+fn in_process(choice: SutChoice, tail: Option<&[String]>) -> Result<SutChoice, UsageError> {
+    match tail {
+        None => Ok(choice),
+        Some(_) => Err(usage(format!(
+            "`--sut {}` runs no external program, so the argv after `--` would be silently \
+             dropped. Use `--sut command -- <analyzer> [args...]` to grade that program instead.",
+            choice.label()
+        ))),
+    }
+}
+
+/// The analyzer's argv, which must exist and must not be empty.
+fn analyzer_argv(tail: Option<&[String]>) -> Result<Vec<String>, UsageError> {
+    match tail {
+        Some(argv) if !argv.is_empty() => Ok(argv.to_vec()),
+        // Both spellings of the same mistake, and neither may degrade into a
+        // run. An empty analyzer command line executes nothing, and a SUT that
+        // executed nothing claims nothing dead — which the gate would read as a
+        // perfect score.
+        _ => Err(usage(
+            "`--sut command` needs the analyzer's command line after `--`, e.g. \
+             `judged mutants --sut command -- vulture --min-confidence 100`. It is run once per \
+             fixture repository, from inside that repository, with the repository's path appended \
+             as the last argument, and its output is read — never acted on."
+                .to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -381,6 +509,119 @@ mod tests {
         let message = usage_error("mutants --sut knip");
         assert!(message.contains("naive"), "got {message}");
         assert!(message.contains("refusing"), "got {message}");
+        assert!(message.contains("vulture"), "got {message}");
+        assert!(message.contains("command"), "got {message}");
+    }
+
+    #[test]
+    fn vulture_runs_vulture_at_its_own_defaults() {
+        // Not `--min-confidence 0`, and not `100`. §4.1's published numbers are
+        // for vulture as shipped, and a score obtained after picking a
+        // threshold that suits our own fixtures is comparable to nothing.
+        let args = mutants_args("mutants --sut vulture");
+
+        assert_eq!(args.sut, SutChoice::Vulture);
+        // No path argument: `CommandSut` appends the fixture repository itself.
+        assert_eq!(args.sut.external_argv(), Some(vec!["vulture".to_string()]));
+    }
+
+    #[test]
+    fn the_two_controls_start_no_subprocess() {
+        // The distinction the installed-analyzer preflight branches on. If
+        // either control reported an external program, `judged mutants` would
+        // start refusing to run its own controls the moment that name was not
+        // on PATH.
+        assert_eq!(SutChoice::Naive.external_argv(), None);
+        assert_eq!(SutChoice::Refusing.external_argv(), None);
+    }
+
+    #[test]
+    fn the_escape_hatch_takes_everything_after_the_double_dash() {
+        let args = mutants_args("mutants --sut command -- vulture --min-confidence 100");
+
+        assert_eq!(
+            args.sut,
+            SutChoice::Command(
+                ["vulture", "--min-confidence", "100"]
+                    .iter()
+                    .map(|w| w.to_string())
+                    .collect()
+            )
+        );
+        // The report has to be able to tell two escape-hatch runs apart, so the
+        // label is the command line rather than the word `command`.
+        assert_eq!(args.sut.label(), "vulture --min-confidence 100");
+    }
+
+    #[test]
+    fn judged_flags_after_the_double_dash_belong_to_the_analyzer() {
+        // `--json` here is the analyzer's flag, not judged's. Consuming it
+        // would change judged's output because of a word aimed at another
+        // program.
+        let args = mutants_args("mutants --sut command -- some-linter --json");
+
+        assert!(!args.json, "`--json` after `--` is not judged's flag");
+        assert_eq!(
+            args.sut,
+            SutChoice::Command(vec!["some-linter".to_string(), "--json".to_string()])
+        );
+    }
+
+    #[test]
+    fn an_analyzers_own_help_is_not_answered_with_judged_usage() {
+        assert!(matches!(
+            parse_words("mutants --sut command -- some-linter --help"),
+            Ok(Invocation::Mutants(_))
+        ));
+        // judged's own `--help` still wins when it is judged's word.
+        assert_eq!(
+            parse_words("mutants --help --sut command -- some-linter"),
+            Ok(Invocation::Help)
+        );
+    }
+
+    #[test]
+    fn an_empty_analyzer_command_line_is_refused_in_both_spellings() {
+        // A `Command` SUT with no program would execute nothing, and a SUT that
+        // executed nothing claims nothing dead — a false-removal count of zero,
+        // which is a passing gate.
+        for line in ["mutants --sut command", "mutants --sut command --"] {
+            let message = usage_error(line);
+            assert!(
+                message.contains("--"),
+                "`{line}` must say where the command goes; got {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_argv_given_to_a_sut_that_cannot_use_it_is_an_error_not_a_shrug() {
+        for control in ["naive", "refusing", "vulture"] {
+            let message = usage_error(&format!("mutants --sut {control} -- some-linter"));
+            assert!(
+                message.contains("--sut command"),
+                "`--sut {control} -- some-linter` must point at the flag that would \
+                 have run some-linter, not silently grade {control}; got {message}"
+            );
+        }
+
+        let message = usage_error("ratchet --sarif a.sarif -- some-linter");
+        assert!(message.contains("ratchet"), "got {message}");
+    }
+
+    #[test]
+    fn a_deletion_flag_inside_an_analyzer_argv_is_still_refused() {
+        // §9.2: adapters are read-only and the orchestrator owns 100% of
+        // mutations. An analyzer handed its own `--fix` would edit the fixture
+        // repository, and the only thing E2 guarantees about that repository is
+        // that the sole change to it is the mutant.
+        for flag in REFUSED_FLAGS {
+            let message = usage_error(&format!("mutants --sut command -- some-linter {flag}"));
+            assert!(
+                message.contains(flag) && message.contains("§9.13"),
+                "refusing {flag} after `--` must quote it and cite the invariant; got {message}"
+            );
+        }
     }
 
     #[test]

@@ -1,8 +1,10 @@
 //! The system under test, and the two controls the suite needs to be meaningful.
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 use judged_core::{Error, Result};
 
@@ -29,6 +31,338 @@ pub trait Sut {
     /// mutate `repo` — §9.2: adapters are read-only, the orchestrator owns 100%
     /// of mutations.
     fn run(&self, repo: &Path) -> Result<SutVerdict>;
+
+    /// Finding classes this SUT **structurally cannot** emit, one short phrase
+    /// each. §9.2's first non-SARIF clause, the capability envelope: *"every
+    /// adapter declares which finding classes it can and structurally cannot
+    /// emit — e.g. 'vulture performs global name-set difference and cannot see
+    /// cross-module references; its silence is not evidence.' This is what lets
+    /// the orchestrator know when silence means anything."*
+    ///
+    /// The distinction being drawn is between *scanned it and found nothing*
+    /// and *never looked*. Both come out of a tool as silence, and silence is
+    /// also what a broken tool produces (§6.20), so an undeclared blind spot is
+    /// indistinguishable from a clean bill of health.
+    ///
+    /// The default is empty — "I claim no structural blind spots" — because the
+    /// envelope is an assertion the SUT's author makes and nothing else can
+    /// make it for them. It is deliberately a list of prose strings and not a
+    /// taxonomy: §9.2 asks for a declaration a human can read next to a report,
+    /// and an enum would have to be right about every tool in advance.
+    fn cannot_emit(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// Turns a tool's stdout into claims, or fails loudly.
+///
+/// A plain `fn` pointer rather than a boxed closure, because this is the seam
+/// that keeps [`CommandSut`] tool-agnostic: everything specific to a given
+/// analyzer — its output format, its schema version, what it calls a symbol —
+/// lives in an adapter behind this signature, and none of it lives here.
+///
+/// Returning `Result` is load-bearing. A parser that cannot read what it was
+/// given must say so; degrading to an empty [`SutVerdict`] would report the
+/// tool as having found nothing.
+pub type VerdictParser = fn(&str) -> Result<SutVerdict>;
+
+/// An arbitrary external command, graded as a SUT.
+///
+/// This is what lets any tool be graded without Judged knowing anything about
+/// it: the command is spawned with the materialized fixture repo as its working
+/// directory and handed that repo's path as its final argument, and its stdout
+/// goes to a caller-supplied [`VerdictParser`].
+///
+/// # Failure is never silence
+///
+/// Every way this can go wrong produces an error, never an empty verdict. The
+/// reason is arithmetic rather than tidiness: an empty [`SutVerdict`] contains
+/// no claims, so [`crate::runner::grade`] finds no false removals in it and
+/// scores it zero — a perfect result. A tool that segfaulted on startup would
+/// therefore outscore one that did the work. §6.20's rule is that *"no data"
+/// must be a distinct state from "zero executions"*, and §9.2 records that
+/// vulture, knip, ts-prune, Go deadcode and Periphery all *"conflate 'clean'
+/// with 'crashed before doing anything'"* — so the harness cannot inherit the
+/// distinction from the tool and has to impose it.
+///
+/// Concretely, these are errors: the binary cannot be spawned; the process is
+/// killed by a signal; it exits with a status not in
+/// [`CommandSut::with_success_exit_codes`]; its stdout is not UTF-8; the parser
+/// rejects its stdout. Exactly one thing is an empty verdict — a healthy exit
+/// whose output the parser read as no claims.
+///
+/// Note in particular that stdout written *before* a bad exit is discarded
+/// rather than parsed. Partial output from a run that died halfway is a short,
+/// plausible, wrong answer, which is worse than no answer.
+#[derive(Debug)]
+pub struct CommandSut {
+    name: String,
+    program: OsString,
+    args: Vec<OsString>,
+    parse: VerdictParser,
+    success_exit_codes: Vec<i32>,
+    cannot_emit: Vec<String>,
+}
+
+impl CommandSut {
+    /// A SUT that runs `program` and reads its stdout with `parse`.
+    ///
+    /// `name` is what the report calls it. Only exit code 0 counts as a healthy
+    /// run until [`CommandSut::with_success_exit_codes`] says otherwise.
+    pub fn new(
+        name: impl Into<String>,
+        program: impl Into<OsString>,
+        parse: VerdictParser,
+    ) -> Self {
+        CommandSut {
+            name: name.into(),
+            program: program.into(),
+            args: Vec::new(),
+            parse,
+            success_exit_codes: vec![0],
+            cannot_emit: Vec::new(),
+        }
+    }
+
+    /// Arguments to pass before the repo path.
+    pub fn with_args(mut self, args: impl IntoIterator<Item = impl Into<OsString>>) -> Self {
+        self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Exit codes that mean the tool ran to completion, replacing the default
+    /// `[0]`.
+    ///
+    /// §9.2: *"adapters compute a health bit; the orchestrator never reads a raw
+    /// exit code."* This is that health bit in its cheapest useful form. Ruff is
+    /// the model contract there — 0 clean, 1 violations found, 2 abnormal
+    /// termination — and a tool of that shape reports findings *by* exiting
+    /// non-zero, so a harness that treated every non-zero exit as a crash could
+    /// never grade one.
+    ///
+    /// It is opt-in per SUT and never inferred, because the failure it guards
+    /// runs the other way: widening this set is how a genuinely crashed run
+    /// gets read as healthy. Declare only codes the tool documents, and note
+    /// that a run killed by a signal has no exit code at all and stays an error
+    /// whatever is declared here.
+    pub fn with_success_exit_codes(mut self, codes: impl IntoIterator<Item = i32>) -> Self {
+        self.success_exit_codes = codes.into_iter().collect();
+        self
+    }
+
+    /// Declare this tool's capability envelope; see [`Sut::cannot_emit`].
+    ///
+    /// Judged knows nothing about the command it was handed, so it cannot infer
+    /// the envelope. Whoever writes the adapter knows, and this is where they
+    /// say it.
+    pub fn with_cannot_emit(
+        mut self,
+        classes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.cannot_emit = classes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Every failure from this SUT, spelled the same way: attributed to it by
+    /// name, so a report never contains an anonymous crash.
+    fn fail(&self, message: String) -> Error {
+        Error::Sut {
+            sut: self.name.clone(),
+            message,
+        }
+    }
+
+    fn program_name(&self) -> String {
+        self.program.to_string_lossy().into_owned()
+    }
+
+    /// Restate one claimed path in the repo-relative form [`SutVerdict`]
+    /// promises, or refuse it.
+    ///
+    /// A real analyzer echoes back the path it was invoked on, so handing it an
+    /// absolute repo path means absolute findings. Left alone, those reach
+    /// [`crate::runner::grade`], strip against nothing, intersect no live path,
+    /// and the run scores clean — a false removal turned into a pass by a
+    /// spelling difference. That is the silent-under-report failure this whole
+    /// type exists to prevent, arriving by a different door.
+    ///
+    /// A path that leaves the repository is refused outright rather than
+    /// dropped (§9.3 gate 0c: *"reject any candidate whose realpath is not a
+    /// repo descendant"*). Dropping it would erase a tool's claim on something
+    /// outside the tree from the report entirely, which is the one place that
+    /// claim most needs to appear.
+    fn repo_relative(&self, path: PathBuf, root: &Path) -> Result<PathBuf> {
+        // Checked before the absolute test, so `/repo/../etc/passwd` is caught
+        // too. Purely lexical on purpose: the target need not exist for the
+        // claim to be wrong.
+        if path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+        {
+            return Err(self.fail(format!(
+                "`{}` claimed {} is dead, which climbs out of the repository",
+                self.program_name(),
+                path.display()
+            )));
+        }
+
+        if path.is_relative() {
+            return Ok(path);
+        }
+
+        let relative = path.strip_prefix(root).map_err(|_| {
+            self.fail(format!(
+                "`{}` claimed {} is dead, which is not inside the repository {}",
+                self.program_name(),
+                path.display(),
+                root.display()
+            ))
+        })?;
+
+        if relative.as_os_str().is_empty() {
+            return Err(self.fail(format!(
+                "`{}` claimed the repository root {} is dead",
+                self.program_name(),
+                root.display()
+            )));
+        }
+
+        Ok(relative.to_path_buf())
+    }
+}
+
+impl Sut for CommandSut {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn cannot_emit(&self) -> Vec<String> {
+        self.cannot_emit.clone()
+    }
+
+    fn run(&self, repo: &Path) -> Result<SutVerdict> {
+        // Canonicalize once, and use the *same* string for the working
+        // directory and the argument. On macOS a temp repo is handed out as
+        // `/var/folders/...`, a symlink to `/private/var/folders/...`; a tool
+        // whose cwd resolves to one and whose argument is the other emits paths
+        // relative to whichever it happened to use. Those do not strip against
+        // the root [`crate::runner::grade`] normalizes with, so they match no
+        // live path and the run scores clean. Also §9.3 gate 0c: canonicalize
+        // paths. Failing here rather than letting the command fail is the
+        // difference between "the fixture is not there" and a mute exit code.
+        let root = repo.canonicalize().map_err(|source| {
+            self.fail(format!(
+                "repository {} could not be resolved: {source}",
+                repo.display()
+            ))
+        })?;
+
+        let output = Command::new(&self.program)
+            .args(&self.args)
+            .arg(&root)
+            .current_dir(&root)
+            .output()
+            .map_err(|source| {
+                // Not installed, not executable, not on PATH. The most likely
+                // failure of the lot, and the one whose empty-verdict spelling
+                // would be most convincing: a tool nobody ran finds nothing.
+                self.fail(format!(
+                    "could not spawn `{}`: {source}",
+                    self.program_name()
+                ))
+            })?;
+
+        match output.status.code() {
+            Some(code) if self.success_exit_codes.contains(&code) => {}
+            Some(code) => {
+                return Err(self.fail(format!(
+                    "`{}` exited with status {code}; declared healthy: {:?}. \
+                     Discarding {} bytes of stdout — a run that ended badly did \
+                     not finish the analysis, so its partial output is not a \
+                     verdict.{}",
+                    self.program_name(),
+                    self.success_exit_codes,
+                    output.stdout.len(),
+                    stderr_tail(&output.stderr),
+                )));
+            }
+            None => {
+                // No exit code exists at all. This is why the match is on
+                // `code()` and not on `success()`: any `unwrap_or` default here
+                // silently picks a side for a process that never got to choose.
+                return Err(self.fail(format!(
+                    "`{}` was killed by a signal before it could exit ({}). \
+                     Discarding {} bytes of stdout.{}",
+                    self.program_name(),
+                    output.status,
+                    output.stdout.len(),
+                    stderr_tail(&output.stderr),
+                )));
+            }
+        }
+
+        // Not `from_utf8_lossy`. Lossy decoding turns undecodable bytes into
+        // replacement characters and hands the parser something that still
+        // looks like output, which comes back as a confident, corrupt verdict.
+        let stdout = String::from_utf8(output.stdout).map_err(|source| {
+            self.fail(format!(
+                "stdout of `{}` is not valid UTF-8: {source}",
+                self.program_name()
+            ))
+        })?;
+
+        // Re-attributed to this SUT. The parser is a free function that does not
+        // know which SUT it was called for, and an unattributed parse failure in
+        // a nineteen-mutant run is not actionable.
+        let mut verdict = (self.parse)(&stdout).map_err(|source| {
+            self.fail(format!(
+                "could not read the output of `{}`: {source}",
+                self.program_name()
+            ))
+        })?;
+
+        // The parser cannot do this itself: it is handed stdout and nothing
+        // else, so it has no way to know where the repository is. `CommandSut`
+        // is the only place that holds both the root and the claims.
+        let claimed = std::mem::take(&mut verdict.claimed_dead_paths);
+        verdict.claimed_dead_paths = claimed
+            .into_iter()
+            .map(|path| self.repo_relative(path, &root))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(verdict)
+    }
+}
+
+/// The tail of `stderr`, for the error message, or an empty string.
+///
+/// Analyzers put the traceback here. One line is enough to tell a missing
+/// plugin apart from a syntax error in the fixture, and it is the difference
+/// between an actionable failure and "it exited 1".
+fn stderr_tail(stderr: &[u8]) -> String {
+    /// Bytes of the line to keep: enough for a message and a path, short
+    /// enough that a traceback cannot become the error.
+    const LIMIT: usize = 300;
+
+    let text = String::from_utf8_lossy(stderr);
+    let Some(last) = text.lines().map(str::trim).rfind(|line| !line.is_empty()) else {
+        return String::new();
+    };
+
+    // Cut on a character boundary. `String::truncate` panics otherwise, and a
+    // panic *here* would abort the run while it was reporting someone else's
+    // crash — turning an actionable error into a harness failure and losing the
+    // reason. Analyzer output is long and is not required to be ASCII, so this
+    // is a live path, not a theoretical one.
+    let tail = if last.len() <= LIMIT {
+        last.to_string()
+    } else {
+        let cut = (0..=LIMIT)
+            .rev()
+            .find(|&i| last.is_char_boundary(i))
+            .unwrap_or(0);
+        format!("{}…", &last[..cut])
+    };
+    format!(" Last stderr line: {tail}")
 }
 
 /// A deliberately bad cleaner: reachability from obvious entry points, nothing
@@ -45,6 +379,26 @@ pub struct NaiveSut;
 impl Sut for NaiveSut {
     fn name(&self) -> &str {
         "naive"
+    }
+
+    /// The two limits below are structural, not incidental: they follow from
+    /// [`PARSED_EXTENSIONS`] and [`ENTRY_STEMS`] and no input can move them.
+    /// Both are demonstrated by tests in `tests/runner_suts.rs`; this is the
+    /// same facts in the form a report can carry.
+    ///
+    /// The control's *other* failures — missing a YAML reference, a CI step, a
+    /// Dockerfile `COPY` — are deliberately absent from this list. Those are
+    /// wrong answers, not silence, and a capability envelope that also listed
+    /// them would be excusing them.
+    fn cannot_emit(&self) -> Vec<String> {
+        vec![
+            "symbols declared outside its parsed extensions (py, pyi, ts, tsx, js, jsx, \
+             mjs, cjs, rs, go): those files are never scanned for declarations"
+                .to_string(),
+            "any artifact named main, index, lib, mod, __init__ or __main__: treated as \
+             an entry point unconditionally, so it is never claimed"
+                .to_string(),
+        ]
     }
 
     fn run(&self, repo: &Path) -> Result<SutVerdict> {
@@ -275,6 +629,20 @@ pub struct RefusingSut;
 impl Sut for RefusingSut {
     fn name(&self) -> &str {
         "refusing"
+    }
+
+    /// The envelope that makes this control's perfect score readable.
+    ///
+    /// Zero false removals is the best number the suite can report, and this
+    /// SUT earns it by never looking at anything. Declaring total blindness is
+    /// what stops that number from being read as competence — which is exactly
+    /// the confusion §9.2 introduces the envelope to prevent.
+    fn cannot_emit(&self) -> Vec<String> {
+        vec![
+            "every finding class: this control claims nothing under any circumstances, \
+             so its silence is never evidence about any artifact"
+                .to_string(),
+        ]
     }
 
     fn run(&self, _repo: &Path) -> Result<SutVerdict> {

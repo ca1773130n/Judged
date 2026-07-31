@@ -102,9 +102,23 @@ impl Run {
 }
 
 fn judged(cwd: &Path, args: &[&str]) -> Run {
-    let output: Output = Command::new(env!("CARGO_BIN_EXE_judged"))
-        .args(args)
-        .current_dir(cwd)
+    judged_with_path(cwd, args, None)
+}
+
+/// Drive the binary with `PATH` replaced.
+///
+/// Every test that touches an external analyzer has to control `PATH`, or it
+/// asserts something about the machine it happens to be running on rather than
+/// about `judged`. `None` inherits the ambient `PATH`; `Some(dir)` makes `dir`
+/// the *entire* search path, which is how "this analyzer is not installed" is
+/// made true on a developer laptop that has it installed.
+fn judged_with_path(cwd: &Path, args: &[&str], path: Option<&Path>) -> Run {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_judged"));
+    command.args(args).current_dir(cwd);
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    let output: Output = command
         .output()
         .expect("the judged binary must be runnable");
 
@@ -1049,6 +1063,361 @@ fn mutants_json_carries_the_gate_and_every_class() {
         "each class must carry the one liveness mechanism it injects; got {}",
         mutants[0]
     );
+}
+
+// ---------------------------------------------------------------------------
+// judged mutants against an external analyzer
+//
+// The suite has only ever graded two SUTs we wrote ourselves, which bounds the
+// harness and nothing else. Pointing it at a real analyzer is what turns E2
+// into evidence about §11 R1 — and it introduces the one failure mode the two
+// in-process controls could never have: the analyzer is not on the machine.
+//
+// A tool that is not installed claims nothing dead. Claiming nothing dead is a
+// false-removal count of zero, and zero false removals is GATE PASSED. So the
+// single most likely way this feature goes wrong is that it reports a clean
+// suite for a run that never happened — §6.20's disarming failure wearing the
+// clothes of a green build. Every test in this section exists to make that
+// impossible.
+// ---------------------------------------------------------------------------
+
+/// A directory containing nothing, used as the whole of `PATH`.
+fn empty_path(label: &str) -> TempDir {
+    scratch(label)
+}
+
+/// Put an executable shim called `name` on a fresh `PATH` directory.
+///
+/// A shim rather than the real analyzer, because a test that requires vulture
+/// to be installed is a test that is skipped on most machines and therefore a
+/// test that does not exist. What is under test here is `judged`'s wiring —
+/// that it finds the program, runs it, and renders a report — not vulture's
+/// analysis, which E2 will measure separately once the numbers are collected.
+#[cfg(unix)]
+fn shim(dir: &Path, name: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join(name);
+    std::fs::write(&path, body).expect("shim must be writable");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("shim must be made executable");
+}
+
+/// Assert that a report is not a verdict — no gate line, in either direction.
+///
+/// Separate from the exit code because both halves are load-bearing. A run that
+/// exits 2 while still printing "false removals: 0 — GATE PASSED" has published
+/// a number somebody will quote out of the log.
+fn expect_no_gate_result(run: &Run) {
+    for forbidden in [
+        "GATE PASSED",
+        "GATE FAILED",
+        "false removals:",
+        "decoy recall:",
+    ] {
+        run.expect_silent_about(forbidden);
+    }
+}
+
+#[test]
+fn a_missing_analyzer_refuses_loudly_and_never_reports_a_clean_suite() {
+    // THE test for this feature. An analyzer that is not installed produces no
+    // findings, which is arithmetically identical to an analyzer that found
+    // nothing wrong — and the gate reads only that number. If this run were
+    // allowed to reach the grader it would print "false removals: 0 — GATE
+    // PASSED" and exit 0, which is a green build certifying nothing at all.
+    let repo = scratch("vulture-missing");
+    let nothing = empty_path("vulture-missing-path");
+
+    let run = judged_with_path(
+        repo.path(),
+        &["mutants", "--sut", "vulture"],
+        Some(nothing.path()),
+    );
+
+    run.expect_code(2, "an analyzer that is not installed analyzed nothing")
+        .expect_says("vulture")
+        .expect_says("not installed")
+        // Naming the binary is not enough to act on. §9.13's presentation rules
+        // are about what a human can do next, and the next thing here is to
+        // install it.
+        .expect_says("pip install vulture");
+    expect_no_gate_result(&run);
+}
+
+#[test]
+fn a_missing_analyzer_refuses_in_json_too() {
+    // The rendering that a script reads, and therefore the one that would
+    // silently propagate a fabricated pass into a dashboard. `--json` changes
+    // the rendering, never the verdict.
+    let repo = scratch("vulture-missing-json");
+    let nothing = empty_path("vulture-missing-json-path");
+
+    let run = judged_with_path(
+        repo.path(),
+        &["mutants", "--sut", "vulture", "--json"],
+        Some(nothing.path()),
+    );
+
+    run.expect_code(2, "--json must not launder a refusal into a result");
+    assert!(
+        !run.stdout.contains("\"gate_passed\": true"),
+        "a refusal must not emit a passing gate. Report was:\n{}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout.contains("\"false_removal_count\": 0"),
+        "a refusal must not emit a false-removal count at all; zero here means \
+         `the analyzer is absent`, and nothing downstream can tell that from \
+         `the analyzer found nothing`. Report was:\n{}",
+        run.stdout
+    );
+    run.expect_says("vulture").expect_says("not installed");
+}
+
+#[test]
+fn a_missing_command_sut_names_the_binary_it_could_not_find() {
+    let repo = scratch("command-missing");
+    let nothing = empty_path("command-missing-path");
+
+    let run = judged_with_path(
+        repo.path(),
+        &["mutants", "--sut", "command", "--", "no-such-analyzer", "."],
+        Some(nothing.path()),
+    );
+
+    run.expect_code(2, "the escape hatch gets the same guard as the named tool")
+        .expect_says("no-such-analyzer")
+        .expect_says("not installed");
+    expect_no_gate_result(&run);
+}
+
+#[test]
+fn an_analyzer_given_as_a_path_is_reported_as_a_path_that_is_not_there() {
+    // A bare name is looked up on PATH; something with a separator in it is the
+    // path it looks like, and is not looked up at all. The message has to say
+    // which of those happened. Telling somebody who typed `./tools/analyze`
+    // that it was not found "in the 45 directories on PATH" describes a search
+    // that never ran and sends them to fix the wrong thing — and "install it"
+    // is not the remedy for a path they meant literally.
+    let repo = scratch("command-path");
+
+    let run = judged(
+        repo.path(),
+        &["mutants", "--sut", "command", "--", "./tools/analyze"],
+    );
+
+    run.expect_code(2, "a path that is not there analyzed nothing")
+        .expect_says("./tools/analyze")
+        // The false claim, pinned by the words that make it: a report of a
+        // search that did not happen. The remedy below it may still mention
+        // PATH, because saying "a bare name would be looked up on PATH" is true
+        // and is the fix.
+        .expect_silent_about("Looked for")
+        .expect_silent_about("directories on PATH");
+    expect_no_gate_result(&run);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_analyzer_that_is_present_is_actually_run_and_graded() {
+    // The other side of the guard, and the reason it cannot be implemented as
+    // "always refuse". A shim that is on PATH must produce a real report with a
+    // real gate line — otherwise the missing-analyzer test above would pass
+    // against a feature that never works.
+    //
+    // The shim claims nothing, so the interesting assertion is not the gate
+    // (which it clears trivially) but the decoy line beside it, which is what
+    // stops a silent tool from reading as a good one.
+    let repo = scratch("command-present");
+    let bin = scratch("command-present-path");
+    shim(bin.path(), "quiet-analyzer", "#!/bin/sh\nexit 0\n");
+    let path = format!(
+        "{}:{}",
+        bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let run = judged_with_path(
+        repo.path(),
+        &["mutants", "--sut", "command", "--", "quiet-analyzer", "."],
+        Some(Path::new(&path)),
+    );
+
+    run.expect_code(0, "an analyzer that claims nothing has no false removals")
+        .expect_says("quiet-analyzer")
+        .expect_says("false removals: 0")
+        .expect_says("decoy recall: 0 of")
+        .expect_says("removed nothing at all");
+    expect_every_class_is_reported(&run);
+}
+
+#[cfg(unix)]
+#[test]
+fn vulture_is_run_by_name_when_it_is_on_path() {
+    // `--sut vulture` has to resolve to the `vulture` binary and no other, so
+    // the shim is named `vulture` and the assertion is that the report says so.
+    let repo = scratch("vulture-present");
+    let bin = scratch("vulture-present-path");
+    shim(bin.path(), "vulture", "#!/bin/sh\nexit 0\n");
+    let path = format!(
+        "{}:{}",
+        bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let run = judged_with_path(
+        repo.path(),
+        &["mutants", "--sut", "vulture"],
+        Some(Path::new(&path)),
+    );
+
+    run.expect_code(0, "a silent analyzer removes nothing")
+        .expect_says("vulture")
+        .expect_says("decoy recall:");
+    expect_every_class_is_reported(&run);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_report_produced_through_an_adapter_carries_the_adapters_envelope() {
+    // §9.2's second non-SARIF clause: every adapter declares the finding
+    // classes the tool structurally cannot emit. That declaration is what makes
+    // a low false-removal count readable — without it, a narrow tool and a safe
+    // tool produce the same number, and the report cannot tell them apart. So
+    // the envelope, and the decision about which half of a verdict the tool's
+    // findings were mapped to, are printed rather than left in a source
+    // comment.
+    let repo = scratch("vulture-envelope");
+    let bin = scratch("vulture-envelope-path");
+    shim(bin.path(), "vulture", "#!/bin/sh\nexit 0\n");
+    let path = format!(
+        "{}:{}",
+        bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let run = judged_with_path(
+        repo.path(),
+        &["mutants", "--sut", "vulture"],
+        Some(Path::new(&path)),
+    );
+
+    run.expect_says("silence is not evidence")
+        .expect_says("claimed_dead_paths");
+
+    // Above the table, not below the summary. §9.13 budgets the reader ten
+    // seconds and puts the deciding numbers in the log tail; a page of adapter
+    // prose appended after them would push the gate line off the bottom of a CI
+    // log, which is the one line that must always be visible.
+    assert!(
+        run.offset_of("silence is not evidence") < run.offset_of("false removals:"),
+        "the envelope must be printed above the summary lines, not after them. \
+         Report was:\n{}",
+        run.stdout
+    );
+
+    // The escape hatch cannot borrow vulture's envelope: nothing is known about
+    // an analyzer that was named on the command line, and claiming otherwise
+    // would be the adapter asserting more than the tool told it.
+    let run = judged_with_path(
+        repo.path(),
+        &["mutants", "--sut", "command", "--", "vulture"],
+        Some(Path::new(&path)),
+    );
+    run.expect_says("capability envelope: NOT DECLARED")
+        .expect_silent_about("global AST name-set difference");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_json_report_carries_the_envelope_for_adapters_and_omits_it_for_controls() {
+    let repo = scratch("adapter-json");
+    let bin = scratch("adapter-json-path");
+    shim(bin.path(), "vulture", "#!/bin/sh\nexit 0\n");
+    let path = format!(
+        "{}:{}",
+        bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let run = judged_with_path(
+        repo.path(),
+        &["mutants", "--sut", "vulture", "--json"],
+        Some(Path::new(&path)),
+    );
+    let report: Value = serde_json::from_str(run.stdout.trim())
+        .unwrap_or_else(|e| panic!("--json must emit JSON: {e}\nGot:\n{}", run.stdout));
+
+    assert_eq!(report["sut"], json!("vulture"));
+    for key in ["capability_envelope", "mapping_decision"] {
+        assert!(
+            report["adapter"][key]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "a machine consumer that records `false_removal_count` without \
+             `adapter.{key}` has recorded a number stripped of what bounds it. \
+             Got:\n{}",
+            run.stdout
+        );
+    }
+
+    // The two controls are this repository's own code, so there is no
+    // third-party translation to disclose and the key is absent rather than
+    // empty.
+    let run = judged(repo.path(), &["mutants", "--sut", "refusing", "--json"]);
+    let report: Value = serde_json::from_str(run.stdout.trim())
+        .unwrap_or_else(|e| panic!("--json must emit JSON: {e}\nGot:\n{}", run.stdout));
+    assert_eq!(report["adapter"], Value::Null);
+}
+
+#[test]
+fn the_escape_hatch_needs_a_command_and_says_where_to_put_it() {
+    let repo = scratch("command-empty");
+
+    let run = judged(repo.path(), &["mutants", "--sut", "command"]);
+    run.expect_code(2, "an empty analyzer command line is a usage error")
+        .expect_says("--");
+    expect_no_gate_result(&run);
+
+    // `--` present but with nothing after it is the same mistake one keystroke
+    // later, and must not degrade into "run the empty program".
+    let run = judged(repo.path(), &["mutants", "--sut", "command", "--"]);
+    run.expect_code(2, "`--` with no command after it is still no command")
+        .expect_says("--");
+    expect_no_gate_result(&run);
+}
+
+#[test]
+fn an_analyzer_argv_may_not_smuggle_in_a_deletion_flag() {
+    // §9.13 invariant 1 is a property of the whole process, not of judged's own
+    // argv. §9.2's adapters are read-only clause says the analyzer is run to be
+    // *read*, never to act: an analyzer invoked with its own --fix would edit
+    // the fixture repository, and the one thing E2 depends on is that the only
+    // thing that changed about that repository is the mutant we injected.
+    let repo = scratch("command-fix");
+
+    for flag in ["--fix", "--delete", "--apply"] {
+        let run = judged(
+            repo.path(),
+            &["mutants", "--sut", "command", "--", "some-linter", flag],
+        );
+        run.expect_code(2, "judged does not run an analyzer that was told to write")
+            .expect_says(flag)
+            .expect_says("§9.13");
+        expect_no_gate_result(&run);
+    }
+}
+
+#[test]
+fn an_unknown_sut_lists_every_one_that_exists() {
+    let repo = scratch("sut-unknown");
+
+    let run = judged(repo.path(), &["mutants", "--sut", "knip"]);
+    run.expect_code(2, "an unknown SUT is a usage error");
+    for known in ["naive", "refusing", "vulture", "command"] {
+        run.expect_says(known);
+    }
 }
 
 // ---------------------------------------------------------------------------

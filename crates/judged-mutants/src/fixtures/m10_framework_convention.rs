@@ -24,8 +24,9 @@
 use std::path::Path;
 
 use judged_core::git::Repo;
-use judged_core::{Error, Result};
+use judged_core::Result;
 
+use crate::fixtures::write;
 use crate::mutant::{Ecosystem, GroundTruth, Mutant};
 
 /// Django's `AppConfig` autoload and Jest's `__mocks__` directory in one
@@ -182,115 +183,43 @@ module.exports = { createClient };
     }
 }
 
-/// Write one fixture file, creating parents, attaching the path to any failure.
-///
-/// Duplicated in each mutant module rather than shared: `fixtures/mod.rs` is
-/// complete and declares only the nineteen class modules, so there is nowhere
-/// to put a shared helper without changing it.
-fn write(root: &Path, rel: &str, contents: &str) -> Result<()> {
-    let path = root.join(rel);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| Error::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    std::fs::write(&path, contents).map_err(|source| Error::Io { path, source })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use judged_core::git::Repo;
-    use tempfile::TempDir;
+    use crate::fixtures::support;
 
-    fn materialize() -> (TempDir, Repo, GroundTruth) {
-        let dir = TempDir::new().expect("create tempdir");
-        let truth = FrameworkConvention
-            .materialize(dir.path())
-            .expect("m10 materializes");
-        let repo = Repo::discover(dir.path()).expect("fixture is a git repo");
-        (dir, repo, truth)
-    }
+    #[test]
+    fn m10_materializes_a_real_git_repo_with_one_commit() {
+        let (_dir, repo, _truth) = support::materialize(&FrameworkConvention);
 
-    fn tree(root: &Path) -> Vec<(String, Vec<u8>)> {
-        let mut out = Vec::new();
-        walk(root, root, &mut out);
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
-    }
-
-    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
-        for entry in std::fs::read_dir(dir).expect("read fixture directory") {
-            let path = entry.expect("read directory entry").path();
-            if path.file_name().is_some_and(|n| n == ".git") {
-                continue;
-            }
-            if path.is_dir() {
-                walk(&path, root, out);
-            } else {
-                let rel = path
-                    .strip_prefix(root)
-                    .expect("path is under the fixture root")
-                    .to_string_lossy()
-                    .into_owned();
-                out.push((rel, std::fs::read(&path).expect("read fixture file")));
-            }
-        }
-    }
-
-    fn mentions(haystack: &[u8], needle: &str) -> bool {
-        let needle = needle.as_bytes();
-        haystack.windows(needle.len()).any(|w| w == needle)
+        // m10 is a two-ecosystem fixture, so both manifests have to be there.
+        support::assert_committed(&repo, &["pyproject.toml", "package.json"]);
     }
 
     #[test]
-    fn materializes_a_real_git_repo_with_one_commit() {
-        let (_dir, repo, _truth) = materialize();
-        assert!(
-            repo.root().join(".git").is_dir(),
-            "expected a git directory"
-        );
-        for manifest in ["pyproject.toml", "package.json"] {
-            assert!(
-                repo.is_tracked(Path::new(manifest))
-                    .expect("query the index"),
-                "{manifest} must be committed; m10 is a two-ecosystem fixture"
-            );
-        }
-    }
-
-    #[test]
-    fn ground_truth_paths_all_exist_on_disk() {
-        let (_dir, repo, truth) = materialize();
+    fn m10_ground_truth_paths_all_exist_on_disk() {
+        let (_dir, repo, truth) = support::materialize(&FrameworkConvention);
         assert_eq!(
             truth.live_paths.len(),
             2,
             "m10 injects one convention per framework: Django and Jest"
         );
-        assert!(
-            !truth.decoy_dead_paths.is_empty(),
-            "without a decoy, a tool that claims nothing passes m10 for free"
-        );
-        for path in truth.live_paths.iter().chain(&truth.decoy_dead_paths) {
-            assert!(path.is_relative(), "{path:?} must be repo-relative");
-            assert!(repo.root().join(path).is_file(), "{path:?} is missing");
-        }
+        support::assert_ground_truth_is_on_disk(&repo, &truth);
     }
 
     /// Django ≥3.2 finds the single `AppConfig` subclass in `<app>/apps.py` by
     /// scanning the module. Nothing writes the class name down, so a tool that
     /// resolves `INSTALLED_APPS` strings still never arrives at this symbol.
     #[test]
-    fn the_app_config_class_is_named_only_by_its_own_definition() {
-        let (_dir, repo, truth) = materialize();
+    fn m10_the_app_config_class_is_named_only_by_its_own_definition() {
+        let (_dir, repo, truth) = support::materialize(&FrameworkConvention);
         let symbol = truth
             .live_symbols
             .first()
             .expect("m10 declares the AppConfig class as a live symbol");
-        let naming: Vec<String> = tree(repo.root())
+        let naming: Vec<String> = support::tree(repo.root())
             .into_iter()
-            .filter(|(_, bytes)| mentions(bytes, symbol))
+            .filter(|(_, bytes)| support::mentions(bytes, symbol))
             .map(|(path, _)| path)
             .collect();
         assert_eq!(
@@ -304,11 +233,11 @@ mod tests {
     /// package automatically — no `jest.mock()` call required. So the directory
     /// name is the entire registration, and it must appear in no file.
     #[test]
-    fn nothing_in_the_repository_references_the_mocks_directory() {
-        let (_dir, repo, _truth) = materialize();
-        for (path, bytes) in tree(repo.root()) {
+    fn m10_nothing_in_the_repository_references_the_mocks_directory() {
+        let (_dir, repo, _truth) = support::materialize(&FrameworkConvention);
+        for (path, bytes) in support::tree(repo.root()) {
             assert!(
-                !mentions(&bytes, "__mocks__"),
+                !support::mentions(&bytes, "__mocks__"),
                 "{path} names __mocks__; Jest's convention must be the only \
                  thing that puts the mock in the module graph"
             );
@@ -316,23 +245,8 @@ mod tests {
     }
 
     #[test]
-    fn the_decoys_are_named_by_nothing() {
-        let (_dir, repo, truth) = materialize();
-        for decoy in &truth.decoy_dead_paths {
-            let stem = decoy
-                .file_stem()
-                .expect("decoy has a file name")
-                .to_string_lossy()
-                .into_owned();
-            for (path, bytes) in tree(repo.root()) {
-                if Path::new(&path) == decoy.as_path() {
-                    continue;
-                }
-                assert!(
-                    !mentions(&bytes, &stem),
-                    "{path} references the decoy {stem:?}, so it is not dead"
-                );
-            }
-        }
+    fn m10_the_decoys_are_named_by_nothing() {
+        let (_dir, repo, truth) = support::materialize(&FrameworkConvention);
+        support::assert_decoys_are_unreferenced(&repo, &truth);
     }
 }

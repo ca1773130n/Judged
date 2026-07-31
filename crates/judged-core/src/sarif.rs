@@ -238,10 +238,10 @@ pub enum SuppressionStatus {
 ///
 /// The distinction is the point: `Degraded` is not `Failed`. §9.2 requires that
 /// partial degradation *caps the tier* for affected paths rather than
-/// discarding the run, while a failed run must contribute nothing at all. §12
-/// note 12 records that every catastrophic failure in the surveyed corpus
-/// presented identically as "~0% covered everywhere" — a run that looks clean
-/// because it did nothing.
+/// discarding the run, while a failed run must contribute nothing at all. §3.7
+/// is why the third state has to exist at all: *"every catastrophic failure mode
+/// in this space shares one signature: coverage reports ~0% for everything"* — a
+/// run that looks clean because it did nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunHealth {
     /// Ran to completion over enough of the repository to be believed.

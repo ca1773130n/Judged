@@ -22,8 +22,9 @@
 use std::path::Path;
 
 use judged_core::git::Repo;
-use judged_core::{Error, Result};
+use judged_core::Result;
 
+use crate::fixtures::write;
 use crate::mutant::{Ecosystem, GroundTruth, Mutant};
 
 /// The loader iterates `plugins/*.py` at startup. Nothing names the plugin;
@@ -130,102 +131,25 @@ def hang_indent(text, width=72):
     }
 }
 
-/// Write one fixture file, creating parents, attaching the path to any failure.
-///
-/// Duplicated in each mutant module rather than shared: `fixtures/mod.rs` is
-/// complete and declares only the nineteen class modules, so there is nowhere
-/// to put a shared helper without changing it.
-fn write(root: &Path, rel: &str, contents: &str) -> Result<()> {
-    let path = root.join(rel);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| Error::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    std::fs::write(&path, contents).map_err(|source| Error::Io { path, source })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use judged_core::git::Repo;
-    use tempfile::TempDir;
+    use crate::fixtures::support;
 
-    /// Materialize into a throwaway directory and hand back the repo with it,
-    /// so that the fixture's git state can be interrogated too.
-    fn materialize() -> (TempDir, Repo, GroundTruth) {
-        let dir = TempDir::new().expect("create tempdir");
-        let truth = PluginDirScan
-            .materialize(dir.path())
-            .expect("m03 materializes");
-        let repo = Repo::discover(dir.path()).expect("fixture is a git repo");
-        (dir, repo, truth)
-    }
-
-    /// Every file in the working tree except `.git`, as (repo-relative path,
-    /// bytes). Bytes rather than text because a later mutant's evidence is
-    /// binary, and a shared shape keeps these tests comparable.
-    fn tree(root: &Path) -> Vec<(String, Vec<u8>)> {
-        let mut out = Vec::new();
-        walk(root, root, &mut out);
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
-    }
-
-    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
-        for entry in std::fs::read_dir(dir).expect("read fixture directory") {
-            let path = entry.expect("read directory entry").path();
-            if path.file_name().is_some_and(|n| n == ".git") {
-                continue;
-            }
-            if path.is_dir() {
-                walk(&path, root, out);
-            } else {
-                let rel = path
-                    .strip_prefix(root)
-                    .expect("path is under the fixture root")
-                    .to_string_lossy()
-                    .into_owned();
-                out.push((rel, std::fs::read(&path).expect("read fixture file")));
-            }
-        }
-    }
-
-    fn mentions(haystack: &[u8], needle: &str) -> bool {
-        let needle = needle.as_bytes();
-        haystack.windows(needle.len()).any(|w| w == needle)
+    #[test]
+    fn m03_materializes_a_real_git_repo_with_one_commit() {
+        let (_dir, repo, _truth) = support::materialize(&PluginDirScan);
+        support::assert_committed(&repo, &["pyproject.toml"]);
     }
 
     #[test]
-    fn materializes_a_real_git_repo_with_one_commit() {
-        let (_dir, repo, _truth) = materialize();
-        assert!(
-            repo.root().join(".git").is_dir(),
-            "expected a git directory"
-        );
-        assert!(
-            repo.is_tracked(Path::new("pyproject.toml"))
-                .expect("query the index"),
-            "the fixture must be committed, not just written to disk"
-        );
-    }
-
-    #[test]
-    fn ground_truth_paths_all_exist_on_disk() {
-        let (_dir, repo, truth) = materialize();
+    fn m03_ground_truth_paths_all_exist_on_disk() {
+        let (_dir, repo, truth) = support::materialize(&PluginDirScan);
         assert!(
             !truth.live_paths.is_empty(),
             "m03's live artifact is a file"
         );
-        assert!(
-            !truth.decoy_dead_paths.is_empty(),
-            "without a decoy, a tool that claims nothing passes m03 for free"
-        );
-        for path in truth.live_paths.iter().chain(&truth.decoy_dead_paths) {
-            assert!(path.is_relative(), "{path:?} must be repo-relative");
-            assert!(repo.root().join(path).is_file(), "{path:?} is missing");
-        }
+        support::assert_ground_truth_is_on_disk(&repo, &truth);
     }
 
     /// The claim m03 makes is that the plugin's *name exists only as a
@@ -233,8 +157,8 @@ mod tests {
     /// `Path.stem`, so unlike class 2 there is no string to grep for — not even
     /// in the loader. Prove it rather than trust it.
     #[test]
-    fn the_plugin_name_appears_in_no_file_in_the_repository() {
-        let (_dir, repo, truth) = materialize();
+    fn m03_the_plugin_name_appears_in_no_file_in_the_repository() {
+        let (_dir, repo, truth) = support::materialize(&PluginDirScan);
         let live = truth
             .live_paths
             .first()
@@ -245,35 +169,18 @@ mod tests {
             .to_string_lossy()
             .into_owned();
 
-        for (path, bytes) in tree(repo.root()) {
+        for (path, bytes) in support::tree(repo.root()) {
             assert!(
-                !mentions(&bytes, &stem),
+                !support::mentions(&bytes, &stem),
                 "{path} names the plugin {stem:?}; m03 must be reachable only \
                  by directory scan"
             );
         }
     }
 
-    /// A decoy that some mechanism secretly reaches would make the suite grade
-    /// a correct refusal as a miss.
     #[test]
-    fn the_decoy_is_named_by_nothing() {
-        let (_dir, repo, truth) = materialize();
-        for decoy in &truth.decoy_dead_paths {
-            let stem = decoy
-                .file_stem()
-                .expect("decoy has a file name")
-                .to_string_lossy()
-                .into_owned();
-            for (path, bytes) in tree(repo.root()) {
-                if Path::new(&path) == decoy.as_path() {
-                    continue;
-                }
-                assert!(
-                    !mentions(&bytes, &stem),
-                    "{path} references the decoy {stem:?}, so it is not dead"
-                );
-            }
-        }
+    fn m03_the_decoy_is_named_by_nothing() {
+        let (_dir, repo, truth) = support::materialize(&PluginDirScan);
+        support::assert_decoys_are_unreferenced(&repo, &truth);
     }
 }

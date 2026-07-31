@@ -225,57 +225,20 @@ impl Mutant for GitignoreNegation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::support;
     use judged_core::git::RecoverabilityClass;
-    use std::process::Command;
-
-    /// Every file in `root` whose bytes contain `needle`, repo-relative.
-    fn files_mentioning(root: &Path, needle: &str) -> Vec<String> {
-        let output = Command::new("git")
-            .args(["grep", "-I", "-l", "--untracked", "--fixed-strings", needle])
-            .current_dir(root)
-            .output()
-            .expect("git grep should run inside a materialized fixture");
-        String::from_utf8(output.stdout)
-            .expect("fixture files are UTF-8")
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-
-    /// Files other than `artifact` itself that contain `needle`.
-    fn references_outside(root: &Path, needle: &str, artifact: &str) -> Vec<String> {
-        files_mentioning(root, needle)
-            .into_iter()
-            .filter(|hit| hit != artifact)
-            .collect()
-    }
-
-    fn materialize_into_tempdir() -> (tempfile::TempDir, GroundTruth) {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let truth = GitignoreNegation
-            .materialize(dir.path())
-            .expect("m13 materializes");
-        (dir, truth)
-    }
 
     #[test]
     fn m13_is_a_real_git_repository_and_the_negated_files_are_committed() {
-        let (dir, _truth) = materialize_into_tempdir();
-        let repo = Repo::discover(dir.path()).expect("fixture is a git working tree");
+        let (_dir, repo, _truth) = support::materialize(&GitignoreNegation);
 
-        for live in [LIVE_HTACCESS, LIVE_EDITOR_CONFIG] {
-            assert!(
-                repo.blob_sha(Path::new(live))
-                    .expect("blob_sha query succeeds")
-                    .is_some(),
-                "{live} must be in HEAD; if it is not, the negation did not take"
-            );
-        }
+        // If either is missing from HEAD, the negation did not take.
+        support::assert_committed(&repo, &[LIVE_HTACCESS, LIVE_EDITOR_CONFIG]);
     }
 
     #[test]
     fn m13_ground_truth_names_files_that_are_really_there() {
-        let (dir, truth) = materialize_into_tempdir();
+        let (_dir, repo, truth) = support::materialize(&GitignoreNegation);
 
         assert_eq!(
             truth.live_paths,
@@ -290,29 +253,22 @@ mod tests {
             GitignoreNegation::DECOYS.len()
         );
 
-        for path in truth
-            .live_paths
-            .iter()
-            .chain(&truth.decoy_dead_paths)
-            .cloned()
-            .chain(
-                IGNORED_SIBLINGS
-                    .iter()
-                    .map(|(path, _)| Path::new(path).to_path_buf()),
-            )
-        {
+        support::assert_ground_truth_is_on_disk(&repo, &truth);
+
+        // The ignored siblings are not ground truth — they are the other half
+        // of the per-file/per-directory contrast — but they still have to be
+        // on disk for the contrast to mean anything.
+        for (sibling, _) in IGNORED_SIBLINGS {
             assert!(
-                dir.path().join(&path).is_file(),
-                "{} is not on disk",
-                path.display()
+                repo.root().join(sibling).is_file(),
+                "{sibling} is not on disk"
             );
         }
     }
 
     #[test]
     fn m13_ignore_status_differs_per_file_inside_one_directory() {
-        let (dir, _truth) = materialize_into_tempdir();
-        let repo = Repo::discover(dir.path()).expect("fixture is a git working tree");
+        let (_dir, repo, _truth) = support::materialize(&GitignoreNegation);
 
         // The whole class in two assertions: same directory, opposite verdicts.
         // Any implementation that answers per-directory gets one of these wrong,
@@ -337,14 +293,14 @@ mod tests {
 
     #[test]
     fn m13_live_files_are_named_only_by_the_ignore_file() {
-        let (dir, _truth) = materialize_into_tempdir();
+        let (_dir, repo, _truth) = support::materialize(&GitignoreNegation);
 
         for (live, basename) in [
             (LIVE_HTACCESS, ".htaccess"),
             (LIVE_EDITOR_CONFIG, "settings.json"),
         ] {
             assert_eq!(
-                references_outside(dir.path(), basename, live),
+                support::references_outside(repo.root(), basename, live),
                 vec![MECHANISM.to_string()],
                 "{live} must be named by {MECHANISM} and by nothing else"
             );
@@ -353,19 +309,7 @@ mod tests {
 
     #[test]
     fn m13_decoys_are_named_nowhere_at_all() {
-        let (dir, truth) = materialize_into_tempdir();
-
-        for decoy in &truth.decoy_dead_paths {
-            let stem = decoy
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .expect("decoy has a UTF-8 stem");
-            let own_path = decoy.to_string_lossy().to_string();
-            let elsewhere = references_outside(dir.path(), stem, &own_path);
-            assert!(
-                elsewhere.is_empty(),
-                "a decoy anything mentions is not a decoy; {own_path} is named by {elsewhere:?}"
-            );
-        }
+        let (_dir, repo, truth) = support::materialize(&GitignoreNegation);
+        support::assert_decoys_are_unreferenced(&repo, &truth);
     }
 }

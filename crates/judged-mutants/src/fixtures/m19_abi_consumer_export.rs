@@ -40,8 +40,9 @@
 use std::path::Path;
 
 use judged_core::git::Repo;
-use judged_core::{Error, Result};
+use judged_core::Result;
 
+use crate::fixtures::write;
 use crate::mutant::{Ecosystem, GroundTruth, Mutant};
 
 /// Unfalsifiable from inside the repository **by construction**, which is
@@ -203,95 +204,23 @@ pub fn half_to_even(value: f64) -> f64 {
     }
 }
 
-/// Write one fixture file, creating parents, attaching the path to any failure.
-///
-/// Duplicated in each mutant module rather than shared: `fixtures/mod.rs` is
-/// complete and declares only the nineteen class modules, so there is nowhere
-/// to put a shared helper without changing it.
-fn write(root: &Path, rel: &str, contents: &str) -> Result<()> {
-    let path = root.join(rel);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| Error::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    std::fs::write(&path, contents).map_err(|source| Error::Io { path, source })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use crate::fixtures::support;
 
-    fn materialize() -> (TempDir, Repo, GroundTruth) {
-        let dir = TempDir::new().expect("create tempdir");
-        let truth = AbiConsumerExport
-            .materialize(dir.path())
-            .expect("m19 materializes");
-        let repo = Repo::discover(dir.path()).expect("fixture is a git repo");
-        (dir, repo, truth)
-    }
-
-    fn tree(root: &Path) -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        walk(root, root, &mut out);
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
-    }
-
-    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
-        for entry in std::fs::read_dir(dir).expect("read fixture directory") {
-            let path = entry.expect("read directory entry").path();
-            if path.file_name().is_some_and(|n| n == ".git") {
-                continue;
-            }
-            if path.is_dir() {
-                walk(&path, root, out);
-            } else {
-                let rel = path
-                    .strip_prefix(root)
-                    .expect("path is under the fixture root")
-                    .to_string_lossy()
-                    .into_owned();
-                out.push((
-                    rel,
-                    std::fs::read_to_string(&path).expect("fixture is UTF-8"),
-                ));
-            }
-        }
+    #[test]
+    fn m19_materializes_a_real_git_repo_with_one_commit() {
+        let (_dir, repo, _truth) = support::materialize(&AbiConsumerExport);
+        support::assert_committed(&repo, &["Cargo.toml", VERSION_SCRIPT, LIVE_FILE, DECOY]);
     }
 
     #[test]
-    fn materializes_a_real_git_repo_with_one_commit() {
-        let (_dir, repo, _truth) = materialize();
-        assert!(
-            repo.root().join(".git").is_dir(),
-            "expected a git directory"
-        );
-        for tracked in ["Cargo.toml", VERSION_SCRIPT, LIVE_FILE, DECOY] {
-            assert!(
-                repo.blob_sha(Path::new(tracked))
-                    .expect("blob_sha query succeeds")
-                    .is_some(),
-                "{tracked} must be in HEAD"
-            );
-        }
-    }
-
-    #[test]
-    fn ground_truth_paths_all_exist_on_disk() {
-        let (_dir, repo, truth) = materialize();
+    fn m19_ground_truth_paths_all_exist_on_disk() {
+        let (_dir, repo, truth) = support::materialize(&AbiConsumerExport);
         assert_eq!(truth.live_paths, vec![Path::new(LIVE_FILE).to_path_buf()]);
         assert_eq!(truth.live_symbols, vec![LIVE_SYMBOL.to_string()]);
-        assert!(
-            !truth.decoy_dead_paths.is_empty(),
-            "without a decoy, a tool that claims nothing passes m19 for free"
-        );
-        for path in truth.live_paths.iter().chain(&truth.decoy_dead_paths) {
-            assert!(path.is_relative(), "{path:?} must be repo-relative");
-            assert!(repo.root().join(path).is_file(), "{path:?} is missing");
-        }
+        support::assert_ground_truth_is_on_disk(&repo, &truth);
     }
 
     /// The hardness assertion, in its strongest available form: the symbol
@@ -299,12 +228,12 @@ mod tests {
     /// repository. Any second occurrence would be in-repo evidence of a
     /// consumer, which §6.24 says does not exist for this class.
     #[test]
-    fn the_exported_symbol_occurs_exactly_once_in_the_whole_repository() {
-        let (_dir, repo, _truth) = materialize();
+    fn m19_the_exported_symbol_occurs_exactly_once_in_the_whole_repository() {
+        let (_dir, repo, _truth) = support::materialize(&AbiConsumerExport);
 
-        let occurrences: Vec<(String, usize)> = tree(repo.root())
+        let occurrences: Vec<(String, usize)> = support::tree(repo.root())
             .into_iter()
-            .map(|(path, text)| (path, text.matches(LIVE_SYMBOL).count()))
+            .map(|(path, bytes)| (path, support::occurrences(&bytes, LIVE_SYMBOL)))
             .filter(|(_, count)| *count > 0)
             .collect();
         assert_eq!(
@@ -318,17 +247,17 @@ mod tests {
     /// `.def`, a ctypes binding, or a cgo preamble would each be such evidence
     /// and would each rescue the symbol by an entirely different mechanism.
     #[test]
-    fn the_repository_contains_no_evidence_of_any_consumer() {
-        let (_dir, repo, _truth) = materialize();
+    fn m19_the_repository_contains_no_evidence_of_any_consumer() {
+        let (_dir, repo, _truth) = support::materialize(&AbiConsumerExport);
 
-        for (path, text) in tree(repo.root()) {
+        for (path, bytes) in support::tree(repo.root()) {
             assert!(
                 !path.ends_with(".h") && !path.ends_with(".hpp") && !path.ends_with(".def"),
                 "{path} is a consumer-facing declaration; m19 must not ship one"
             );
             for binding in ["dlsym", "CDLL", "ffi.cdef", "extern crate ledger", "#cgo"] {
                 assert!(
-                    !text.contains(binding),
+                    !support::mentions(&bytes, binding),
                     "{path} binds the library via {binding}; that is a second mechanism"
                 );
             }
@@ -338,23 +267,22 @@ mod tests {
     /// The counter-signals §6.9 and §6.24 say a tool must key on, all present,
     /// so refusing here is a decision the tool could actually have reached.
     #[test]
-    fn the_repository_advertises_that_it_ships_an_abi() {
-        let (_dir, repo, _truth) = materialize();
+    fn m19_the_repository_advertises_that_it_ships_an_abi() {
+        let (_dir, repo, _truth) = support::materialize(&AbiConsumerExport);
 
-        let manifest =
-            std::fs::read_to_string(repo.root().join("Cargo.toml")).expect("read Cargo.toml");
+        let manifest = std::fs::read(repo.root().join("Cargo.toml")).expect("read Cargo.toml");
         assert!(
-            manifest.contains("cdylib"),
+            support::mentions(&manifest, "cdylib"),
             "§6.9's counter-signal is a distribution manifest; declare the crate-type"
         );
-        let live = std::fs::read_to_string(repo.root().join(LIVE_FILE)).expect("read the export");
+        let live = std::fs::read(repo.root().join(LIVE_FILE)).expect("read the export");
         assert!(
-            live.contains("#[no_mangle]") && live.contains("extern \"C\""),
+            support::mentions(&live, "#[no_mangle]") && support::mentions(&live, "extern \"C\""),
             "§6.24 lists #[no_mangle] among its ABI markers"
         );
-        let build = std::fs::read_to_string(repo.root().join("build.rs")).expect("read build.rs");
+        let build = std::fs::read(repo.root().join("build.rs")).expect("read build.rs");
         assert!(
-            build.contains(VERSION_SCRIPT),
+            support::mentions(&build, VERSION_SCRIPT),
             "an unwired version script is decoration; hand it to the linker"
         );
     }
@@ -363,40 +291,25 @@ mod tests {
     /// distributed. A `global:` list enumerating the symbol would be a manifest
     /// a scanner could read, and §6.24's point is that no such manifest exists.
     #[test]
-    fn the_version_script_pins_the_abi_without_naming_the_symbol() {
-        let (_dir, repo, _truth) = materialize();
-        let script = std::fs::read_to_string(repo.root().join(VERSION_SCRIPT))
-            .expect("read the version script");
+    fn m19_the_version_script_pins_the_abi_without_naming_the_symbol() {
+        let (_dir, repo, _truth) = support::materialize(&AbiConsumerExport);
+        let script =
+            std::fs::read(repo.root().join(VERSION_SCRIPT)).expect("read the version script");
 
-        assert!(script.contains("global:") && script.contains("local:"));
+        assert!(support::mentions(&script, "global:") && support::mentions(&script, "local:"));
         assert!(
-            script.contains("ledger_*;"),
+            support::mentions(&script, "ledger_*;"),
             "the export is matched by pattern, the way version scripts are written"
         );
         assert!(
-            !script.contains(LIVE_SYMBOL),
+            !support::mentions(&script, LIVE_SYMBOL),
             "listing the symbol would hand a scanner the evidence §6.24 says is absent"
         );
     }
 
     #[test]
-    fn the_decoy_is_named_by_nothing() {
-        let (_dir, repo, truth) = materialize();
-        for decoy in &truth.decoy_dead_paths {
-            let stem = decoy
-                .file_stem()
-                .expect("decoy has a file name")
-                .to_string_lossy()
-                .into_owned();
-            for (path, text) in tree(repo.root()) {
-                if Path::new(&path) == decoy.as_path() {
-                    continue;
-                }
-                assert!(
-                    !text.contains(&stem),
-                    "{path} references the decoy {stem:?}, so it is not dead"
-                );
-            }
-        }
+    fn m19_the_decoy_is_named_by_nothing() {
+        let (_dir, repo, truth) = support::materialize(&AbiConsumerExport);
+        support::assert_decoys_are_unreferenced(&repo, &truth);
     }
 }

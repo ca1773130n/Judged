@@ -281,53 +281,17 @@ impl Mutant for LinknameAlias {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-
-    /// Every file in `root` whose bytes contain `needle`, repo-relative.
-    ///
-    /// Deliberately `git grep --fixed-strings`: the claim under test is about
-    /// what a *plain textual search* can find, so the check has to be a plain
-    /// textual search and not a smarter one. `git grep` also skips `.git/`,
-    /// where the committed blobs would otherwise match everything.
-    fn files_mentioning(root: &Path, needle: &str) -> Vec<String> {
-        let output = Command::new("git")
-            .args(["grep", "-I", "-l", "--untracked", "--fixed-strings", needle])
-            .current_dir(root)
-            .output()
-            .expect("git grep should run inside a materialized fixture");
-        String::from_utf8(output.stdout)
-            .expect("fixture files are UTF-8")
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-
-    fn materialize_into_tempdir() -> (tempfile::TempDir, GroundTruth) {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let truth = LinknameAlias
-            .materialize(dir.path())
-            .expect("m12 materializes");
-        (dir, truth)
-    }
+    use crate::fixtures::support;
 
     #[test]
     fn m12_is_a_real_git_repository_whose_live_artifacts_are_committed() {
-        let (dir, _truth) = materialize_into_tempdir();
-        let repo = Repo::discover(dir.path()).expect("fixture is a git working tree");
-
-        for live in [LIVE, LIVE_ABI] {
-            assert!(
-                repo.blob_sha(Path::new(live))
-                    .expect("blob_sha query succeeds")
-                    .is_some(),
-                "{live} must be present in HEAD"
-            );
-        }
+        let (_dir, repo, _truth) = support::materialize(&LinknameAlias);
+        support::assert_committed(&repo, &[LIVE, LIVE_ABI]);
     }
 
     #[test]
     fn m12_ground_truth_names_files_that_are_really_there() {
-        let (dir, truth) = materialize_into_tempdir();
+        let (_dir, repo, truth) = support::materialize(&LinknameAlias);
 
         assert_eq!(
             truth.live_paths,
@@ -339,24 +303,18 @@ mod tests {
         );
         assert_eq!(truth.decoy_dead_paths.len(), LinknameAlias::DECOYS.len());
 
-        for path in truth.live_paths.iter().chain(&truth.decoy_dead_paths) {
-            assert!(
-                dir.path().join(path).is_file(),
-                "ground truth names {} but it is not on disk",
-                path.display()
-            );
-        }
+        support::assert_ground_truth_is_on_disk(&repo, &truth);
     }
 
     #[test]
     fn m12_the_aliased_function_has_no_caller_outside_the_directive() {
-        let (dir, _truth) = materialize_into_tempdir();
+        let (_dir, repo, _truth) = support::materialize(&LinknameAlias);
 
         // The definition and the one directive, and nothing else. In
         // particular not `cmd/telemetryd/main.go`: a Go call site would give
         // the type checker an edge and the mutant would be testing nothing.
         assert_eq!(
-            files_mentioning(dir.path(), LIVE_SYMBOL),
+            support::files_mentioning(repo.root(), LIVE_SYMBOL),
             vec![MECHANISM.to_string(), LIVE.to_string()],
             "only the linkname directive and the definition may name the target"
         );
@@ -365,7 +323,7 @@ mod tests {
         // applied to the qualified name, does find it. A mutant nothing can
         // solve measures nothing.
         assert_eq!(
-            files_mentioning(dir.path(), LINKNAME_DIRECTIVE),
+            support::files_mentioning(repo.root(), LINKNAME_DIRECTIVE),
             vec![MECHANISM.to_string()],
             "the directive is the one rescue signal and must be spelled in full"
         );
@@ -373,14 +331,14 @@ mod tests {
 
     #[test]
     fn m12_the_c_export_is_corroborated_by_nothing_at_all() {
-        let (dir, _truth) = materialize_into_tempdir();
+        let (_dir, repo, _truth) = support::materialize(&LinknameAlias);
 
         // The `//export` line and the definition it decorates are the same
         // file. This is the class at its most honest: there is no second
         // opinion available inside the repository, so a tool that answers
         // "dead" here is guessing, not measuring.
         assert_eq!(
-            files_mentioning(dir.path(), ABI_SYMBOL),
+            support::files_mentioning(repo.root(), ABI_SYMBOL),
             vec![LIVE_ABI.to_string()],
             "nothing outside the exported file may name the exported symbol"
         );
@@ -388,7 +346,7 @@ mod tests {
 
     #[test]
     fn m12_neither_live_file_is_named_by_its_filename() {
-        let (dir, _truth) = materialize_into_tempdir();
+        let (_dir, repo, _truth) = support::materialize(&LinknameAlias);
 
         // Go resolves packages by directory and symbols by directive; neither
         // spells a filename. So a cleaner that greps for `drain.go` or
@@ -400,7 +358,7 @@ mod tests {
                 .and_then(|name| name.to_str())
                 .expect("live path has a UTF-8 basename");
             assert!(
-                files_mentioning(dir.path(), basename).is_empty(),
+                support::files_mentioning(repo.root(), basename).is_empty(),
                 "{basename} must be spelled nowhere; nothing links Go files by name"
             );
         }
@@ -408,18 +366,7 @@ mod tests {
 
     #[test]
     fn m12_decoys_are_named_nowhere_at_all() {
-        let (dir, truth) = materialize_into_tempdir();
-
-        for decoy in &truth.decoy_dead_paths {
-            let stem = decoy
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .expect("decoy has a UTF-8 stem");
-            let mentions = files_mentioning(dir.path(), stem);
-            assert!(
-                mentions.iter().all(|f| Path::new(f) == decoy),
-                "a decoy that anything mentions is not a decoy; {stem} appears in {mentions:?}"
-            );
-        }
+        let (_dir, repo, truth) = support::materialize(&LinknameAlias);
+        support::assert_decoys_are_unreferenced(&repo, &truth);
     }
 }

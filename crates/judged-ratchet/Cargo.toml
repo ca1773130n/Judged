@@ -11,3 +11,9 @@ repository.workspace = true
 judged-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# Every test here needs a throwaway git working tree. `tempfile` is already a
+# workspace dependency for the E2 suite, so the tests use it rather than
+# hand-rolling a second temp-directory type that would have to be kept correct.
+tempfile = { workspace = true }

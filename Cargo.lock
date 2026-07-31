@@ -109,6 +109,7 @@ dependencies = [
  "judged-mutants",
  "judged-ratchet",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -119,6 +120,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
 ]
 
@@ -137,6 +139,7 @@ dependencies = [
  "judged-core",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

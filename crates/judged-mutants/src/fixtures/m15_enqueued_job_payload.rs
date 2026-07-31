@@ -35,8 +35,9 @@
 use std::path::Path;
 
 use judged_core::git::Repo;
-use judged_core::{Error, Result};
+use judged_core::Result;
 
+use crate::fixtures::write;
 use crate::mutant::{Ecosystem, GroundTruth, Mutant};
 
 /// The job Celery would hand a worker, protocol 1, before base64.
@@ -193,67 +194,10 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-/// Write one fixture file, creating parents, attaching the path to any failure.
-///
-/// Duplicated in each mutant module rather than shared: `fixtures/mod.rs` is
-/// complete and declares only the nineteen class modules, so there is nowhere
-/// to put a shared helper without changing it.
-fn write(root: &Path, rel: &str, contents: &str) -> Result<()> {
-    let path = root.join(rel);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| Error::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    std::fs::write(&path, contents).map_err(|source| Error::Io { path, source })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use judged_core::git::Repo;
-    use tempfile::TempDir;
-
-    fn materialize() -> (TempDir, Repo, GroundTruth) {
-        let dir = TempDir::new().expect("create tempdir");
-        let truth = EnqueuedJobPayload
-            .materialize(dir.path())
-            .expect("m15 materializes");
-        let repo = Repo::discover(dir.path()).expect("fixture is a git repo");
-        (dir, repo, truth)
-    }
-
-    fn tree(root: &Path) -> Vec<(String, Vec<u8>)> {
-        let mut out = Vec::new();
-        walk(root, root, &mut out);
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
-    }
-
-    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
-        for entry in std::fs::read_dir(dir).expect("read fixture directory") {
-            let path = entry.expect("read directory entry").path();
-            if path.file_name().is_some_and(|n| n == ".git") {
-                continue;
-            }
-            if path.is_dir() {
-                walk(&path, root, out);
-            } else {
-                let rel = path
-                    .strip_prefix(root)
-                    .expect("path is under the fixture root")
-                    .to_string_lossy()
-                    .into_owned();
-                out.push((rel, std::fs::read(&path).expect("read fixture file")));
-            }
-        }
-    }
-
-    fn mentions(haystack: &[u8], needle: &str) -> bool {
-        let needle = needle.as_bytes();
-        haystack.windows(needle.len()).any(|w| w == needle)
-    }
+    use crate::fixtures::support;
 
     /// Independent of the encoder under test on purpose: if both directions
     /// shared code, a broken alphabet would round-trip and the test would
@@ -287,50 +231,37 @@ mod tests {
     }
 
     #[test]
-    fn materializes_a_real_git_repo_with_one_commit() {
-        let (_dir, repo, _truth) = materialize();
-        assert!(
-            repo.root().join(".git").is_dir(),
-            "expected a git directory"
-        );
-        assert!(
-            repo.is_tracked(Path::new("var/broker/celery-default.jsonl"))
-                .expect("query the index"),
-            "the queue file stands in for the broker and must be committed"
-        );
+    fn m15_materializes_a_real_git_repo_with_one_commit() {
+        let (_dir, repo, _truth) = support::materialize(&EnqueuedJobPayload);
+
+        // The queue file stands in for the broker, so it has to be committed.
+        support::assert_committed(&repo, &["var/broker/celery-default.jsonl"]);
     }
 
     #[test]
-    fn ground_truth_paths_all_exist_on_disk() {
-        let (_dir, repo, truth) = materialize();
+    fn m15_ground_truth_paths_all_exist_on_disk() {
+        let (_dir, repo, truth) = support::materialize(&EnqueuedJobPayload);
         assert!(
             !truth.live_paths.is_empty(),
             "m15's live artifact is a file"
         );
-        assert!(
-            !truth.decoy_dead_paths.is_empty(),
-            "without a decoy, a tool that claims nothing passes m15 for free"
-        );
-        for path in truth.live_paths.iter().chain(&truth.decoy_dead_paths) {
-            assert!(path.is_relative(), "{path:?} must be repo-relative");
-            assert!(repo.root().join(path).is_file(), "{path:?} is missing");
-        }
+        support::assert_ground_truth_is_on_disk(&repo, &truth);
     }
 
     /// The whole point of §6.24: the payload names the class, and no textual
     /// scan of the repository — including of the committed queue file — can
     /// find it, because Celery's protocol 1 body is base64.
     #[test]
-    fn the_class_name_survives_only_inside_the_encoded_payload() {
-        let (_dir, repo, truth) = materialize();
+    fn m15_the_class_name_survives_only_inside_the_encoded_payload() {
+        let (_dir, repo, truth) = support::materialize(&EnqueuedJobPayload);
         let symbol = truth
             .live_symbols
             .first()
             .expect("m15 declares the worker class as a live symbol");
 
-        let naming: Vec<String> = tree(repo.root())
+        let naming: Vec<String> = support::tree(repo.root())
             .into_iter()
-            .filter(|(_, bytes)| mentions(bytes, symbol))
+            .filter(|(_, bytes)| support::mentions(bytes, symbol))
             .map(|(path, _)| path)
             .collect();
         assert_eq!(
@@ -344,7 +275,7 @@ mod tests {
         let line = queue.lines().next().expect("at least one enqueued job");
         let decoded = base64_decode(envelope_body(line));
         assert!(
-            mentions(&decoded, symbol),
+            support::mentions(&decoded, symbol),
             "the enqueued payload must actually name {symbol}, or the mutant \
              asserts a liveness that does not exist"
         );
@@ -354,11 +285,11 @@ mod tests {
     /// counter-signal ("detect a job framework ... → ineligible above
     /// report-only"). Without it the mutant would be unfair rather than hard.
     #[test]
-    fn the_repository_admits_it_runs_a_job_framework() {
-        let (_dir, repo, _truth) = materialize();
+    fn m15_the_repository_admits_it_runs_a_job_framework() {
+        let (_dir, repo, _truth) = support::materialize(&EnqueuedJobPayload);
         let manifest = std::fs::read(repo.root().join("pyproject.toml")).expect("read pyproject");
         assert!(
-            mentions(&manifest, "celery"),
+            support::mentions(&manifest, "celery"),
             "§6.24's counter-signal is framework detection; declare the dependency"
         );
     }
@@ -366,12 +297,12 @@ mod tests {
     /// "Deleting it does not break the build, does not break any test, and does
     /// not break the deploy" (§6.24). That is only true if nothing enqueues it.
     #[test]
-    fn nothing_in_the_repository_enqueues_the_task() {
-        let (_dir, repo, _truth) = materialize();
-        for (path, bytes) in tree(repo.root()) {
+    fn m15_nothing_in_the_repository_enqueues_the_task() {
+        let (_dir, repo, _truth) = support::materialize(&EnqueuedJobPayload);
+        for (path, bytes) in support::tree(repo.root()) {
             for enqueue in [".delay(", "apply_async", "send_task"] {
                 assert!(
-                    !mentions(&bytes, enqueue),
+                    !support::mentions(&bytes, enqueue),
                     "{path} still enqueues via {enqueue}; m15 requires the last \
                      call site to be gone"
                 );
@@ -380,23 +311,8 @@ mod tests {
     }
 
     #[test]
-    fn the_decoy_is_named_by_nothing() {
-        let (_dir, repo, truth) = materialize();
-        for decoy in &truth.decoy_dead_paths {
-            let stem = decoy
-                .file_stem()
-                .expect("decoy has a file name")
-                .to_string_lossy()
-                .into_owned();
-            for (path, bytes) in tree(repo.root()) {
-                if Path::new(&path) == decoy.as_path() {
-                    continue;
-                }
-                assert!(
-                    !mentions(&bytes, &stem),
-                    "{path} references the decoy {stem:?}, so it is not dead"
-                );
-            }
-        }
+    fn m15_the_decoy_is_named_by_nothing() {
+        let (_dir, repo, truth) = support::materialize(&EnqueuedJobPayload);
+        support::assert_decoys_are_unreferenced(&repo, &truth);
     }
 }

@@ -21,3 +21,9 @@ judged-mutants = { workspace = true }
 # being types and becomes bytes again. `judged-core` models the SARIF subset but
 # ships no reader, so the reader lives here.
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# The end-to-end tests drive the real binary against a real git working tree,
+# which has to be a throwaway directory. Same reasoning as `judged-ratchet`:
+# one temp-directory implementation for the workspace, not one per test file.
+tempfile = { workspace = true }

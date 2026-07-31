@@ -237,59 +237,22 @@ impl Mutant for ConcurrencyHelper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use judged_core::git::Repo;
-    use std::process::Command;
+    use crate::fixtures::support;
 
     /// The condition in [`MECHANISM`] that opens the contended branch. Every
     /// call to the helper must appear after it, so the fixture cannot decay
     /// into an unconditional call that a single-threaded test would cover.
     const CONTENDED_BRANCH: &str = "if state.waiting > 0 {";
 
-    /// Every file in `root` whose bytes contain `needle`, repo-relative.
-    ///
-    /// Deliberately `git grep --fixed-strings`: the claim under test is about
-    /// what a *plain textual search* can find, so the check has to be a plain
-    /// textual search and not a smarter one. `git grep` also skips `.git/`,
-    /// where the committed blobs would otherwise match everything.
-    fn files_mentioning(root: &Path, needle: &str) -> Vec<String> {
-        let output = Command::new("git")
-            .args(["grep", "-I", "-l", "--untracked", "--fixed-strings", needle])
-            .current_dir(root)
-            .output()
-            .expect("git grep should run inside a materialized fixture");
-        String::from_utf8(output.stdout)
-            .expect("fixture files are UTF-8")
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-
-    fn materialize_into_tempdir() -> (tempfile::TempDir, GroundTruth) {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let truth = ConcurrencyHelper
-            .materialize(dir.path())
-            .expect("m06 materializes");
-        (dir, truth)
-    }
-
     #[test]
     fn m06_is_a_real_git_repository_whose_live_artifact_is_committed() {
-        let (dir, _truth) = materialize_into_tempdir();
-        let repo = Repo::discover(dir.path()).expect("fixture is a git working tree");
-
-        // A blob SHA at HEAD exists only if a commit contains it, so this
-        // asserts "real repository" and "one commit" together.
-        assert!(
-            repo.blob_sha(Path::new(LIVE))
-                .expect("blob_sha query succeeds")
-                .is_some(),
-            "{LIVE} must be present in HEAD"
-        );
+        let (_dir, repo, _truth) = support::materialize(&ConcurrencyHelper);
+        support::assert_committed(&repo, &[LIVE]);
     }
 
     #[test]
     fn m06_ground_truth_names_files_that_are_really_there() {
-        let (dir, truth) = materialize_into_tempdir();
+        let (_dir, repo, truth) = support::materialize(&ConcurrencyHelper);
 
         assert_eq!(truth.live_paths, vec![Path::new(LIVE).to_path_buf()]);
         assert_eq!(truth.live_symbols, vec![LIVE_SYMBOL.to_string()]);
@@ -298,26 +261,20 @@ mod tests {
             ConcurrencyHelper::DECOYS.len()
         );
 
-        for path in truth.live_paths.iter().chain(&truth.decoy_dead_paths) {
-            assert!(
-                dir.path().join(path).is_file(),
-                "ground truth names {} but it is not on disk",
-                path.display()
-            );
-        }
+        support::assert_ground_truth_is_on_disk(&repo, &truth);
     }
 
     #[test]
     fn m06_the_helper_is_called_only_from_the_contended_branch() {
-        let (dir, _truth) = materialize_into_tempdir();
+        let (_dir, repo, _truth) = support::materialize(&ConcurrencyHelper);
 
         assert_eq!(
-            files_mentioning(dir.path(), LIVE_SYMBOL),
+            support::files_mentioning(repo.root(), LIVE_SYMBOL),
             vec![MECHANISM.to_string(), LIVE.to_string()],
             "only the definition and the one contended branch may name the helper"
         );
 
-        let source = std::fs::read_to_string(dir.path().join(MECHANISM))
+        let source = std::fs::read_to_string(repo.root().join(MECHANISM))
             .expect("mechanism file is readable");
         let branch = source
             .find(CONTENDED_BRANCH)
@@ -333,7 +290,7 @@ mod tests {
 
     #[test]
     fn m06_no_test_in_the_repository_can_contend() {
-        let (dir, _truth) = materialize_into_tempdir();
+        let (_dir, repo, _truth) = support::materialize(&ConcurrencyHelper);
 
         // The branch is reachable only with a second thread in existence. If
         // nothing in the repository can create one, then running the suite --
@@ -341,7 +298,7 @@ mod tests {
         // as dead every time, which is §3.4 Issue 4 exactly.
         for spawner in ["thread::spawn", "std::thread", "scope("] {
             assert!(
-                files_mentioning(dir.path(), spawner).is_empty(),
+                support::files_mentioning(repo.root(), spawner).is_empty(),
                 "{spawner} appears in the fixture; the suite must not be able to contend"
             );
         }
@@ -349,18 +306,7 @@ mod tests {
 
     #[test]
     fn m06_decoys_are_named_nowhere_at_all() {
-        let (dir, truth) = materialize_into_tempdir();
-
-        for decoy in &truth.decoy_dead_paths {
-            let stem = decoy
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .expect("decoy has a UTF-8 stem");
-            let mentions = files_mentioning(dir.path(), stem);
-            assert!(
-                mentions.iter().all(|f| Path::new(f) == decoy),
-                "a decoy that anything mentions is not a decoy; {stem} appears in {mentions:?}"
-            );
-        }
+        let (_dir, repo, truth) = support::materialize(&ConcurrencyHelper);
+        support::assert_decoys_are_unreferenced(&repo, &truth);
     }
 }

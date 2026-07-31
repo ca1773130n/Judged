@@ -186,56 +186,39 @@ impl Mutant for CheckedInGeneratedAsset {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use crate::fixtures::support;
 
-    /// Every file in `root` whose bytes contain `needle`, repo-relative.
-    fn files_mentioning(root: &Path, needle: &str) -> Vec<String> {
-        let output = Command::new("git")
-            .args(["grep", "-I", "-l", "--untracked", "--fixed-strings", needle])
-            .current_dir(root)
-            .output()
-            .expect("git grep should run inside a materialized fixture");
-        String::from_utf8(output.stdout)
-            .expect("fixture files are UTF-8")
-            .lines()
-            .map(str::to_string)
-            .collect()
+    /// `widget.7f3a91c.js` — the hashed basename, derived from [`LIVE`] rather
+    /// than transcribed, so that changing the fixture's hash cannot leave the
+    /// assertions quietly testing a filename that no longer exists.
+    fn bundle_basename() -> &'static str {
+        Path::new(LIVE)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("LIVE has a UTF-8 basename")
     }
 
-    /// Files other than `artifact` itself that contain `needle`.
-    fn references_outside(root: &Path, needle: &str, artifact: &str) -> Vec<String> {
-        files_mentioning(root, needle)
-            .into_iter()
-            .filter(|hit| hit != artifact)
-            .collect()
-    }
-
-    fn materialize_into_tempdir() -> (tempfile::TempDir, GroundTruth) {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let truth = CheckedInGeneratedAsset
-            .materialize(dir.path())
-            .expect("m14 materializes");
-        (dir, truth)
+    /// `widget.7f3a91c` — the same name without its extension, which is the
+    /// form a build script would spell if it knew the name at all.
+    fn bundle_stem() -> &'static str {
+        Path::new(LIVE)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("LIVE has a UTF-8 stem")
     }
 
     #[test]
     fn m14_commits_the_bundle_despite_it_looking_like_build_output() {
-        let (dir, _truth) = materialize_into_tempdir();
-        let repo = Repo::discover(dir.path()).expect("fixture is a git working tree");
+        let (_dir, repo, _truth) = support::materialize(&CheckedInGeneratedAsset);
 
         // If a stray ignore rule kept dist/ out of the index, the mutant would
         // be testing the ignore path (m13) instead of the CDN path.
-        assert!(
-            repo.blob_sha(Path::new(LIVE))
-                .expect("blob_sha query succeeds")
-                .is_some(),
-            "{LIVE} must be committed: a checked-in artifact is the premise"
-        );
+        support::assert_committed(&repo, &[LIVE]);
     }
 
     #[test]
     fn m14_ground_truth_names_files_that_are_really_there() {
-        let (dir, truth) = materialize_into_tempdir();
+        let (_dir, repo, truth) = support::materialize(&CheckedInGeneratedAsset);
 
         assert_eq!(truth.live_paths, vec![Path::new(LIVE).to_path_buf()]);
         assert!(truth.live_symbols.is_empty());
@@ -244,28 +227,22 @@ mod tests {
             CheckedInGeneratedAsset::DECOYS.len()
         );
 
-        for path in truth.live_paths.iter().chain(&truth.decoy_dead_paths) {
-            assert!(
-                dir.path().join(path).is_file(),
-                "ground truth names {} but it is not on disk",
-                path.display()
-            );
-        }
+        support::assert_ground_truth_is_on_disk(&repo, &truth);
     }
 
     #[test]
     fn m14_the_bundle_is_named_by_one_html_attribute_and_by_no_build_config() {
-        let (dir, _truth) = materialize_into_tempdir();
+        let (_dir, repo, _truth) = support::materialize(&CheckedInGeneratedAsset);
 
         assert_eq!(
-            references_outside(dir.path(), "widget.7f3a91c.js", LIVE),
+            support::references_outside(repo.root(), bundle_basename(), LIVE),
             vec![MECHANISM.to_string()],
             "only the script tag may name the bundle"
         );
 
         // Specifically not the build script, which is where a reader would
         // expect to find it and where a build-graph analysis would look.
-        let build_config_hits = files_mentioning(dir.path(), "widget.7f3a91c");
+        let build_config_hits = support::files_mentioning(repo.root(), bundle_stem());
         assert!(
             !build_config_hits.contains(&"package.json".to_string())
                 && !build_config_hits.contains(&"tsconfig.json".to_string()),
@@ -275,19 +252,7 @@ mod tests {
 
     #[test]
     fn m14_the_stale_bundle_beside_it_really_is_unreferenced() {
-        let (dir, truth) = materialize_into_tempdir();
-
-        for decoy in &truth.decoy_dead_paths {
-            let stem = decoy
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .expect("decoy has a UTF-8 stem");
-            let own_path = decoy.to_string_lossy().to_string();
-            let elsewhere = references_outside(dir.path(), stem, &own_path);
-            assert!(
-                elsewhere.is_empty(),
-                "a decoy anything mentions is not a decoy; {own_path} is named by {elsewhere:?}"
-            );
-        }
+        let (_dir, repo, truth) = support::materialize(&CheckedInGeneratedAsset);
+        support::assert_decoys_are_unreferenced(&repo, &truth);
     }
 }

@@ -35,7 +35,8 @@ const COMMIT_IDENTITY_NAME: &str = "Judged";
 const COMMIT_IDENTITY_EMAIL: &str = "judged@judged.invalid";
 
 /// A finished `git` invocation, kept together with the command that produced it
-/// so that every error message can name the exact thing that failed (§12).
+/// so that every error message can name the exact thing that failed (AGENTS.md
+/// rule 12, "Fail Loudly": errors are actionable or they are noise).
 struct GitRun {
     args: Vec<OsString>,
     dir: PathBuf,
@@ -198,7 +199,8 @@ impl Repo {
     /// Runs `git rev-parse --show-toplevel`. Fails when `start` is not inside a
     /// working tree — including inside a bare repository, which prints nothing.
     /// "Not a repository" must never be mistaken for "a repository with nothing
-    /// in it" (§12).
+    /// in it" — §6.20's rule that `"no data" must be a distinct state from
+    /// "zero executions"`, applied to the substrate the classifier runs on.
     pub fn discover(start: &Path) -> Result<Repo> {
         let run = GitRun::new(start, ["rev-parse", "--show-toplevel"], None)?.require_success()?;
         let toplevel = run.stdout_trimmed()?;

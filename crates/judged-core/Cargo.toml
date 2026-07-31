@@ -13,3 +13,8 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# The git tests build real repositories on disk; tempfile owns their creation,
+# their uniqueness under concurrent test threads, and their removal on drop.
+tempfile = { workspace = true }

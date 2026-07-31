@@ -242,52 +242,17 @@ impl Mutant for ReadmeExecutedBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use judged_core::git::Repo;
-    use std::process::Command;
-
-    /// Every file in `root` whose bytes contain `needle`, repo-relative.
-    ///
-    /// Deliberately `git grep --fixed-strings`: the claim under test is about
-    /// what a *plain textual search* can find, so the check has to be a plain
-    /// textual search and not a smarter one. `git grep` also skips `.git/`,
-    /// where the committed blobs would otherwise match everything.
-    fn files_mentioning(root: &Path, needle: &str) -> Vec<String> {
-        let output = Command::new("git")
-            .args(["grep", "-I", "-l", "--untracked", "--fixed-strings", needle])
-            .current_dir(root)
-            .output()
-            .expect("git grep should run inside a materialized fixture");
-        String::from_utf8(output.stdout)
-            .expect("fixture files are UTF-8")
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-
-    fn materialize_into_tempdir() -> (tempfile::TempDir, GroundTruth) {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let truth = ReadmeExecutedBlock
-            .materialize(dir.path())
-            .expect("m09 materializes");
-        (dir, truth)
-    }
+    use crate::fixtures::support;
 
     #[test]
     fn m09_is_a_real_git_repository_whose_live_artifact_is_committed() {
-        let (dir, _truth) = materialize_into_tempdir();
-        let repo = Repo::discover(dir.path()).expect("fixture is a git working tree");
-
-        assert!(
-            repo.blob_sha(Path::new(LIVE))
-                .expect("blob_sha query succeeds")
-                .is_some(),
-            "{LIVE} must be present in HEAD"
-        );
+        let (_dir, repo, _truth) = support::materialize(&ReadmeExecutedBlock);
+        support::assert_committed(&repo, &[LIVE]);
     }
 
     #[test]
     fn m09_ground_truth_names_files_that_are_really_there() {
-        let (dir, truth) = materialize_into_tempdir();
+        let (_dir, repo, truth) = support::materialize(&ReadmeExecutedBlock);
 
         assert_eq!(truth.live_paths, vec![Path::new(LIVE).to_path_buf()]);
         assert_eq!(truth.live_symbols, vec![LIVE_SYMBOL.to_string()]);
@@ -296,24 +261,18 @@ mod tests {
             ReadmeExecutedBlock::DECOYS.len()
         );
 
-        for path in truth.live_paths.iter().chain(&truth.decoy_dead_paths) {
-            assert!(
-                dir.path().join(path).is_file(),
-                "ground truth names {} but it is not on disk",
-                path.display()
-            );
-        }
+        support::assert_ground_truth_is_on_disk(&repo, &truth);
     }
 
     #[test]
     fn m09_no_source_file_names_the_documented_api() {
-        let (dir, _truth) = materialize_into_tempdir();
+        let (_dir, repo, _truth) = support::materialize(&ReadmeExecutedBlock);
 
         // The Markdown file and the definition, and nothing else. In
         // particular not `src/main.rs`: if the binary called it, the call graph
         // would rescue it and the mutant would be testing nothing.
         assert_eq!(
-            files_mentioning(dir.path(), LIVE_SYMBOL),
+            support::files_mentioning(repo.root(), LIVE_SYMBOL),
             vec![MECHANISM.to_string(), LIVE.to_string()],
             "only the README example and the definition may name the API"
         );
@@ -321,9 +280,8 @@ mod tests {
 
     #[test]
     fn m09_the_documented_module_is_never_named_by_its_filename() {
-        let (dir, _truth) = materialize_into_tempdir();
-        let live = Path::new(LIVE);
-        let basename = live
+        let (_dir, repo, _truth) = support::materialize(&ReadmeExecutedBlock);
+        let basename = Path::new(LIVE)
             .file_name()
             .and_then(|n| n.to_str())
             .expect("LIVE has a UTF-8 basename");
@@ -333,26 +291,26 @@ mod tests {
         // greps for the filename before deleting the file finds nothing, and
         // the mutant is hard for the reason it claims to be.
         assert!(
-            files_mentioning(dir.path(), basename).is_empty(),
+            support::files_mentioning(repo.root(), basename).is_empty(),
             "{basename} must be spelled nowhere; the README names the item, not the file"
         );
     }
 
     #[test]
     fn m09_the_readme_block_is_actually_executed() {
-        let (dir, _truth) = materialize_into_tempdir();
+        let (_dir, repo, _truth) = support::materialize(&ReadmeExecutedBlock);
 
         // A README block that CI does not run is a comment, and this class
         // would then be indistinguishable from an ordinary dead function. Both
         // halves have to hold: the crate root includes the README as docs, and
         // CI runs the doctests.
         assert_eq!(
-            files_mentioning(dir.path(), DOC_INCLUDE),
+            support::files_mentioning(repo.root(), DOC_INCLUDE),
             vec![DOC_INCLUDE_SITE.to_string()],
             "the crate root must include the README as documentation"
         );
         assert_eq!(
-            files_mentioning(dir.path(), CI_DOCTEST_STEP),
+            support::files_mentioning(repo.root(), CI_DOCTEST_STEP),
             vec![CI_WORKFLOW.to_string()],
             "CI must run the doctests, or the block is not executed"
         );
@@ -360,18 +318,7 @@ mod tests {
 
     #[test]
     fn m09_decoys_are_named_nowhere_at_all() {
-        let (dir, truth) = materialize_into_tempdir();
-
-        for decoy in &truth.decoy_dead_paths {
-            let stem = decoy
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .expect("decoy has a UTF-8 stem");
-            let mentions = files_mentioning(dir.path(), stem);
-            assert!(
-                mentions.iter().all(|f| Path::new(f) == decoy),
-                "a decoy that anything mentions is not a decoy; {stem} appears in {mentions:?}"
-            );
-        }
+        let (_dir, repo, truth) = support::materialize(&ReadmeExecutedBlock);
+        support::assert_decoys_are_unreferenced(&repo, &truth);
     }
 }

@@ -42,6 +42,7 @@ use std::path::Path;
 use judged_core::git::Repo;
 use judged_core::{Error, Result};
 
+use crate::fixtures::write;
 use crate::mutant::{Ecosystem, GroundTruth, Mutant};
 
 /// A pickled cache entry on disk still names the class. Nothing in the
@@ -204,15 +205,6 @@ def test_missing_cache_is_a_miss(tmp_path):
     }
 }
 
-/// Write one fixture file, creating parents, attaching the path to any failure.
-///
-/// Duplicated in each mutant module rather than shared: `fixtures/mod.rs` is
-/// complete and declares only the nineteen class modules, so there is nowhere
-/// to put a shared helper without changing it.
-fn write(root: &Path, rel: &str, contents: &str) -> Result<()> {
-    write_bytes(root, rel, contents.as_bytes())
-}
-
 /// Same, for the blob — which is not text and must not be coerced into it.
 fn write_bytes(root: &Path, rel: &str, contents: &[u8]) -> Result<()> {
     let path = root.join(rel);
@@ -228,94 +220,36 @@ fn write_bytes(root: &Path, rel: &str, contents: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use crate::fixtures::support;
 
-    fn materialize() -> (TempDir, Repo, GroundTruth) {
-        let dir = TempDir::new().expect("create tempdir");
-        let truth = PersistedSerializedBlob
-            .materialize(dir.path())
-            .expect("m16 materializes");
-        let repo = Repo::discover(dir.path()).expect("fixture is a git repo");
-        (dir, repo, truth)
-    }
+    #[test]
+    fn m16_materializes_a_real_git_repo_with_the_blob_committed() {
+        let (_dir, repo, _truth) = support::materialize(&PersistedSerializedBlob);
 
-    fn tree(root: &Path) -> Vec<(String, Vec<u8>)> {
-        let mut out = Vec::new();
-        walk(root, root, &mut out);
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
-    }
-
-    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
-        for entry in std::fs::read_dir(dir).expect("read fixture directory") {
-            let path = entry.expect("read directory entry").path();
-            if path.file_name().is_some_and(|n| n == ".git") {
-                continue;
-            }
-            if path.is_dir() {
-                walk(&path, root, out);
-            } else {
-                let rel = path
-                    .strip_prefix(root)
-                    .expect("path is under the fixture root")
-                    .to_string_lossy()
-                    .into_owned();
-                out.push((rel, std::fs::read(&path).expect("read fixture file")));
-            }
-        }
-    }
-
-    fn mentions(haystack: &[u8], needle: &str) -> bool {
-        let needle = needle.as_bytes();
-        haystack.windows(needle.len()).any(|w| w == needle)
-    }
-
-    /// A file git would refuse to search as text — the same test `git grep`
-    /// applies, and the reason a textual scan cannot see the class name.
-    fn looks_binary(bytes: &[u8]) -> bool {
-        bytes.iter().take(8000).any(|b| *b == 0)
+        // The cache blob stands in for the warm cache, so it has to be in HEAD.
+        support::assert_committed(&repo, &[MECHANISM]);
     }
 
     #[test]
-    fn materializes_a_real_git_repo_with_the_blob_committed() {
-        let (_dir, repo, _truth) = materialize();
-        assert!(
-            repo.root().join(".git").is_dir(),
-            "expected a git directory"
-        );
-        assert!(
-            repo.blob_sha(Path::new(MECHANISM))
-                .expect("blob_sha query succeeds")
-                .is_some(),
-            "the cache blob stands in for the warm cache and must be in HEAD"
-        );
-    }
-
-    #[test]
-    fn ground_truth_paths_all_exist_on_disk() {
-        let (_dir, repo, truth) = materialize();
+    fn m16_ground_truth_paths_all_exist_on_disk() {
+        let (_dir, repo, truth) = support::materialize(&PersistedSerializedBlob);
         assert_eq!(truth.live_paths, vec![Path::new(LIVE_MODULE).to_path_buf()]);
         assert_eq!(truth.live_symbols, vec![LIVE_CLASS.to_string()]);
-        assert!(
-            !truth.decoy_dead_paths.is_empty(),
-            "without a decoy, a tool that claims nothing passes m16 for free"
-        );
-        for path in truth.live_paths.iter().chain(&truth.decoy_dead_paths) {
-            assert!(path.is_relative(), "{path:?} must be repo-relative");
-            assert!(repo.root().join(path).is_file(), "{path:?} is missing");
-        }
+        support::assert_ground_truth_is_on_disk(&repo, &truth);
     }
 
     /// The hardness assertion. Nothing that reads the repository as text can
     /// find the class: the sole occurrence outside its own definition is inside
     /// a blob every text tool skips.
     #[test]
-    fn the_class_name_survives_only_inside_the_binary_blob() {
-        let (_dir, repo, _truth) = materialize();
+    fn m16_the_class_name_survives_only_inside_the_binary_blob() {
+        let (_dir, repo, _truth) = support::materialize(&PersistedSerializedBlob);
 
-        let textual: Vec<String> = tree(repo.root())
+        let textual: Vec<String> = support::tree(repo.root())
             .into_iter()
-            .filter(|(_, bytes)| !looks_binary(bytes) && mentions(bytes, LIVE_CLASS))
+            .filter(|(_, bytes)| {
+                !support::looks_binary(bytes) && support::mentions(bytes, LIVE_CLASS)
+            })
             .map(|(path, _)| path)
             .collect();
         assert_eq!(
@@ -326,12 +260,12 @@ mod tests {
 
         let blob = std::fs::read(repo.root().join(MECHANISM)).expect("read the cache blob");
         assert!(
-            looks_binary(&blob),
+            support::looks_binary(&blob),
             "{MECHANISM} must contain NUL, or git will search it as text and the \
              grep veto rescues the class"
         );
         assert!(
-            mentions(&blob, LIVE_CLASS),
+            support::mentions(&blob, LIVE_CLASS),
             "the blob must actually name {LIVE_CLASS}, or the mutant asserts a \
              liveness that does not exist"
         );
@@ -340,19 +274,19 @@ mod tests {
     /// The module path is the other half of what `STACK_GLOBAL` resolves, and it
     /// has to be as unfindable as the class name or the mutant is soft.
     #[test]
-    fn the_module_path_is_named_nowhere_in_the_source_either() {
-        let (_dir, repo, _truth) = materialize();
+    fn m16_the_module_path_is_named_nowhere_in_the_source_either() {
+        let (_dir, repo, _truth) = support::materialize(&PersistedSerializedBlob);
         let stem = Path::new(LIVE_MODULE)
             .file_stem()
             .and_then(|s| s.to_str())
             .expect("the live module has a UTF-8 stem");
 
-        for (path, bytes) in tree(repo.root()) {
-            if path == LIVE_MODULE || looks_binary(&bytes) {
+        for (path, bytes) in support::tree(repo.root()) {
+            if path == LIVE_MODULE || support::looks_binary(&bytes) {
                 continue;
             }
             assert!(
-                !mentions(&bytes, stem),
+                !support::mentions(&bytes, stem),
                 "{path} names {stem}; the pickle must be the only thing that does"
             );
         }
@@ -363,8 +297,8 @@ mod tests {
     /// with the file length and the string length prefixes are redundant with
     /// the strings, so a typo in any of them shows up here.
     #[test]
-    fn the_blob_is_a_structurally_valid_protocol_4_pickle() {
-        let (_dir, repo, _truth) = materialize();
+    fn m16_the_blob_is_a_structurally_valid_protocol_4_pickle() {
+        let (_dir, repo, _truth) = support::materialize(&PersistedSerializedBlob);
         let blob = std::fs::read(repo.root().join(MECHANISM)).expect("read the cache blob");
 
         assert_eq!(&blob[..2], b"\x80\x04", "PROTO 4 header");
@@ -400,16 +334,16 @@ mod tests {
     /// §6.24's implementable counter-signals, so refusing here is something a
     /// tool could have decided rather than guessed.
     #[test]
-    fn the_repository_admits_it_deserializes_and_the_type_carries_the_veto_marker() {
-        let (_dir, repo, _truth) = materialize();
+    fn m16_the_repository_admits_it_deserializes_and_the_type_carries_the_veto_marker() {
+        let (_dir, repo, _truth) = support::materialize(&PersistedSerializedBlob);
         let loader = std::fs::read(repo.root().join("pricing/cache.py")).expect("read the loader");
         assert!(
-            mentions(&loader, "pickle"),
+            support::mentions(&loader, "pickle"),
             "serializer detection is the counter-signal; import it for real"
         );
         let live = std::fs::read(repo.root().join(LIVE_MODULE)).expect("read the live module");
         assert!(
-            mentions(&live, "__setstate__"),
+            support::mentions(&live, "__setstate__"),
             "§6.24 lists __setstate__ as a VETO marker on the candidate itself"
         );
     }
@@ -417,14 +351,14 @@ mod tests {
     /// "Does not break the build, does not break any test" (§6.24). Only true
     /// while nothing in the suite loads the committed blob.
     #[test]
-    fn nothing_in_the_repository_constructs_or_unpickles_the_live_class() {
-        let (_dir, repo, _truth) = materialize();
-        for (path, bytes) in tree(repo.root()) {
+    fn m16_nothing_in_the_repository_constructs_or_unpickles_the_live_class() {
+        let (_dir, repo, _truth) = support::materialize(&PersistedSerializedBlob);
+        for (path, bytes) in support::tree(repo.root()) {
             if !path.starts_with("tests/") {
                 continue;
             }
             assert!(
-                !mentions(&bytes, MECHANISM) && !mentions(&bytes, "quote-cache"),
+                !support::mentions(&bytes, MECHANISM) && !support::mentions(&bytes, "quote-cache"),
                 "{path} reads the committed blob; then deletion would break a test \
                  and m16 would not be m16"
             );
@@ -432,23 +366,8 @@ mod tests {
     }
 
     #[test]
-    fn the_decoy_is_named_by_nothing() {
-        let (_dir, repo, truth) = materialize();
-        for decoy in &truth.decoy_dead_paths {
-            let stem = decoy
-                .file_stem()
-                .expect("decoy has a file name")
-                .to_string_lossy()
-                .into_owned();
-            for (path, bytes) in tree(repo.root()) {
-                if Path::new(&path) == decoy.as_path() {
-                    continue;
-                }
-                assert!(
-                    !mentions(&bytes, &stem),
-                    "{path} references the decoy {stem:?}, so it is not dead"
-                );
-            }
-        }
+    fn m16_the_decoy_is_named_by_nothing() {
+        let (_dir, repo, truth) = support::materialize(&PersistedSerializedBlob);
+        support::assert_decoys_are_unreferenced(&repo, &truth);
     }
 }

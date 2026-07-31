@@ -1,10 +1,12 @@
 //! One error type for the whole workspace.
 //!
-//! Every failure carries the thing it failed on. §12 of the research is blunt
-//! about silent failure being the dominant catastrophic-deletion mechanism: a
-//! tool that cannot tell "scanned everything, found nothing" apart from "failed
-//! to start" deletes the repository. The same discipline applies to our own
-//! plumbing, so there is no stringly-typed catch-all variant and no `Other`.
+//! Every failure carries the thing it failed on. §6.20 of the research catalogs
+//! the mechanism — every analyzer self-failure it lists "presents as clean
+//! output", and its rule is that *"no data" must be a distinct state from "zero
+//! executions"*. A tool that cannot tell "scanned everything, found nothing"
+//! apart from "failed to start" deletes the repository. Our own plumbing is held
+//! to the same discipline (AGENTS.md rule 12, "Fail Loudly"), so there is no
+//! stringly-typed catch-all variant and no `Other`.
 
 use std::path::PathBuf;
 

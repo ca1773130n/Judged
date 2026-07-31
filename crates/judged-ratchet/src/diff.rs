@@ -31,7 +31,7 @@ pub enum RatchetOutcome {
     /// `analysisTarget` ratio floor) cannot distinguish "no new findings" from
     /// "found nothing because it crashed". Passing CI on that evidence would
     /// teach everyone that a green ratchet means nothing. Refusing loudly is
-    /// the only honest option — §12: silent failures are bugs.
+    /// the only honest option — AGENTS.md rule 12: silent failures are bugs.
     Refused { reason: String },
     /// The run was trusted enough to judge, but not entirely.
     ///

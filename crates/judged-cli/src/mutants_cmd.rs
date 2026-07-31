@@ -251,7 +251,7 @@ fn render_json(
         Ok(text) => format!("{text}\n"),
         // Unreachable for a document built from owned strings and integers, and
         // reported rather than unwrapped so that an impossible failure is still
-        // a message instead of a panic (§12).
+        // a message instead of a panic (AGENTS.md rule 12).
         Err(error) => format!("{{\"error\":\"could not serialize the E2 report: {error}\"}}\n"),
     }
 }

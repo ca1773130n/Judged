@@ -104,7 +104,7 @@ fn referent_is_gone(repo: &Repo, uri: &str) -> bool {
 /// A value that is not in either shape counts as expired. The baseline is
 /// hand-edited, so `2026/08/01` and `next quarter` will be typed into it, and
 /// both would compare as far-future under a lexicographic rule — silently
-/// granting a longer amnesty than the author asked for. §12: fail loudly. The
+/// granting a longer amnesty than the author asked for. AGENTS.md rule 12, fail loudly. The
 /// raw text is carried into the report so the author can see what they wrote.
 /// Public because `--update` must ask the same question this module asks.
 ///
@@ -152,6 +152,40 @@ mod tests {
 
     #[test]
     fn a_date_that_is_not_iso_shaped_is_treated_as_expired() {
+        // Asserted through `has_expired`, because that is the function whose
+        // answer anything acts on. Testing `is_iso_dated` alone would leave the
+        // name unearned: it passes just as happily against
+        // `is_iso_dated(expires) && expires <= now`, which reads every one of
+        // these as *not yet due* and grants it amnesty forever — the failure
+        // mode the shape check exists to prevent.
+        const NOW: &str = "2026-07-31T12:00:00Z";
+        for typo in [
+            "2026/07/30",   // sorts after `2026-`, so it reads as far future
+            "31-07-2026",   // day first
+            "2026-07",      // truncated
+            "soon",         // not a date at all
+            "next quarter", // the one a human actually types
+            "",             // an `expires:` key with nothing after it
+            "9999-99-99",   // ISO-shaped and still meaningless, but see below
+        ] {
+            let expired = has_expired(typo, NOW);
+            // `9999-99-99` is the exception the shape check cannot catch: it is
+            // ISO-shaped, so it is compared, and it compares as far future. It
+            // is listed here to record that the guarantee is about *shape*, not
+            // about validity.
+            if typo == "9999-99-99" {
+                assert!(!expired, "an ISO-shaped date is compared, not validated");
+                continue;
+            }
+            assert!(
+                expired,
+                "`{typo}` is not a date this crate can evaluate, so it must count \
+                 as expired. Reading it as a future deadline would grant a longer \
+                 amnesty than the author asked for, silently and forever (§9.14)"
+            );
+        }
+
+        // The shape check underneath, which is what decides all of the above.
         assert!(!is_iso_dated("2026/07/30"));
         assert!(!is_iso_dated("31-07-2026"));
         assert!(!is_iso_dated("soon"));

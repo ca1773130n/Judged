@@ -256,60 +256,17 @@ impl Mutant for DynamicImport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-
-    /// Every file in `root` whose bytes contain `needle`, repo-relative.
-    ///
-    /// Deliberately `git grep --fixed-strings`: the claim under test is that
-    /// the artifact survives *a plain textual search*, so the check has to be
-    /// a plain textual search and not a smarter one.
-    fn files_mentioning(root: &Path, needle: &str) -> Vec<String> {
-        let output = Command::new("git")
-            .args(["grep", "-I", "-l", "--untracked", "--fixed-strings", needle])
-            .current_dir(root)
-            .output()
-            .expect("git grep should run inside a materialized fixture");
-        String::from_utf8(output.stdout)
-            .expect("fixture files are UTF-8")
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-
-    /// Files other than `artifact` itself that contain `needle`.
-    fn references_outside(root: &Path, needle: &str, artifact: &str) -> Vec<String> {
-        files_mentioning(root, needle)
-            .into_iter()
-            .filter(|hit| hit != artifact)
-            .collect()
-    }
-
-    fn materialize_into_tempdir() -> (tempfile::TempDir, GroundTruth) {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let truth = DynamicImport
-            .materialize(dir.path())
-            .expect("m02 materializes");
-        (dir, truth)
-    }
+    use crate::fixtures::support;
 
     #[test]
     fn m02_is_a_real_git_repository_with_both_halves_committed() {
-        let (dir, _truth) = materialize_into_tempdir();
-        let repo = Repo::discover(dir.path()).expect("fixture is a git working tree");
-
-        for live in [LIVE_PYTHON, LIVE_TYPESCRIPT] {
-            assert!(
-                repo.blob_sha(Path::new(live))
-                    .expect("blob_sha query succeeds")
-                    .is_some(),
-                "{live} must be present in HEAD"
-            );
-        }
+        let (_dir, repo, _truth) = support::materialize(&DynamicImport);
+        support::assert_committed(&repo, &[LIVE_PYTHON, LIVE_TYPESCRIPT]);
     }
 
     #[test]
     fn m02_ground_truth_names_files_that_are_really_there() {
-        let (dir, truth) = materialize_into_tempdir();
+        let (_dir, repo, truth) = support::materialize(&DynamicImport);
 
         assert_eq!(
             truth.live_paths,
@@ -324,24 +281,18 @@ mod tests {
         );
         assert_eq!(truth.decoy_dead_paths.len(), DynamicImport::DECOYS.len());
 
-        for path in truth.live_paths.iter().chain(&truth.decoy_dead_paths) {
-            assert!(
-                dir.path().join(path).is_file(),
-                "ground truth names {} but it is not on disk",
-                path.display()
-            );
-        }
+        support::assert_ground_truth_is_on_disk(&repo, &truth);
     }
 
     #[test]
     fn m02_neither_constructed_module_name_exists_as_a_literal() {
-        let (dir, _truth) = materialize_into_tempdir();
+        let (_dir, repo, _truth) = support::materialize(&DynamicImport);
 
         for (live, basename) in [
             (LIVE_PYTHON, "redis_backend"),
             (LIVE_TYPESCRIPT, "websocketTransport"),
         ] {
-            let elsewhere = references_outside(dir.path(), basename, live);
+            let elsewhere = support::references_outside(repo.root(), basename, live);
             assert!(
                 elsewhere.is_empty(),
                 "{live} is supposed to be unnamed outside itself; {basename} appears in {elsewhere:?}"
@@ -351,7 +302,7 @@ mod tests {
 
     #[test]
     fn m02_both_halves_are_solvable_by_the_prefix_and_directory_counter_signals() {
-        let (dir, _truth) = materialize_into_tempdir();
+        let (_dir, repo, _truth) = support::materialize(&DynamicImport);
 
         // §6.2: the basename minus its suffix does appear as a literal, in the
         // very file that builds the specifier. §6.12: so does the containing
@@ -361,7 +312,7 @@ mod tests {
             (MECHANISM_TYPESCRIPT, "websocket", "./transports/"),
         ] {
             for needle in [fragment, directory] {
-                let hits = files_mentioning(dir.path(), needle);
+                let hits = support::files_mentioning(repo.root(), needle);
                 assert!(
                     hits.contains(&mechanism.to_string()),
                     "{mechanism} must contain the literal {needle:?}; hits were {hits:?}"
@@ -372,19 +323,7 @@ mod tests {
 
     #[test]
     fn m02_decoys_are_named_nowhere_at_all() {
-        let (dir, truth) = materialize_into_tempdir();
-
-        for decoy in &truth.decoy_dead_paths {
-            let stem = decoy
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .expect("decoy has a UTF-8 stem");
-            let own_path = decoy.to_string_lossy().to_string();
-            let elsewhere = references_outside(dir.path(), stem, &own_path);
-            assert!(
-                elsewhere.is_empty(),
-                "a decoy anything mentions is not a decoy; {own_path} is named by {elsewhere:?}"
-            );
-        }
+        let (_dir, repo, truth) = support::materialize(&DynamicImport);
+        support::assert_decoys_are_unreferenced(&repo, &truth);
     }
 }

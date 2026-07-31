@@ -209,83 +209,42 @@ impl Mutant for ErrorPathOnly {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use judged_core::git::Repo;
-    use std::process::Command;
+    use crate::fixtures::support;
 
     /// The line in [`MECHANISM`] that opens the failure branch. Every reference
     /// to the live symbol must appear after it; the test below asserts exactly
     /// that, so the fixture cannot decay into an ordinary top-level import.
     const FAILURE_BRANCH: &str = "except OSError as cause:";
 
-    /// Every file in `root` whose bytes contain `needle`, repo-relative.
-    ///
-    /// Deliberately `git grep --fixed-strings`: the claim under test is about
-    /// what a *plain textual search* can find, so the check has to be a plain
-    /// textual search and not a smarter one. `git grep` also skips `.git/`,
-    /// where the committed blobs would otherwise match everything.
-    fn files_mentioning(root: &Path, needle: &str) -> Vec<String> {
-        let output = Command::new("git")
-            .args(["grep", "-I", "-l", "--untracked", "--fixed-strings", needle])
-            .current_dir(root)
-            .output()
-            .expect("git grep should run inside a materialized fixture");
-        String::from_utf8(output.stdout)
-            .expect("fixture files are UTF-8")
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-
-    fn materialize_into_tempdir() -> (tempfile::TempDir, GroundTruth) {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let truth = ErrorPathOnly
-            .materialize(dir.path())
-            .expect("m05 materializes");
-        (dir, truth)
-    }
-
     #[test]
     fn m05_is_a_real_git_repository_whose_live_artifact_is_committed() {
-        let (dir, _truth) = materialize_into_tempdir();
-        let repo = Repo::discover(dir.path()).expect("fixture is a git working tree");
+        let (_dir, repo, _truth) = support::materialize(&ErrorPathOnly);
 
-        // A blob SHA at HEAD exists only if a commit contains it, so this
-        // asserts "real repository" and "one commit" together. Recoverability
-        // class (Gate 0g) is part of what the suite exercises, so it matters
-        // that the fixture is committed rather than merely initialised.
-        assert!(
-            repo.blob_sha(Path::new(LIVE))
-                .expect("blob_sha query succeeds")
-                .is_some(),
-            "{LIVE} must be present in HEAD"
-        );
+        // Recoverability class (Gate 0g) is part of what the suite exercises,
+        // so it matters that the fixture is committed rather than merely
+        // initialised.
+        support::assert_committed(&repo, &[LIVE]);
     }
 
     #[test]
     fn m05_ground_truth_names_files_that_are_really_there() {
-        let (dir, truth) = materialize_into_tempdir();
+        let (_dir, repo, truth) = support::materialize(&ErrorPathOnly);
 
         assert_eq!(truth.live_paths, vec![Path::new(LIVE).to_path_buf()]);
         assert_eq!(truth.live_symbols, vec![LIVE_SYMBOL.to_string()]);
         assert_eq!(truth.decoy_dead_paths.len(), ErrorPathOnly::DECOYS.len());
 
-        for path in truth.live_paths.iter().chain(&truth.decoy_dead_paths) {
-            assert!(
-                dir.path().join(path).is_file(),
-                "ground truth names {} but it is not on disk",
-                path.display()
-            );
-        }
+        support::assert_ground_truth_is_on_disk(&repo, &truth);
     }
 
     #[test]
     fn m05_the_handler_is_named_only_inside_the_failure_branch() {
-        let (dir, _truth) = materialize_into_tempdir();
+        let (_dir, repo, _truth) = support::materialize(&ErrorPathOnly);
 
         // One caller, and it is not a test. If a second file ever names the
         // handler, the mutant has stopped testing one mechanism.
         assert_eq!(
-            files_mentioning(dir.path(), LIVE_SYMBOL),
+            support::files_mentioning(repo.root(), LIVE_SYMBOL),
             vec![LIVE.to_string(), MECHANISM.to_string()],
             "only the definition and the one failure branch may name the handler"
         );
@@ -293,7 +252,7 @@ mod tests {
         // And the reference is genuinely below the `except`, not a top-level
         // import that merely happens to share a file with one. This is what
         // keeps the handler off the happy path, and therefore out of coverage.
-        let source = std::fs::read_to_string(dir.path().join(MECHANISM))
+        let source = std::fs::read_to_string(repo.root().join(MECHANISM))
             .expect("mechanism file is readable");
         let branch = source
             .find(FAILURE_BRANCH)
@@ -309,13 +268,13 @@ mod tests {
 
     #[test]
     fn m05_no_test_in_the_repository_can_reach_the_handler() {
-        let (dir, _truth) = materialize_into_tempdir();
+        let (_dir, repo, _truth) = support::materialize(&ErrorPathOnly);
 
         // §3.4's "tests are not usage" runs in this direction too: the suite
         // must not accidentally cover the handler, or the mutant would be
         // solvable by running the tests — precisely the signal the debloating
         // study showed to be unsound.
-        for file in files_mentioning(dir.path(), LIVE_SYMBOL) {
+        for file in support::files_mentioning(repo.root(), LIVE_SYMBOL) {
             assert!(
                 !file.starts_with("tests/"),
                 "{file} reaches the handler; the suite must not be able to"
@@ -325,18 +284,7 @@ mod tests {
 
     #[test]
     fn m05_decoys_are_named_nowhere_at_all() {
-        let (dir, truth) = materialize_into_tempdir();
-
-        for decoy in &truth.decoy_dead_paths {
-            let stem = decoy
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .expect("decoy has a UTF-8 stem");
-            let mentions = files_mentioning(dir.path(), stem);
-            assert!(
-                mentions.iter().all(|f| Path::new(f) == decoy),
-                "a decoy that anything mentions is not a decoy; {stem} appears in {mentions:?}"
-            );
-        }
+        let (_dir, repo, truth) = support::materialize(&ErrorPathOnly);
+        support::assert_decoys_are_unreferenced(&repo, &truth);
     }
 }

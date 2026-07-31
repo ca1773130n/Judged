@@ -17,61 +17,39 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use judged_core::git::Repo;
 use judged_ratchet::baseline::BASELINE_PATH;
 use serde_json::{json, Value};
+use tempfile::{Builder, TempDir};
 
 // ---------------------------------------------------------------------------
 // Scratch space
-//
-// `tempfile` is not a dependency of this crate. The few bytes of temp-directory
-// handling these tests need live here instead, matching what
-// `judged-ratchet/tests/ratchet.rs` already does.
 // ---------------------------------------------------------------------------
 
-/// A uniquely named directory that deletes itself when the test ends.
-struct Scratch {
-    path: PathBuf,
+/// A throwaway directory that deletes itself when the test ends.
+///
+/// The label is only a prefix on the directory name, so a directory left behind
+/// by a hard abort still says which case it came from.
+fn scratch(label: &str) -> TempDir {
+    Builder::new()
+        .prefix(&format!("judged-cli-{label}-"))
+        .tempdir()
+        .expect("scratch directory must be creatable")
 }
 
-impl Scratch {
-    fn new(label: &str) -> Scratch {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "judged-cli-{}-{label}-{unique}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("scratch directory must be creatable");
-        Scratch { path }
+/// Write `body` to a path relative to `dir`, creating parents.
+fn write(dir: &Path, relative: &str, body: &str) -> PathBuf {
+    let path = dir.join(relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("parent directory must be creatable");
     }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Write `body` to a repo-relative path, creating parents.
-    fn write(&self, relative: &str, body: &str) -> PathBuf {
-        let path = self.path.join(relative);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("parent directory must be creatable");
-        }
-        std::fs::write(&path, body).expect("scratch file must be writable");
-        path
-    }
-
-    fn read(&self, relative: &str) -> String {
-        std::fs::read_to_string(self.path.join(relative)).expect("file must be readable")
-    }
+    std::fs::write(&path, body).expect("scratch file must be writable");
+    path
 }
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
+fn read(dir: &Path, relative: &str) -> String {
+    std::fs::read_to_string(dir.join(relative)).expect("file must be readable")
 }
 
 // ---------------------------------------------------------------------------
@@ -212,11 +190,15 @@ fn baseline_line(fingerprint: &str, rule_id: &str, uri: &str, first_seen: &str) 
 /// The files have to genuinely exist: `judged_ratchet::rot` reports an entry
 /// whose referent is missing as `ReferentGone`, so a fixture that only wrote
 /// SARIF would make every test look like a rot test.
-fn repo_with_sources(label: &str) -> Scratch {
-    let scratch = Scratch::new(label);
+fn repo_with_sources(label: &str) -> TempDir {
+    let scratch = scratch(label);
     Repo::init(scratch.path()).expect("scratch must be a git working tree");
     for name in ["a", "b", "c"] {
-        scratch.write(&format!("src/{name}.ts"), "export const x = 1;\n");
+        write(
+            scratch.path(),
+            &format!("src/{name}.ts"),
+            "export const x = 1;\n",
+        );
     }
     scratch
 }
@@ -228,7 +210,8 @@ fn repo_with_sources(label: &str) -> Scratch {
 #[test]
 fn a_clean_ratchet_run_exits_zero() {
     let repo = repo_with_sources("clean");
-    repo.write(
+    write(
+        repo.path(),
         "knip.sarif",
         &sarif_log(
             "knip",
@@ -242,7 +225,8 @@ fn a_clean_ratchet_run_exits_zero() {
             )],
         ),
     );
-    repo.write(
+    write(
+        repo.path(),
         BASELINE_PATH,
         &format!(
             "{}\n",
@@ -267,9 +251,88 @@ fn a_clean_ratchet_run_exits_zero() {
 }
 
 #[test]
+fn a_relative_baseline_resolves_against_the_repository_root_not_the_working_directory() {
+    // The baseline is checked in, one per repository (§9.14, following
+    // `deprecation_toolkit`), so `.judged/baseline.jsonl` has to mean the same
+    // file wherever the command is typed — and in a monorepo it is typed from a
+    // package directory far more often than from the top. Resolved against the
+    // working directory instead, it finds nothing: every already-accepted
+    // finding comes back as NEW (a red build nobody can act on), and `--update`
+    // writes a second baseline into a subdirectory no reviewer will ever see.
+    //
+    // Every other test in this file runs with the working directory at the repo
+    // root, where the two resolutions are indistinguishable.
+    let repo = repo_with_sources("subdir");
+    write(
+        repo.path(),
+        "knip.sarif",
+        &sarif_log(
+            "knip",
+            true,
+            &["src/a.ts", "src/b.ts", "src/c.ts"],
+            vec![finding(
+                "unused-export",
+                "src/a.ts",
+                "aaaa",
+                "export `x` is never imported",
+            )],
+        ),
+    );
+    write(
+        repo.path(),
+        BASELINE_PATH,
+        &format!(
+            "{}\n",
+            baseline_line(
+                "judged/v1:aaaa",
+                "unused-export",
+                "src/a.ts",
+                "2026-01-01T00:00:00Z"
+            )
+        ),
+    );
+    let nested = repo.path().join("services/api");
+    std::fs::create_dir_all(&nested).expect("subdirectory must be creatable");
+
+    // The SARIF path is absolute, so the only path whose resolution is under
+    // test here is the baseline's.
+    let sarif = repo.path().join("knip.sarif");
+    let sarif = sarif.to_str().expect("scratch paths are UTF-8");
+    let run = judged(&nested, &["ratchet", "--sarif", sarif]);
+
+    run.expect_code(
+        0,
+        "the one finding is baselined at the repository root, and the working \
+         directory does not change which findings are new",
+    )
+    .expect_says("clean");
+    // The report names the file it consulted, so a reader can tell which
+    // baseline was read without inferring it from the verdict.
+    let root = std::fs::canonicalize(repo.path()).expect("scratch path must canonicalize");
+    run.expect_says(&root.join(BASELINE_PATH).display().to_string());
+
+    // Writing goes to the same place reading does.
+    judged(&nested, &["ratchet", "--sarif", sarif, "--update"]).expect_code(
+        0,
+        "rewriting the baseline is the remediation, not a failure",
+    );
+    assert!(
+        !nested.join(BASELINE_PATH).exists(),
+        "--update from a subdirectory left a second baseline at {}. Two baseline \
+         files is one amnesty list nobody reviews (§9.14)",
+        nested.join(BASELINE_PATH).display()
+    );
+    assert!(
+        read(repo.path(), BASELINE_PATH).contains("judged/v1:aaaa"),
+        "the repository's own baseline must be the one that was rewritten"
+    );
+}
+
+#[test]
 fn a_new_finding_exits_one_and_is_named_in_the_report() {
     let repo = repo_with_sources("new-finding");
-    repo.write(
+    write(
+        repo.path(),
         "knip.sarif",
         &sarif_log(
             "knip",
@@ -291,7 +354,8 @@ fn a_new_finding_exits_one_and_is_named_in_the_report() {
             ],
         ),
     );
-    repo.write(
+    write(
+        repo.path(),
         BASELINE_PATH,
         &format!(
             "{}\n",
@@ -323,9 +387,14 @@ fn new_findings_are_sorted_by_rule_id_never_by_size() {
     // The big file here carries the alphabetically-later rule, so a
     // size-descending report and a rule-id-ascending report disagree.
     let repo = repo_with_sources("sorted");
-    repo.write("src/huge.ts", &"export const pad = 1;\n".repeat(4096));
-    repo.write("src/tiny.ts", "1\n");
-    repo.write(
+    write(
+        repo.path(),
+        "src/huge.ts",
+        &"export const pad = 1;\n".repeat(4096),
+    );
+    write(repo.path(), "src/tiny.ts", "1\n");
+    write(
+        repo.path(),
         "knip.sarif",
         &sarif_log(
             "knip",
@@ -352,7 +421,8 @@ fn new_findings_are_sorted_by_rule_id_never_by_size() {
 #[test]
 fn a_rotted_baseline_entry_exits_one_and_says_why() {
     let repo = repo_with_sources("rot");
-    repo.write(
+    write(
+        repo.path(),
         "knip.sarif",
         &sarif_log(
             "knip",
@@ -366,7 +436,8 @@ fn a_rotted_baseline_entry_exits_one_and_says_why() {
             )],
         ),
     );
-    repo.write(
+    write(
+        repo.path(),
         BASELINE_PATH,
         &format!(
             "{}\n{}\n{}\n",
@@ -412,7 +483,8 @@ fn a_rotted_baseline_entry_exits_one_and_says_why() {
 #[test]
 fn an_expired_baseline_entry_is_rot_and_the_expiry_is_quoted_back() {
     let repo = repo_with_sources("expired");
-    repo.write(
+    write(
+        repo.path(),
         "knip.sarif",
         &sarif_log(
             "knip",
@@ -421,7 +493,8 @@ fn an_expired_baseline_entry_is_rot_and_the_expiry_is_quoted_back() {
             vec![finding("unused-export", "src/a.ts", "aaaa", "still here")],
         ),
     );
-    repo.write(
+    write(
+        repo.path(),
         BASELINE_PATH,
         &format!(
             "{}\n",
@@ -448,7 +521,8 @@ fn a_crashed_analyzer_is_refused_with_exit_two() {
     // analyzer emits zero results, the ratchet records "nothing new", and the
     // gate is permanently disarmed while staying green.
     let repo = repo_with_sources("crashed");
-    repo.write(
+    write(
+        repo.path(),
         "crash.sarif",
         &sarif_log("knip", false, &["src/a.ts", "src/b.ts", "src/c.ts"], vec![]),
     );
@@ -466,7 +540,11 @@ fn a_crashed_analyzer_is_refused_with_exit_two() {
 #[test]
 fn a_sarif_log_with_no_runs_at_all_is_refused() {
     let repo = repo_with_sources("no-runs");
-    repo.write("empty.sarif", r#"{"version":"2.1.0","runs":[]}"#);
+    write(
+        repo.path(),
+        "empty.sarif",
+        r#"{"version":"2.1.0","runs":[]}"#,
+    );
 
     let run = judged(repo.path(), &["ratchet", "--sarif", "empty.sarif"]);
 
@@ -490,7 +568,8 @@ fn a_missing_sarif_file_is_refused_rather_than_read_as_empty() {
 #[test]
 fn update_rewrites_the_baseline_and_keeps_the_original_first_seen() {
     let repo = repo_with_sources("update");
-    repo.write(
+    write(
+        repo.path(),
         "knip.sarif",
         &sarif_log(
             "knip",
@@ -502,7 +581,8 @@ fn update_rewrites_the_baseline_and_keeps_the_original_first_seen() {
             ],
         ),
     );
-    repo.write(
+    write(
+        repo.path(),
         BASELINE_PATH,
         &format!(
             "{}\n{}\n",
@@ -532,7 +612,7 @@ fn update_rewrites_the_baseline_and_keeps_the_original_first_seen() {
     )
     .expect_says(BASELINE_PATH);
 
-    let written = repo.read(BASELINE_PATH);
+    let written = read(repo.path(), BASELINE_PATH);
     assert!(
         written.contains("judged/v1:aaaa") && written.contains("judged/v1:bbbb"),
         "both findings in the run must be accepted; got:\n{written}"
@@ -560,12 +640,90 @@ fn update_rewrites_the_baseline_and_keeps_the_original_first_seen() {
 }
 
 #[test]
+fn update_carries_a_passed_deadline_forward_instead_of_laundering_it() {
+    // §9.14 names the permanent amnesty list as the ratchet's known failure
+    // mode, and `--update` is the mechanism that would build one: run it often
+    // enough and every deadline a human set gets quietly renewed. So an
+    // `expires` is carried through unchanged, counted out loud in the report,
+    // and left failing the very next run.
+    //
+    // The second entry is the case that motivates counting them with
+    // `judged_ratchet::has_expired` rather than with a local `expires <= now`.
+    // `next quarter` is a date nothing can evaluate; it sorts after any real
+    // timestamp, so the local spelling reads it as *not yet due* and renews it
+    // forever, while `has_expired` — the same predicate the rot report uses —
+    // treats an unevaluable deadline as passed.
+    let repo = repo_with_sources("update-expired");
+    write(
+        repo.path(),
+        "knip.sarif",
+        &sarif_log(
+            "knip",
+            true,
+            &["src/a.ts", "src/b.ts"],
+            vec![
+                finding("unused-export", "src/a.ts", "aaaa", "still here"),
+                finding("unused-file", "src/b.ts", "bbbb", "also still here"),
+            ],
+        ),
+    );
+    write(
+        repo.path(),
+        BASELINE_PATH,
+        &format!(
+            "{}\n{}\n",
+            json!({
+                "fingerprint": "judged/v1:aaaa",
+                "rule_id": "unused-export",
+                "uri": "src/a.ts",
+                "first_seen": "2020-01-01T00:00:00Z",
+                "expires": "2021-01-01",
+            }),
+            json!({
+                "fingerprint": "judged/v1:bbbb",
+                "rule_id": "unused-file",
+                "uri": "src/b.ts",
+                "first_seen": "2020-01-01T00:00:00Z",
+                "expires": "next quarter",
+            }),
+        ),
+    );
+
+    let run = judged(
+        repo.path(),
+        &["ratchet", "--sarif", "knip.sarif", "--update"],
+    );
+
+    run.expect_code(0, "rewriting the baseline is not itself a failure")
+        .expect_says("2 kept an expiry that has already passed");
+
+    let written = read(repo.path(), BASELINE_PATH);
+    assert!(
+        written.contains("2021-01-01") && written.contains("next quarter"),
+        "both deadlines must survive the rewrite verbatim: a mechanical rewrite \
+         has no standing to extend or drop a date a human typed. Got:\n{written}"
+    );
+
+    // The property all of the above exists to protect: passing `--update` over
+    // an expired entry does not buy it another pass.
+    judged(repo.path(), &["ratchet", "--sarif", "knip.sarif"])
+        .expect_code(
+            1,
+            "an --update must never turn an expired amnesty into a green build",
+        )
+        .expect_says("BASELINE ROT")
+        .expect_says("2021-01-01")
+        .expect_says("next quarter");
+}
+
+#[test]
 fn update_refuses_to_rewrite_the_baseline_from_a_crashed_run() {
     // The most destructive thing this binary could do. A crashed analyzer
     // reports zero findings; baselining that would erase the accepted backlog
     // and leave a green CI over a repository nobody has analyzed since.
     let repo = repo_with_sources("update-crashed");
-    repo.write(
+    write(
+        repo.path(),
         "crash.sarif",
         &sarif_log("knip", false, &["src/a.ts", "src/b.ts", "src/c.ts"], vec![]),
     );
@@ -578,7 +736,7 @@ fn update_refuses_to_rewrite_the_baseline_from_a_crashed_run() {
             "2019-03-04T05:06:07Z"
         )
     );
-    repo.write(BASELINE_PATH, &original);
+    write(repo.path(), BASELINE_PATH, &original);
 
     let run = judged(
         repo.path(),
@@ -588,7 +746,7 @@ fn update_refuses_to_rewrite_the_baseline_from_a_crashed_run() {
     run.expect_code(2, "a refused run must not be allowed to rewrite anything")
         .expect_says("REFUSED");
     assert_eq!(
-        repo.read(BASELINE_PATH),
+        read(repo.path(), BASELINE_PATH),
         original,
         "the baseline must be byte-identical after a refused --update"
     );
@@ -601,7 +759,8 @@ fn several_sarif_logs_are_judged_as_one_run() {
     // would report it as such — which is how a multi-adapter ratchet becomes
     // permanently red for reasons nobody can act on.
     let repo = repo_with_sources("multi");
-    repo.write(
+    write(
+        repo.path(),
         "knip.sarif",
         &sarif_log(
             "knip",
@@ -610,7 +769,8 @@ fn several_sarif_logs_are_judged_as_one_run() {
             vec![finding("unused-export", "src/a.ts", "aaaa", "ts side")],
         ),
     );
-    repo.write(
+    write(
+        repo.path(),
         "vulture.sarif",
         &sarif_log(
             "vulture",
@@ -619,7 +779,8 @@ fn several_sarif_logs_are_judged_as_one_run() {
             vec![finding("unused-function", "src/b.ts", "bbbb", "py side")],
         ),
     );
-    repo.write(
+    write(
+        repo.path(),
         BASELINE_PATH,
         &format!(
             "{}\n{}\n",
@@ -661,7 +822,8 @@ fn a_short_scanned_universe_is_reported_without_changing_the_exit_code() {
     // does not fail a build the analyzers did not fail, so the operator has to
     // be told in words rather than through an exit code.
     let repo = repo_with_sources("degraded");
-    repo.write(
+    write(
+        repo.path(),
         "knip.sarif",
         &sarif_log(
             "knip",
@@ -670,7 +832,8 @@ fn a_short_scanned_universe_is_reported_without_changing_the_exit_code() {
             vec![finding("unused-export", "src/a.ts", "aaaa", "one of many")],
         ),
     );
-    repo.write(
+    write(
+        repo.path(),
         BASELINE_PATH,
         &format!(
             "{}\n",
@@ -707,9 +870,59 @@ fn a_short_scanned_universe_is_reported_without_changing_the_exit_code() {
 /// `fixtures::all()`, so that a catalogue that silently shrinks fails here.
 const E2_CLASSES: usize = 19;
 
+/// The class rows of a text report — the lines shaped `  mNN  pass  ...`.
+///
+/// Rows, not substring occurrences. `stdout.matches("  m")` also matches the
+/// mechanism prose in a row's tail — `decoys  module name ...` on m02 and
+/// `decoys  model field ...` on m11 — so it over-counts: 21 hits against 19
+/// required rows, which is exactly enough slack to hide two classes that were
+/// never printed at all.
+fn class_rows(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|line| {
+            let bytes = line.as_bytes();
+            // The rows under a class are indented further (`       removed
+            // live: ...`) and the summary lines start at column zero, so only a
+            // class row can match.
+            bytes.len() > 5
+                && bytes.starts_with(b"  m")
+                && bytes[3].is_ascii_digit()
+                && bytes[4].is_ascii_digit()
+        })
+        .collect()
+}
+
+/// Assert the report carries one row for every class in the catalogue, each
+/// named.
+///
+/// A silently dropped class is the failure this guards: it removes a row from
+/// the table and a line from the totals, and what is left still reads like a
+/// complete, passing report.
+fn expect_every_class_is_reported(run: &Run) {
+    let rows = class_rows(&run.stdout);
+    assert_eq!(
+        rows.len(),
+        E2_CLASSES,
+        "the report carries {} class rows, not {E2_CLASSES}. A mutant that never \
+         reaches the report reads as a pass the SUT never earned. Report was:\n{}",
+        rows.len(),
+        run.stdout
+    );
+    for n in 1..=E2_CLASSES {
+        let id = format!("m{n:02}");
+        assert!(
+            rows.iter().any(|row| row[2..].starts_with(&id)),
+            "no row for class {id}; the report names {:?}. Report was:\n{}",
+            rows.iter().map(|row| &row[2..5]).collect::<Vec<_>>(),
+            run.stdout
+        );
+    }
+}
+
 #[test]
 fn mutants_refusing_exits_zero_because_it_removes_nothing() {
-    let repo = Scratch::new("mutants-refusing");
+    let repo = scratch("mutants-refusing");
 
     let run = judged(repo.path(), &["mutants", "--sut", "refusing"]);
 
@@ -724,14 +937,7 @@ fn mutants_refusing_exits_zero_because_it_removes_nothing() {
     // reads as an endorsement.
     .expect_says("decoy recall");
 
-    assert_eq!(
-        run.stdout.matches("  m").count().min(E2_CLASSES),
-        E2_CLASSES,
-        "every one of the {E2_CLASSES} classes must appear in the report; a \
-         silently skipped mutant reads as a pass the SUT never earned. Report \
-         was:\n{}",
-        run.stdout
-    );
+    expect_every_class_is_reported(&run);
 }
 
 #[test]
@@ -741,7 +947,7 @@ fn mutants_naive_exits_non_zero_and_names_the_classes_it_failed() {
     // cleaner, which is §7.5's heuristic reproduced faithfully, has to come out
     // red, and the report has to say which injected liveness mechanisms caught
     // it.
-    let repo = Scratch::new("mutants-naive");
+    let repo = scratch("mutants-naive");
 
     let run = judged(repo.path(), &["mutants", "--sut", "naive"]);
 
@@ -749,6 +955,10 @@ fn mutants_naive_exits_non_zero_and_names_the_classes_it_failed() {
         .expect_says("naive")
         .expect_says("GATE FAILED")
         .expect_says("classes with false removals:");
+
+    // A red report is no more allowed to be short than a green one: a class
+    // dropped here would be a mechanism this cleaner was never shown to survive.
+    expect_every_class_is_reported(&run);
 
     assert!(
         !run.stdout.contains("false removals: 0"),
@@ -783,7 +993,7 @@ fn the_two_controls_disagree_about_the_gate_and_agree_about_nothing_else() {
     // proves nothing: refusing-passes says the harness does not invent
     // failures, naive-fails says the catalogue can still fail, and only both
     // together say the suite measures something.
-    let repo = Scratch::new("mutants-pair");
+    let repo = scratch("mutants-pair");
 
     let refusing = judged(repo.path(), &["mutants", "--sut", "refusing"]);
     let naive = judged(repo.path(), &["mutants", "--sut", "naive"]);
@@ -800,7 +1010,7 @@ fn the_two_controls_disagree_about_the_gate_and_agree_about_nothing_else() {
 #[test]
 fn mutants_defaults_to_the_control_that_fails() {
     // A bare `judged mutants` must never be mistakable for a passing real tool.
-    let repo = Scratch::new("mutants-default");
+    let repo = scratch("mutants-default");
 
     judged(repo.path(), &["mutants"])
         .expect_code(1, "the default SUT is the positive control")
@@ -809,7 +1019,7 @@ fn mutants_defaults_to_the_control_that_fails() {
 
 #[test]
 fn mutants_json_carries_the_gate_and_every_class() {
-    let repo = Scratch::new("mutants-json");
+    let repo = scratch("mutants-json");
 
     let run = judged(repo.path(), &["mutants", "--sut", "refusing", "--json"]);
     run.expect_code(0, "--json changes the rendering, never the verdict");
@@ -863,7 +1073,7 @@ fn the_binary_has_no_flag_that_deletes() {
 
 #[test]
 fn there_are_two_subcommands_and_the_help_says_so() {
-    let repo = Scratch::new("help");
+    let repo = scratch("help");
 
     let run = judged(repo.path(), &["--help"]);
     run.expect_code(0, "help was asked for, not provoked")

@@ -391,10 +391,29 @@ fn verdict_block(outcome: &RatchetOutcome, sarif: &[PathBuf], baseline_path: &Pa
         RatchetOutcome::Clean => "clean: no new findings, no baseline rot\n".to_string(),
         RatchetOutcome::NewFindings(findings) => new_findings_block(findings, sarif),
         RatchetOutcome::Rot(reasons) => rot_block(reasons, sarif, baseline_path),
-        RatchetOutcome::Refused { reason } => refusal_block(&[reason.clone()]),
-        // `ratchet` wraps at most once and the caller already unwrapped, so this
-        // arm is unreachable. Rendering it rather than panicking keeps a future
-        // change to that invariant a formatting bug instead of a crash.
+
+        // Neither arm below can be reached the way [`execute`] calls
+        // [`ratchet`] today, and both stay.
+        //
+        // `Refused` needs the merged run to fail its health assessment, and a
+        // merged run can only fail one if one of its parts did: the failure
+        // conditions are an empty `invocations` list and an invocation
+        // reporting `executionSuccessful: false`, and merging concatenates
+        // invocations. `execute` assessed every run separately and returned
+        // exit 2 before the merge, so that pre-pass has already fired.
+        // `Degraded` is removed by `strip_degradation` on the line that calls
+        // this function, because degradation is rendered from the per-run pass
+        // where it can still name the log it came from.
+        //
+        // Both invariants live in `execute`, not in the type — `RatchetOutcome`
+        // can spell either state — so a later caller that skips the pre-pass, or
+        // forgets to strip, lands here. The alternatives are worse than a
+        // redundant arm: `unreachable!()` turns a refactor into a panic in CI,
+        // and matching `_ => String::new()` prints a verdict-shaped blank beside
+        // an exit code nobody explained. AGENTS.md rule 12 wants a refusal to say REFUSED
+        // wherever it is rendered from. Tested below rather than merely
+        // asserted, because an untested defensive arm is a claim, not a defence.
+        RatchetOutcome::Refused { reason } => refusal_block(std::slice::from_ref(reason)),
         RatchetOutcome::Degraded { verdict, .. } => verdict_block(verdict, sarif, baseline_path),
     }
 }
@@ -562,5 +581,42 @@ mod tests {
 
         assert!(block.contains("REFUSED"), "got {block}");
         assert!(!block.contains("clean:"), "got {block}");
+    }
+
+    #[test]
+    fn the_two_defensive_arms_of_the_verdict_block_render_honestly() {
+        // `execute` refuses per run before it reaches `ratchet`, and strips
+        // degradation before it reaches this function, so neither outcome can
+        // arrive here today. The arms are kept for the caller that stops doing
+        // one of those things (see the comment on them), and a defence nothing
+        // ever runs is only a comment — so they are run here.
+        let baseline = Path::new(".judged/baseline.jsonl");
+
+        let refused = verdict_block(
+            &RatchetOutcome::Refused {
+                reason: "knip.sarif run 0: it died".to_string(),
+            },
+            &[PathBuf::from("knip.sarif")],
+            baseline,
+        );
+        assert!(refused.contains("REFUSED"), "got {refused}");
+        assert!(refused.contains("it died"), "got {refused}");
+        assert!(!refused.contains("clean:"), "got {refused}");
+
+        // A wrapper renders the verdict it carries, unchanged. The reasons are
+        // deliberately not rendered here: they are printed by the per-run pass,
+        // which can attribute them to a log.
+        let wrapped = verdict_block(
+            &RatchetOutcome::Degraded {
+                reasons: vec!["half the repository".to_string()],
+                verdict: Box::new(RatchetOutcome::Clean),
+            },
+            &[],
+            baseline,
+        );
+        assert_eq!(
+            wrapped,
+            verdict_block(&RatchetOutcome::Clean, &[], baseline)
+        );
     }
 }

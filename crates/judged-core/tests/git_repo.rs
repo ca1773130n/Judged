@@ -5,14 +5,10 @@
 //! and the only thing that can validate it is the `git` binary the tool actually
 //! shells out to. A mock would encode our beliefs about git rather than git's
 //! behaviour, and every hazard in §6.16/§6.17 is a case where those two differ.
-//!
-//! `judged-core` has no `tempfile` dev-dependency (the scaffold owns the
-//! manifests), so this file carries a ~20-line temp directory of its own.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use judged_core::git::{RecoverabilityClass, Repo};
 
@@ -20,37 +16,34 @@ use judged_core::git::{RecoverabilityClass, Repo};
 // test scaffolding
 // ---------------------------------------------------------------------------
 
-/// A directory under the system temp root, removed on drop.
+/// A [`tempfile::TempDir`] whose path has been canonicalized once.
+///
+/// The wrapper exists only for that canonicalization, and it is load-bearing
+/// rather than cosmetic: macOS hands out temp roots under `/var/folders/…`,
+/// a symlink to `/private/var/folders/…`, while `git rev-parse --show-toplevel`
+/// answers with the resolved form. Comparing an unresolved fixture path against
+/// [`Repo::root`] fails on exactly the platform these tests run on.
 struct TempDir {
+    /// Held for its `Drop`: removing the directory tree is tempfile's job.
+    _guard: tempfile::TempDir,
     path: PathBuf,
 }
 
 impl TempDir {
     fn new(label: &str) -> TempDir {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "judged-core-git-{}-{}-{}",
-            std::process::id(),
-            n,
-            label
-        ));
-        fs::create_dir_all(&path).expect("create temp dir");
-        // Resolve symlinks (macOS hands out /var -> /private/var) so that the
-        // paths we pass in compare equal to what `git rev-parse --show-toplevel`
-        // reports back.
-        let path = fs::canonicalize(&path).expect("canonicalize temp dir");
-        TempDir { path }
+        let guard = tempfile::Builder::new()
+            .prefix(&format!("judged-core-git-{label}-"))
+            .tempdir()
+            .expect("create temp dir");
+        let path = fs::canonicalize(guard.path()).expect("canonicalize temp dir");
+        TempDir {
+            _guard: guard,
+            path,
+        }
     }
 
     fn path(&self) -> &Path {
         &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -156,7 +149,8 @@ fn discover_outside_a_repository_is_an_error() {
 
     let err = Repo::discover(td.path()).expect_err("must not invent a repository");
 
-    // §12: "no repository here" and "git blew up" must never look like success.
+    // §6.20: "no data" is a distinct state from "zero findings". Neither "no
+    // repository here" nor "git blew up" may arrive looking like success.
     assert!(
         format!("{err}").contains("git"),
         "expected a git error, got: {err}"

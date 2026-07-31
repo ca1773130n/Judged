@@ -4,9 +4,6 @@
 //! and the CLI can observe, and every test here is written against that surface
 //! rather than against internals.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-
 use judged_core::git::Repo;
 use judged_core::sarif::{
     Artifact, BaselineState, Invocation, Level, Location, Notification, Run, SarifResult, Tool,
@@ -17,44 +14,21 @@ use judged_ratchet::{
     baseline_state, detect_rot, exit_code, ratchet, Baseline, BaselineEntry, RatchetOutcome,
     RotReason,
 };
+use tempfile::{Builder, TempDir};
 
 // ---------------------------------------------------------------------------
 // Scratch space
-//
-// `tempfile` is not a dependency of this crate and Cargo.toml belongs to
-// another owner, so the few bytes of temp-directory handling the tests need
-// live here instead.
 // ---------------------------------------------------------------------------
 
-/// A uniquely named directory that deletes itself when the test ends.
-struct Scratch {
-    path: PathBuf,
-}
-
-impl Scratch {
-    fn new(label: &str) -> Scratch {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "judged-ratchet-{}-{label}-{unique}",
-            std::process::id()
-        ));
-        // Start from a known-empty directory even if a previous run died before
-        // its Drop ran.
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("scratch directory must be creatable");
-        Scratch { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
+/// A throwaway directory that deletes itself when the test ends.
+///
+/// The label is only a prefix on the directory name, so a test that leaves one
+/// behind after a hard abort still says which case it came from.
+fn scratch(label: &str) -> TempDir {
+    Builder::new()
+        .prefix(&format!("judged-ratchet-{label}-"))
+        .tempdir()
+        .expect("scratch directory must be creatable")
 }
 
 // ---------------------------------------------------------------------------
@@ -148,11 +122,11 @@ const EXPECTED_TARGETS: usize = 10;
 /// An instant every fixture treats as "now".
 const NOW: &str = "2026-07-31T12:00:00Z";
 
-fn repo(scratch: &Scratch) -> Repo {
+fn repo(scratch: &TempDir) -> Repo {
     Repo::init(scratch.path()).expect("git init must succeed in scratch space")
 }
 
-fn touch(scratch: &Scratch, rel: &str) {
+fn touch(scratch: &TempDir, rel: &str) {
     let path = scratch.path().join(rel);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("fixture parent directory must be creatable");
@@ -172,7 +146,7 @@ fn baseline_lives_at_the_committed_path() {
 #[test]
 fn a_missing_baseline_file_is_an_empty_baseline() {
     // First run on a repository must not need a setup step.
-    let scratch = Scratch::new("missing");
+    let scratch = scratch("missing");
 
     let baseline = Baseline::load(&scratch.path().join(BASELINE_PATH))
         .expect("a missing baseline file must not be an error");
@@ -182,7 +156,7 @@ fn a_missing_baseline_file_is_an_empty_baseline() {
 
 #[test]
 fn save_then_load_round_trips() {
-    let scratch = Scratch::new("roundtrip");
+    let scratch = scratch("roundtrip");
     let path = scratch.path().join(BASELINE_PATH);
     let mut with_options = entry("judged/v1:beef", "src/b.ts");
     with_options.symbol = Some("pkg.Widget".to_string());
@@ -204,7 +178,7 @@ fn saved_baseline_is_one_line_per_entry_and_byte_stable() {
     // would put unrelated churn in every PR that touches it, which is how a
     // baseline stops being read and becomes the permanent amnesty list §9.14
     // warns about.
-    let scratch = Scratch::new("stable");
+    let scratch = scratch("stable");
     let baseline = Baseline::new(vec![
         entry("judged/v1:00ff", "src/a.ts"),
         entry("judged/v1:beef", "src/b.ts"),
@@ -242,8 +216,8 @@ fn saved_baseline_is_one_line_per_entry_and_byte_stable() {
 #[test]
 fn a_malformed_line_is_an_error_not_a_silent_drop() {
     // Silently dropping an unparseable line un-accepts findings and fails CI
-    // for reasons nobody can explain (§12).
-    let scratch = Scratch::new("malformed");
+    // for reasons nobody can explain (AGENTS.md rule 12, fail loudly).
+    let scratch = scratch("malformed");
     let path = scratch.path().join("baseline.jsonl");
     std::fs::write(
         &path,
@@ -261,7 +235,7 @@ fn a_malformed_line_is_an_error_not_a_silent_drop() {
 fn an_entry_without_a_fingerprint_is_rejected() {
     // The fingerprint is the join key. An empty one silently matches nothing,
     // so the entry would be indistinguishable from rot forever.
-    let scratch = Scratch::new("nofingerprint");
+    let scratch = scratch("nofingerprint");
     let path = scratch.path().join("baseline.jsonl");
     std::fs::write(
         &path,
@@ -330,7 +304,7 @@ fn from_results_does_not_write_the_same_finding_twice() {
 
 #[test]
 fn an_entry_that_still_matches_is_not_rot() {
-    let scratch = Scratch::new("rot-live");
+    let scratch = scratch("rot-live");
     let repo = repo(&scratch);
     touch(&scratch, "src/a.ts");
     let run = healthy_run(vec![fingerprinted(
@@ -347,7 +321,7 @@ fn an_entry_no_finding_carries_is_rot() {
     // Either the finding was fixed or our own analysis stopped producing it.
     // Both mean the amnesty now protects nothing, and §5.3 is explicit: "a
     // suppression list without rot detection is the off switch".
-    let scratch = Scratch::new("rot-unmatched");
+    let scratch = scratch("rot-unmatched");
     let repo = repo(&scratch);
     touch(&scratch, "src/a.ts");
     let run = healthy_run(Vec::new());
@@ -363,7 +337,7 @@ fn an_entry_no_finding_carries_is_rot() {
 
 #[test]
 fn an_entry_whose_file_is_gone_is_rot() {
-    let scratch = Scratch::new("rot-gone");
+    let scratch = scratch("rot-gone");
     let repo = repo(&scratch);
     let run = healthy_run(Vec::new());
     let baseline = Baseline::new(vec![entry("judged/v1:00ff", "src/deleted.ts")]);
@@ -379,7 +353,7 @@ fn an_entry_whose_file_is_gone_is_rot() {
 
 #[test]
 fn an_entry_past_its_expiry_is_rot() {
-    let scratch = Scratch::new("rot-expired");
+    let scratch = scratch("rot-expired");
     let repo = repo(&scratch);
     touch(&scratch, "src/a.ts");
     let run = healthy_run(vec![fingerprinted(
@@ -401,7 +375,7 @@ fn an_entry_past_its_expiry_is_rot() {
 
 #[test]
 fn an_expiry_still_in_the_future_is_not_rot() {
-    let scratch = Scratch::new("rot-not-yet");
+    let scratch = scratch("rot-not-yet");
     let repo = repo(&scratch);
     touch(&scratch, "src/a.ts");
     let run = healthy_run(vec![fingerprinted(
@@ -421,7 +395,7 @@ fn an_expiry_that_cannot_be_evaluated_is_rot() {
     // typed into it. Comparing them as ISO-8601 would silently grant a longer
     // amnesty than the author asked for, so an unevaluable expiry is rot: the
     // entry has stopped earning its place until a human fixes the line.
-    let scratch = Scratch::new("rot-garbage-expiry");
+    let scratch = scratch("rot-garbage-expiry");
     let repo = repo(&scratch);
     touch(&scratch, "src/a.ts");
     let run = healthy_run(vec![fingerprinted(
@@ -446,7 +420,7 @@ fn a_deleted_referent_outranks_the_unmatched_fingerprint_it_implies() {
     // A deleted file always drags its fingerprint out of the run too. Emitting
     // both reasons would double every deletion in the report; the file being
     // gone is the actionable one, because it can never match again.
-    let scratch = Scratch::new("rot-precedence");
+    let scratch = scratch("rot-precedence");
     let repo = repo(&scratch);
     let run = healthy_run(Vec::new());
     let mut e = entry("judged/v1:00ff", "src/deleted.ts");
@@ -467,7 +441,7 @@ fn an_entry_with_no_uri_is_never_reported_as_a_missing_file() {
     // Project-scoped findings (an unused dependency, say) have no artifact.
     // Joining `repo_root` with "" yields the repo root, which exists, but the
     // check must not depend on that accident.
-    let scratch = Scratch::new("rot-no-uri");
+    let scratch = scratch("rot-no-uri");
     let repo = repo(&scratch);
     let run = healthy_run(vec![fingerprinted(
         result("unused-dependency", "", None, "crate `prost` is unused"),
@@ -482,7 +456,7 @@ fn an_entry_with_no_uri_is_never_reported_as_a_missing_file() {
 fn an_empty_baseline_has_no_rot() {
     // The run immediately after `--write` must be clean, or the ratchet is
     // unusable on day one.
-    let scratch = Scratch::new("rot-empty");
+    let scratch = scratch("rot-empty");
     let repo = repo(&scratch);
     let run = healthy_run(vec![result("unused-export", "src/a.ts", Some(1), "m")]);
 
@@ -501,7 +475,7 @@ fn a_baseline_written_from_a_crashed_run_is_refused_not_believed() {
     // The disarming scenario, end to end. A crashed analyzer emits zero
     // results; recording that as the baseline and then checking against it
     // would leave a permanently green gate that nobody ever looks at again.
-    let scratch = Scratch::new("disarm");
+    let scratch = scratch("disarm");
     let repo = repo(&scratch);
     let crashed = crashed_run(Vec::new());
 
@@ -525,7 +499,7 @@ fn a_crashed_run_cannot_report_clean_against_a_good_baseline() {
     // The sharper half of the same failure: the tool reports the findings it
     // already knew about but flags that it did not succeed. Diffing alone would
     // call that Clean and pass every PR for as long as the tool stays broken.
-    let scratch = Scratch::new("disarm-check");
+    let scratch = scratch("disarm-check");
     let repo = repo(&scratch);
     touch(&scratch, "src/a.ts");
     let finding = fingerprinted(result("unused-export", "src/a.ts", Some(12), "m"), "00ff");
@@ -549,7 +523,7 @@ fn a_crashed_run_cannot_report_clean_against_a_good_baseline() {
 fn a_run_with_no_invocation_is_refused() {
     // Absence is not success (§6.20): a run that never asserted
     // `executionSuccessful` has told us nothing about whether it ran.
-    let scratch = Scratch::new("no-invocation");
+    let scratch = scratch("no-invocation");
     let repo = repo(&scratch);
     let mut run = healthy_run(Vec::new());
     run.invocations.clear();
@@ -567,7 +541,7 @@ fn a_degraded_run_still_produces_a_verdict_and_carries_the_reasons() {
     // §9.2: partial degradation caps the tier, it does not discard the run.
     // But it must never be silent — half a repository scanned, reported green,
     // is the §6.20 failure in slow motion.
-    let scratch = Scratch::new("degraded");
+    let scratch = scratch("degraded");
     let repo = repo(&scratch);
     touch(&scratch, "src/a.ts");
     let finding = fingerprinted(result("unused-export", "src/a.ts", Some(12), "m"), "00ff");
@@ -599,7 +573,7 @@ fn a_degraded_run_still_produces_a_verdict_and_carries_the_reasons() {
 
 #[test]
 fn a_run_that_matches_the_baseline_is_clean() {
-    let scratch = Scratch::new("clean");
+    let scratch = scratch("clean");
     let repo = repo(&scratch);
     touch(&scratch, "src/a.ts");
     let finding = fingerprinted(result("unused-export", "src/a.ts", Some(12), "m"), "00ff");
@@ -619,7 +593,7 @@ fn a_run_that_matches_the_baseline_is_clean() {
 
 #[test]
 fn a_finding_the_baseline_does_not_carry_fails_the_gate() {
-    let scratch = Scratch::new("new");
+    let scratch = scratch("new");
     let repo = repo(&scratch);
     touch(&scratch, "src/a.ts");
     touch(&scratch, "src/b.ts");
@@ -666,7 +640,7 @@ fn reformatting_a_file_does_not_manufacture_new_findings() {
     // reformat resets the stability clock". A formatter moves every line in the
     // file and moves the line numbers the tool bakes into its own prose; none
     // of that is a new finding.
-    let scratch = Scratch::new("reformat");
+    let scratch = scratch("reformat");
     let repo = repo(&scratch);
     touch(&scratch, "src/a.ts");
     let before = result(
@@ -705,7 +679,7 @@ fn reformatting_a_file_does_not_manufacture_new_findings() {
 #[test]
 fn rot_fails_the_gate_as_hard_as_a_new_finding() {
     // §5.3: "a suppression list without rot detection is the off switch".
-    let scratch = Scratch::new("gate-rot");
+    let scratch = scratch("gate-rot");
     let repo = repo(&scratch);
     let baseline = Baseline::new(vec![entry("judged/v1:00ff", "src/deleted.ts")]);
 
@@ -732,7 +706,7 @@ fn a_rotten_baseline_is_reported_before_new_findings() {
     // do first. Pruning the baseline is mechanical; fixing code is not, and a
     // new-findings list computed against a baseline that is known to be stale
     // is a list you have to recompute anyway.
-    let scratch = Scratch::new("rot-first");
+    let scratch = scratch("rot-first");
     let repo = repo(&scratch);
     touch(&scratch, "src/b.ts");
     let fresh = fingerprinted(result("unused-export", "src/b.ts", Some(3), "m"), "beef");

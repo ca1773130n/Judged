@@ -12,7 +12,30 @@
 //! documented incident, so the catalogue grows every time a new one is
 //! documented. Add classes; never remove one to make a run green.
 
+use std::path::Path;
+
+use judged_core::{Error, Result};
+
 use crate::mutant::Mutant;
+
+/// Write one fixture file, creating parents, attaching the path to any failure.
+///
+/// Lives here because eight class modules had a byte-identical private copy,
+/// each carrying a doc comment explaining that it was duplicated "because
+/// `fixtures/mod.rs` is complete and there is nowhere to put a shared helper".
+/// That constraint was an instruction to the agents writing those modules, not
+/// a property of the code, and it is not a reason to keep eight copies of a
+/// nine-line function.
+pub(crate) fn write(root: &Path, rel: &str, contents: &str) -> Result<()> {
+    let path = root.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| Error::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    std::fs::write(&path, contents).map_err(|source| Error::Io { path, source })
+}
 
 /// The catalogue, in class order. `all()[n - 1]` is §10 E2 class `n`.
 pub fn all() -> Vec<Box<dyn Mutant>> {
@@ -98,6 +121,12 @@ pub mod m18_platform_side_manifest;
 /// Class 19 — an exported symbol with no in-repo caller but a live ABI consumer
 /// *(§6.24, §6.9)*.
 pub mod m19_abi_consumer_export;
+
+/// Test scaffolding every class module shares: one materializer, one whole-repo
+/// byte search, one plain-text search, and the three assertions each fixture
+/// makes about the repository it built.
+#[cfg(test)]
+mod support;
 
 #[cfg(test)]
 mod tests {

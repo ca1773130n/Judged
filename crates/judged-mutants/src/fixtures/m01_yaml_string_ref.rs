@@ -218,80 +218,37 @@ impl Mutant for YamlStringRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-
-    /// Every file in `root` whose bytes contain `needle`, repo-relative.
-    ///
-    /// Deliberately `git grep --fixed-strings`: the claim under test is that
-    /// the artifact survives *a plain textual search*, so the check has to be
-    /// a plain textual search and not a smarter one. `git grep` also skips
-    /// `.git/`, where the committed blobs would otherwise match everything.
-    fn files_mentioning(root: &Path, needle: &str) -> Vec<String> {
-        let output = Command::new("git")
-            .args(["grep", "-I", "-l", "--untracked", "--fixed-strings", needle])
-            .current_dir(root)
-            .output()
-            .expect("git grep should run inside a materialized fixture");
-        String::from_utf8(output.stdout)
-            .expect("fixture files are UTF-8")
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-
-    fn materialize_into_tempdir() -> (tempfile::TempDir, GroundTruth) {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let truth = YamlStringRef
-            .materialize(dir.path())
-            .expect("m01 materializes");
-        (dir, truth)
-    }
+    use crate::fixtures::support;
 
     #[test]
     fn m01_is_a_real_git_repository_whose_live_artifact_is_committed() {
-        let (dir, _truth) = materialize_into_tempdir();
-        let repo = Repo::discover(dir.path()).expect("fixture is a git working tree");
+        let (_dir, repo, _truth) = support::materialize(&YamlStringRef);
 
-        // A blob SHA at HEAD exists only if there is a commit containing it, so
-        // this asserts "real repo" and "one commit" together. Recoverability is
-        // part of what the suite exercises (Gate 0g), so it is not incidental
-        // that the fixture is committed rather than merely initialised.
-        assert!(
-            repo.blob_sha(Path::new(LIVE))
-                .expect("blob_sha query succeeds")
-                .is_some(),
-            "{LIVE} must be present in HEAD"
-        );
+        // Recoverability is part of what the suite exercises (Gate 0g), so it
+        // is not incidental that the fixture is committed rather than merely
+        // initialised.
+        support::assert_committed(&repo, &[LIVE]);
     }
 
     #[test]
     fn m01_ground_truth_names_files_that_are_really_there() {
-        let (dir, truth) = materialize_into_tempdir();
+        let (_dir, repo, truth) = support::materialize(&YamlStringRef);
 
         assert_eq!(truth.live_paths, vec![Path::new(LIVE).to_path_buf()]);
         assert_eq!(truth.live_symbols, vec!["DunningConfig".to_string()]);
         assert_eq!(truth.decoy_dead_paths.len(), YamlStringRef::DECOYS.len());
 
-        for path in truth.live_paths.iter().chain(&truth.decoy_dead_paths) {
-            assert!(
-                dir.path().join(path).is_file(),
-                "ground truth names {} but it is not on disk",
-                path.display()
-            );
-        }
+        support::assert_ground_truth_is_on_disk(&repo, &truth);
     }
 
     #[test]
     fn m01_live_module_is_invisible_to_a_basename_search_but_visible_to_a_stem_veto() {
-        let (dir, _truth) = materialize_into_tempdir();
+        let (_dir, repo, _truth) = support::materialize(&YamlStringRef);
 
         // The mutant is only hard if this holds: no file — not even the one
         // config that keeps the module alive — spells its filename. The
         // reference is dotted, so the basename genuinely occurs nowhere.
-        let elsewhere: Vec<String> = files_mentioning(dir.path(), "dunning.py")
-            .into_iter()
-            .filter(|hit| hit != LIVE)
-            .collect();
+        let elsewhere = support::references_outside(repo.root(), "dunning.py", LIVE);
         assert!(
             elsewhere.is_empty(),
             "nothing outside {LIVE} may contain its basename; found {elsewhere:?}"
@@ -300,7 +257,7 @@ mod tests {
         // And it is only *fair* if this holds: §6.2's mandatory whole-repo
         // literal veto, applied to the stem, does find it. A mutant nothing can
         // solve measures nothing.
-        let stem_hits = files_mentioning(dir.path(), "ledger.dunning");
+        let stem_hits = support::files_mentioning(repo.root(), "ledger.dunning");
         assert!(
             stem_hits.contains(&MECHANISM.to_string()),
             "the settings list is the one rescue signal; hits were {stem_hits:?}"
@@ -309,22 +266,7 @@ mod tests {
 
     #[test]
     fn m01_decoys_are_named_nowhere_at_all() {
-        let (dir, truth) = materialize_into_tempdir();
-
-        for decoy in &truth.decoy_dead_paths {
-            let stem = decoy
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .expect("decoy has a UTF-8 stem");
-            let own_path = decoy.to_string_lossy().to_string();
-            let elsewhere: Vec<String> = files_mentioning(dir.path(), stem)
-                .into_iter()
-                .filter(|hit| *hit != own_path)
-                .collect();
-            assert!(
-                elsewhere.is_empty(),
-                "a decoy anything mentions is not a decoy; {own_path} is named by {elsewhere:?}"
-            );
-        }
+        let (_dir, repo, truth) = support::materialize(&YamlStringRef);
+        support::assert_decoys_are_unreferenced(&repo, &truth);
     }
 }

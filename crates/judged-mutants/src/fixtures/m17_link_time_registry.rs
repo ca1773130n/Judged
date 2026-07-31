@@ -38,8 +38,9 @@
 use std::path::Path;
 
 use judged_core::git::Repo;
-use judged_core::{Error, Result};
+use judged_core::Result;
 
+use crate::fixtures::write;
 use crate::mutant::{Ecosystem, GroundTruth, Mutant};
 
 /// `inventory::submit!` / `linkme` / a self-registering `static Registrar` /
@@ -206,107 +207,35 @@ pub fn crc16(bytes: &[u8]) -> u16 {
     }
 }
 
-/// Write one fixture file, creating parents, attaching the path to any failure.
-///
-/// Duplicated in each mutant module rather than shared: `fixtures/mod.rs` is
-/// complete and declares only the nineteen class modules, so there is nowhere
-/// to put a shared helper without changing it.
-fn write(root: &Path, rel: &str, contents: &str) -> Result<()> {
-    let path = root.join(rel);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| Error::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    std::fs::write(&path, contents).map_err(|source| Error::Io { path, source })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use crate::fixtures::support;
 
-    fn materialize() -> (TempDir, Repo, GroundTruth) {
-        let dir = TempDir::new().expect("create tempdir");
-        let truth = LinkTimeRegistry
-            .materialize(dir.path())
-            .expect("m17 materializes");
-        let repo = Repo::discover(dir.path()).expect("fixture is a git repo");
-        (dir, repo, truth)
-    }
-
-    fn tree(root: &Path) -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        walk(root, root, &mut out);
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
-    }
-
-    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
-        for entry in std::fs::read_dir(dir).expect("read fixture directory") {
-            let path = entry.expect("read directory entry").path();
-            if path.file_name().is_some_and(|n| n == ".git") {
-                continue;
-            }
-            if path.is_dir() {
-                walk(&path, root, out);
-            } else {
-                let rel = path
-                    .strip_prefix(root)
-                    .expect("path is under the fixture root")
-                    .to_string_lossy()
-                    .into_owned();
-                out.push((
-                    rel,
-                    std::fs::read_to_string(&path).expect("fixture is UTF-8"),
-                ));
-            }
-        }
+    #[test]
+    fn m17_materializes_a_real_git_repo_with_one_commit() {
+        let (_dir, repo, _truth) = support::materialize(&LinkTimeRegistry);
+        support::assert_committed(&repo, &["Cargo.toml", LIVE_FILE, CONSUMER, DECOY]);
     }
 
     #[test]
-    fn materializes_a_real_git_repo_with_one_commit() {
-        let (_dir, repo, _truth) = materialize();
-        assert!(
-            repo.root().join(".git").is_dir(),
-            "expected a git directory"
-        );
-        for tracked in ["Cargo.toml", LIVE_FILE, CONSUMER, DECOY] {
-            assert!(
-                repo.blob_sha(Path::new(tracked))
-                    .expect("blob_sha query succeeds")
-                    .is_some(),
-                "{tracked} must be in HEAD"
-            );
-        }
-    }
-
-    #[test]
-    fn ground_truth_paths_all_exist_on_disk() {
-        let (_dir, repo, truth) = materialize();
+    fn m17_ground_truth_paths_all_exist_on_disk() {
+        let (_dir, repo, truth) = support::materialize(&LinkTimeRegistry);
         assert_eq!(truth.live_paths, vec![Path::new(LIVE_FILE).to_path_buf()]);
         assert_eq!(truth.live_symbols, vec![LIVE_SYMBOL.to_string()]);
-        assert!(
-            !truth.decoy_dead_paths.is_empty(),
-            "without a decoy, a tool that claims nothing passes m17 for free"
-        );
-        for path in truth.live_paths.iter().chain(&truth.decoy_dead_paths) {
-            assert!(path.is_relative(), "{path:?} must be repo-relative");
-            assert!(repo.root().join(path).is_file(), "{path:?} is missing");
-        }
+        support::assert_ground_truth_is_on_disk(&repo, &truth);
     }
 
     /// The hardness assertion. One file names the live symbol, and it is the
     /// file that submits it. Anything else naming it would be a second way to
     /// reach the function, and the mutant would stop testing the registry.
     #[test]
-    fn the_registered_function_is_named_only_where_it_is_submitted() {
-        let (_dir, repo, _truth) = materialize();
+    fn m17_the_registered_function_is_named_only_where_it_is_submitted() {
+        let (_dir, repo, _truth) = support::materialize(&LinkTimeRegistry);
 
-        let naming: Vec<String> = tree(repo.root())
+        let naming: Vec<String> = support::tree(repo.root())
             .into_iter()
-            .filter(|(_, text)| text.contains(LIVE_SYMBOL))
+            .filter(|(_, bytes)| support::mentions(bytes, LIVE_SYMBOL))
             .map(|(path, _)| path)
             .collect();
         assert_eq!(
@@ -320,28 +249,28 @@ mod tests {
     /// the submission. Neither is a call, and a call is what every reachability
     /// signal is looking for.
     #[test]
-    fn nothing_anywhere_calls_the_registered_function() {
-        let (_dir, repo, _truth) = materialize();
+    fn m17_nothing_anywhere_calls_the_registered_function() {
+        let (_dir, repo, _truth) = support::materialize(&LinkTimeRegistry);
 
-        for (path, text) in tree(repo.root()) {
-            let calls = text.matches(&format!("{LIVE_SYMBOL}(")).count();
+        let call_site = format!("{LIVE_SYMBOL}(");
+        for (path, bytes) in support::tree(repo.root()) {
+            let calls = support::occurrences(&bytes, &call_site);
             let expected = usize::from(path == LIVE_FILE); // the `fn` line only
             assert_eq!(
                 calls, expected,
-                "{path} contains {calls} occurrence(s) of `{LIVE_SYMBOL}(`; the \
+                "{path} contains {calls} occurrence(s) of `{call_site}`; the \
                  call graph for a link-time registry must be empty"
             );
         }
 
-        let live =
-            std::fs::read_to_string(repo.root().join(LIVE_FILE)).expect("read the migration");
+        let live = std::fs::read(repo.root().join(LIVE_FILE)).expect("read the migration");
         assert_eq!(
-            live.matches(LIVE_SYMBOL).count(),
+            support::occurrences(&live, LIVE_SYMBOL),
             2,
             "exactly two occurrences: the definition and the inventory::submit!"
         );
         assert!(
-            live.contains("inventory::submit!"),
+            support::mentions(&live, "inventory::submit!"),
             "the submission is the mechanism; without it the fixture is just a dead fn"
         );
     }
@@ -352,24 +281,24 @@ mod tests {
     /// a tool that read `mod` as a liveness reference would call every file in
     /// every Rust crate alive.
     #[test]
-    fn the_migration_file_is_named_only_by_the_mod_line_that_compiles_it() {
-        let (_dir, repo, _truth) = materialize();
+    fn m17_the_migration_file_is_named_only_by_the_mod_line_that_compiles_it() {
+        let (_dir, repo, _truth) = support::materialize(&LinkTimeRegistry);
         let stem = Path::new(LIVE_FILE)
             .file_stem()
             .and_then(|s| s.to_str())
             .expect("the live file has a UTF-8 stem");
 
-        let naming: Vec<String> = tree(repo.root())
+        let naming: Vec<String> = support::tree(repo.root())
             .into_iter()
-            .filter(|(path, text)| path != LIVE_FILE && text.contains(stem))
+            .filter(|(path, bytes)| path != LIVE_FILE && support::mentions(bytes, stem))
             .map(|(path, _)| path)
             .collect();
         assert_eq!(naming, vec!["src/migrations/mod.rs".to_string()]);
 
-        let declaring = std::fs::read_to_string(repo.root().join("src/migrations/mod.rs"))
-            .expect("read mod.rs");
+        let declaring =
+            std::fs::read(repo.root().join("src/migrations/mod.rs")).expect("read mod.rs");
         assert!(
-            declaring.contains(&format!("mod {stem};")),
+            support::mentions(&declaring, &format!("mod {stem};")),
             "the only reference must be the module declaration itself"
         );
     }
@@ -378,45 +307,30 @@ mod tests {
     /// entry, that entry would be reachable by an ordinary call and this would
     /// be a different mutant.
     #[test]
-    fn the_consumer_iterates_the_registry_without_naming_an_entry() {
-        let (_dir, repo, _truth) = materialize();
-        let consumer = std::fs::read_to_string(repo.root().join(CONSUMER)).expect("read lib.rs");
+    fn m17_the_consumer_iterates_the_registry_without_naming_an_entry() {
+        let (_dir, repo, _truth) = support::materialize(&LinkTimeRegistry);
+        let consumer = std::fs::read(repo.root().join(CONSUMER)).expect("read lib.rs");
 
         assert!(
-            consumer.contains("inventory::collect!") && consumer.contains("inventory::iter"),
+            support::mentions(&consumer, "inventory::collect!")
+                && support::mentions(&consumer, "inventory::iter"),
             "the registry must be declared and iterated, or nothing runs the migration"
         );
         assert!(
-            !consumer.contains(LIVE_SYMBOL),
+            !support::mentions(&consumer, LIVE_SYMBOL),
             "the consumer must not name the entry it will end up calling"
         );
 
-        let manifest =
-            std::fs::read_to_string(repo.root().join("Cargo.toml")).expect("read Cargo.toml");
+        let manifest = std::fs::read(repo.root().join("Cargo.toml")).expect("read Cargo.toml");
         assert!(
-            manifest.contains("inventory"),
+            support::mentions(&manifest, "inventory"),
             "a real Cargo.toml has to declare the crate the mechanism depends on"
         );
     }
 
     #[test]
-    fn the_decoy_is_named_by_nothing() {
-        let (_dir, repo, truth) = materialize();
-        for decoy in &truth.decoy_dead_paths {
-            let stem = decoy
-                .file_stem()
-                .expect("decoy has a file name")
-                .to_string_lossy()
-                .into_owned();
-            for (path, text) in tree(repo.root()) {
-                if Path::new(&path) == decoy.as_path() {
-                    continue;
-                }
-                assert!(
-                    !text.contains(&stem),
-                    "{path} references the decoy {stem:?}, so it is not dead"
-                );
-            }
-        }
+    fn m17_the_decoy_is_named_by_nothing() {
+        let (_dir, repo, truth) = support::materialize(&LinkTimeRegistry);
+        support::assert_decoys_are_unreferenced(&repo, &truth);
     }
 }

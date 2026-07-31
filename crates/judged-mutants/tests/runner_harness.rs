@@ -197,6 +197,75 @@ fn false_removals_are_the_intersection_of_claims_and_live_ground_truth() {
 }
 
 #[test]
+fn a_qualified_spelling_is_the_same_symbol_and_a_longer_name_is_not() {
+    // Ground truth spells symbols bare (`DunningConfig`); a real tool spells
+    // them the way its ecosystem does. Under exact equality a SUT could delete
+    // a live symbol and be graded clean purely for having qualified the name —
+    // the gate silently under-reporting the one number §11 R1 keys on, which is
+    // the direction a safety gate must never be wrong in.
+    //
+    // The second half is what keeps that widening honest. A bare `ends_with`
+    // would score `MyDunningConfig` as a hit on `DunningConfig`, and a gate that
+    // manufactures false removals is one nobody keeps running. The trailing
+    // segment must be a whole segment: preceded by a separator, or nothing.
+    let mutants = vec![StubMutant::boxed(
+        "s01",
+        GroundTruth {
+            live_paths: Vec::new(),
+            live_symbols: vec![
+                "DunningConfig".to_string(),
+                "render_badge".to_string(),
+                "drain".to_string(),
+                "Widget".to_string(),
+                // Nothing below is claimed. Each is a suffix of one of the
+                // claims above without being a segment of it, so a bare
+                // `ends_with` reports it as removed and a segment match does
+                // not. They have to be symbols nothing else already flags:
+                // a false positive on a symbol some other claim legitimately
+                // matches is invisible in a set of live symbol names.
+                "Config".to_string(),
+                "badge".to_string(),
+            ],
+            decoy_dead_paths: Vec::new(),
+        },
+    )];
+    let sut = ScriptedSut {
+        verdict: claims(
+            &[],
+            &[
+                // Qualified spellings of a live symbol: same symbol, caught.
+                "ledger.dunning.DunningConfig", // python
+                "badge::render_badge",          // rust
+                "pkg/sampler.drain",            // go
+                "src/ui/Widget.tsx#Widget",     // typescript, uri-fragment style
+                // Merely ends with the same letters: a different symbol, and
+                // claiming it is not a false removal.
+                "MyDunningConfig",
+                "xrender_badge",
+                "predrain",
+            ],
+        ),
+    };
+
+    let report = run_suite(&sut, &mutants).expect("suite runs");
+
+    assert_eq!(
+        report.reports[0].false_removals,
+        vec![
+            "DunningConfig".to_string(),
+            "Widget".to_string(),
+            "drain".to_string(),
+            "render_badge".to_string(),
+        ],
+        "a qualified spelling names the same symbol and must be caught; a name \
+         that merely ends with the same letters is a different symbol and must \
+         not be. `Config` and `badge` are live, unclaimed, and are what a bare \
+         `ends_with` would invent"
+    );
+    assert_eq!(report.false_removal_count, 4);
+}
+
+#[test]
 fn any_false_removal_fails_that_mutant() {
     // §10 E2: "Any 'dead' verdict is a hard failure." One is enough, even when
     // the SUT also found every decoy.

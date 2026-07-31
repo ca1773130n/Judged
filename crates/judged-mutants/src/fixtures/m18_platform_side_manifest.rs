@@ -266,56 +266,17 @@ impl Mutant for PlatformSideManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-
-    /// Every file in `root` whose bytes contain `needle`, repo-relative.
-    fn files_mentioning(root: &Path, needle: &str) -> Vec<String> {
-        let output = Command::new("git")
-            .args(["grep", "-I", "-l", "--untracked", "--fixed-strings", needle])
-            .current_dir(root)
-            .output()
-            .expect("git grep should run inside a materialized fixture");
-        String::from_utf8(output.stdout)
-            .expect("fixture files are UTF-8")
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-
-    /// Files other than `artifact` itself that contain `needle`.
-    fn references_outside(root: &Path, needle: &str, artifact: &str) -> Vec<String> {
-        files_mentioning(root, needle)
-            .into_iter()
-            .filter(|hit| hit != artifact)
-            .collect()
-    }
-
-    fn materialize_into_tempdir() -> (tempfile::TempDir, GroundTruth) {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let truth = PlatformSideManifest
-            .materialize(dir.path())
-            .expect("m18 materializes");
-        (dir, truth)
-    }
+    use crate::fixtures::support;
 
     #[test]
     fn m18_is_a_real_git_repository_with_every_entry_point_committed() {
-        let (dir, _truth) = materialize_into_tempdir();
-        let repo = Repo::discover(dir.path()).expect("fixture is a git working tree");
-
-        for live in [LIVE_PTH, LIVE_PYTHON_HOOK, LIVE_RECEIVER] {
-            assert!(
-                repo.blob_sha(Path::new(live))
-                    .expect("blob_sha query succeeds")
-                    .is_some(),
-                "{live} must be present in HEAD"
-            );
-        }
+        let (_dir, repo, _truth) = support::materialize(&PlatformSideManifest);
+        support::assert_committed(&repo, &[LIVE_PTH, LIVE_PYTHON_HOOK, LIVE_RECEIVER]);
     }
 
     #[test]
     fn m18_ground_truth_names_files_that_are_really_there() {
-        let (dir, truth) = materialize_into_tempdir();
+        let (_dir, repo, truth) = support::materialize(&PlatformSideManifest);
 
         assert_eq!(
             truth.live_paths,
@@ -331,37 +292,31 @@ mod tests {
             PlatformSideManifest::DECOYS.len()
         );
 
-        for path in truth.live_paths.iter().chain(&truth.decoy_dead_paths) {
-            assert!(
-                dir.path().join(path).is_file(),
-                "ground truth names {} but it is not on disk",
-                path.display()
-            );
-        }
+        support::assert_ground_truth_is_on_disk(&repo, &truth);
     }
 
     #[test]
     fn m18_the_pth_file_is_named_by_absolutely_nothing() {
-        let (dir, _truth) = materialize_into_tempdir();
+        let (_dir, repo, _truth) = support::materialize(&PlatformSideManifest);
 
         // §5.2's exact claim, asserted rather than assumed. This is the one
         // artifact in the mutant with no textual rescue at all: only an
         // enumerated root checklist saves it.
         assert!(
-            references_outside(dir.path(), "zzz_ledger_bootstrap", LIVE_PTH).is_empty(),
+            support::references_outside(repo.root(), "zzz_ledger_bootstrap", LIVE_PTH).is_empty(),
             "the .pth file must have no caller and no mention anywhere"
         );
     }
 
     #[test]
     fn m18_manifest_named_entry_points_are_invisible_to_a_basename_search() {
-        let (dir, _truth) = materialize_into_tempdir();
+        let (_dir, repo, _truth) = support::materialize(&PlatformSideManifest);
 
         for (live, basename) in [
             (LIVE_PYTHON_HOOK, "ledger_startup_hook.py"),
             (LIVE_RECEIVER, "OtaUpdateReceiver.kt"),
         ] {
-            let elsewhere = references_outside(dir.path(), basename, live);
+            let elsewhere = support::references_outside(repo.root(), basename, live);
             assert!(
                 elsewhere.is_empty(),
                 "{live} must not be named by filename anywhere; found {elsewhere:?}"
@@ -371,11 +326,12 @@ mod tests {
         // The rescue signals, so the mutant is hard rather than impossible: the
         // module name is in the .pth line and the class name is in the manifest.
         assert!(
-            files_mentioning(dir.path(), "ledger_startup_hook").contains(&LIVE_PTH.to_string()),
+            support::files_mentioning(repo.root(), "ledger_startup_hook")
+                .contains(&LIVE_PTH.to_string()),
             "the .pth line is the module's one rescue signal"
         );
         assert!(
-            files_mentioning(dir.path(), "OtaUpdateReceiver")
+            support::files_mentioning(repo.root(), "OtaUpdateReceiver")
                 .contains(&MECHANISM_ANDROID.to_string()),
             "the android:name attribute is the receiver's one rescue signal"
         );
@@ -383,19 +339,7 @@ mod tests {
 
     #[test]
     fn m18_decoys_are_named_nowhere_at_all() {
-        let (dir, truth) = materialize_into_tempdir();
-
-        for decoy in &truth.decoy_dead_paths {
-            let stem = decoy
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .expect("decoy has a UTF-8 stem");
-            let own_path = decoy.to_string_lossy().to_string();
-            let elsewhere = references_outside(dir.path(), stem, &own_path);
-            assert!(
-                elsewhere.is_empty(),
-                "a decoy anything mentions is not a decoy; {own_path} is named by {elsewhere:?}"
-            );
-        }
+        let (_dir, repo, truth) = support::materialize(&PlatformSideManifest);
+        support::assert_decoys_are_unreferenced(&repo, &truth);
     }
 }

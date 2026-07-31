@@ -247,7 +247,10 @@ mod tests {
     #[test]
     fn materializes_a_real_git_repo_with_one_commit() {
         let (_dir, repo, _truth) = materialize();
-        assert!(repo.root().join(".git").is_dir(), "expected a git directory");
+        assert!(
+            repo.root().join(".git").is_dir(),
+            "expected a git directory"
+        );
         for manifest in ["pyproject.toml", "package.json"] {
             assert!(
                 repo.is_tracked(Path::new(manifest))

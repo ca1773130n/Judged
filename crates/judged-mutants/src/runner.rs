@@ -119,6 +119,21 @@ fn grade(
         .map(String::as_str)
         .collect();
 
+    // Ground truth spells symbols bare (`DunningConfig`); real tools spell them
+    // however their ecosystem does (`ledger.dunning.DunningConfig`,
+    // `badge::render_badge`, `pkg/sampler.drain`). Exact equality would let a
+    // SUT delete a live symbol and be graded clean purely because it qualified
+    // the name — the gate silently under-reporting the number it exists to
+    // report. Matching the trailing segment can only ever find MORE false
+    // removals than equality, never fewer, which is the direction a safety gate
+    // is allowed to be wrong in.
+    fn names_same_symbol(claimed: &str, live: &str) -> bool {
+        claimed == live
+            || ["::", ".", "/", "#"]
+                .iter()
+                .any(|sep| claimed.ends_with(&format!("{sep}{live}")))
+    }
+
     let live_paths: BTreeSet<String> = truth
         .live_paths
         .iter()
@@ -136,7 +151,7 @@ fn grade(
     let mut false_removals: BTreeSet<String> =
         claimed_paths.intersection(&live_paths).cloned().collect();
     for symbol in truth.live_symbols.iter() {
-        if claimed_symbols.contains(symbol.as_str()) {
+        if claimed_symbols.iter().any(|c| names_same_symbol(c, symbol)) {
             false_removals.insert(symbol.clone());
         }
     }

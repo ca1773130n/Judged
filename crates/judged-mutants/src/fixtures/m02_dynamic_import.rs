@@ -128,7 +128,10 @@ if __name__ == "__main__":
     print(load_backend())
 "#,
     ),
-    ("app/backends/__init__.py", "\"\"\"Backend implementations.\"\"\"\n"),
+    (
+        "app/backends/__init__.py",
+        "\"\"\"Backend implementations.\"\"\"\n",
+    ),
     (
         LIVE_PYTHON,
         r#""""LIVE. Imported only by importlib.import_module() in app/main.py.

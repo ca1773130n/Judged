@@ -285,7 +285,10 @@ mod tests {
             ]
         );
         assert!(truth.live_symbols.is_empty());
-        assert_eq!(truth.decoy_dead_paths.len(), GitignoreNegation::DECOYS.len());
+        assert_eq!(
+            truth.decoy_dead_paths.len(),
+            GitignoreNegation::DECOYS.len()
+        );
 
         for path in truth
             .live_paths

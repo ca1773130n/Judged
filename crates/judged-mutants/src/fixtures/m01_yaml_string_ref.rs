@@ -1,11 +1,22 @@
-//! Class 1 — referenced only by a string in a config.
+//! Class 1 — referenced only by a string in a YAML/JSON config.
 //!
 //! **The mechanism.** `ledger/dunning.py` defines `DunningConfig`. The only
 //! thing in the repository that names it is the string
-//! `"ledger.dunning.DunningConfig"` inside `INSTALLED_APPS` in
-//! `ledger/settings.py` — §6.2's very first named shape, Django
-//! `INSTALLED_APPS = ['myapp.SomeConfig']`. Django imports the module and
-//! instantiates the class at startup; nothing in the repository imports it.
+//! `"ledger.dunning.DunningConfig"` in `ledger/apps.yaml`, which
+//! `settings.py` loads at import time to build `INSTALLED_APPS` — §6.2's first
+//! named shape (Django `INSTALLED_APPS = ['myapp.SomeConfig']`) in its
+//! externalised-config form. Django imports the module and instantiates the
+//! class at startup; nothing in the repository imports it.
+//!
+//! **Why the list is in YAML and not in `settings.py`.** An earlier revision
+//! put the dotted string directly in `settings.py` and argued that was harder,
+//! because a tool parsing every file as code would still only see a string
+//! literal. That reasoning inverts for the signal §6.2 marks *mandatory*: a
+//! whole-repo literal veto reads `.py` files, finds the stem, and vetoes — so
+//! the mutant was passed by every grep-based cleaner without their having
+//! implemented anything. §10 E2 class 1 says *YAML/JSON config*, and
+//! `fixtures/mod.rs` says classes 1–14 share the shape "a reference in a place
+//! you didn't parse". `settings.py` is not such a place. `apps.yaml` is.
 //!
 //! **Why every other signal misses it.** The import graph stops at
 //! `manage.py -> ledger.settings`, because a list of strings is data, not an
@@ -28,21 +39,16 @@ use judged_core::{Error, Result};
 
 use crate::mutant::{Ecosystem, GroundTruth, Mutant};
 
-/// A Django `AppConfig` named only as a dotted string in a settings list. No
-/// import, no call site: the reference exists, but only as data.
-///
-/// The scaffold originally sketched this as a Celery task in `celery.yaml`.
-/// The Django `INSTALLED_APPS` shape is the one §6.2 names first and is
-/// strictly harder, because `settings.py` *is* Python — so the mutant survives
-/// even a tool that parses every file in the repository as code, which the
-/// YAML variant does not.
+/// A Django `AppConfig` named only as a dotted string in a YAML app list. No
+/// import, no call site: the reference exists, but only as data, and only in a
+/// file no Python analyzer parses.
 pub struct YamlStringRef;
 
 /// Repo-relative path of the artifact that is alive and looks dead.
 const LIVE: &str = "ledger/dunning.py";
 
 /// The one file in the repository that names [`LIVE`], and how.
-const MECHANISM: &str = "ledger/settings.py";
+const MECHANISM: &str = "ledger/apps.yaml";
 
 /// Files written into the mutant repository, as `(repo-relative path, body)`.
 const FILES: &[(&str, &str)] = &[
@@ -83,22 +89,36 @@ if __name__ == "__main__":
     ("ledger/__init__.py", "\"\"\"Ledger service.\"\"\"\n"),
     (
         MECHANISM,
-        r#""""Django settings.
+        r#"# The only reference in this repository to the dunning app.
+#
+# Django imports the module and instantiates the class at startup. To every
+# Python analyzer this file does not exist: it is not code, it is not on the
+# import graph, and nothing here is a symbol.
+installed_apps:
+  - django.contrib.contenttypes
+  - django.contrib.auth
+  - ledger.dunning.DunningConfig
 
-The last entry of INSTALLED_APPS is the only reference in this repository to
-the dunning app. Django imports the module and instantiates the class at
-startup. To a reachability pass it is an unremarkable string in a list.
+middleware:
+  - django.middleware.common.CommonMiddleware
+"#,
+    ),
+    (
+        "ledger/settings.py",
+        r#""""Django settings, loaded from apps.yaml at import time.
+
+Note what is NOT here: no app is named in this file. The list is data, read
+from a file the parser does not read, so the import graph reaches settings and
+stops -- and a whole-repo literal veto only helps if it searches YAML too.
 """
 
-INSTALLED_APPS = [
-    "django.contrib.contenttypes",
-    "django.contrib.auth",
-    "ledger.dunning.DunningConfig",
-]
+import pathlib
+import yaml
 
-MIDDLEWARE = [
-    "django.middleware.common.CommonMiddleware",
-]
+_CONFIG = yaml.safe_load((pathlib.Path(__file__).parent / "apps.yaml").read_text())
+
+INSTALLED_APPS = _CONFIG["installed_apps"]
+MIDDLEWARE = _CONFIG["middleware"]
 "#,
     ),
     (
@@ -160,7 +180,7 @@ impl Mutant for YamlStringRef {
         Ecosystem::Python
     }
     fn mechanism(&self) -> &str {
-        "dotted class path appearing only as a string literal in a settings list"
+        "dotted class path appearing only as a string in a YAML app list"
     }
     fn research_ref(&self) -> &str {
         "§10 E2 class 1"
@@ -186,7 +206,11 @@ impl Mutant for YamlStringRef {
             // canonicalized root is not the path the runner holds.
             live_paths: vec![Path::new(LIVE).to_path_buf()],
             live_symbols: vec!["DunningConfig".to_string()],
-            decoy_dead_paths: Self::DECOYS.iter().map(Path::new).map(Path::to_path_buf).collect(),
+            decoy_dead_paths: Self::DECOYS
+                .iter()
+                .map(Path::new)
+                .map(Path::to_path_buf)
+                .collect(),
         })
     }
 }

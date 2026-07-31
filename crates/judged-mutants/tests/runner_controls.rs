@@ -27,18 +27,20 @@ use judged_mutants::sut::{NaiveSut, RefusingSut};
 /// whose plugin file is named by no literal anywhere.
 ///
 /// It is deliberately not set to "most of the catalogue". Fixtures are free to
-/// be harder than the naive heuristic and several already are — m01 hides its
-/// dotted string inside `settings.py`, which *is* Python, so it survives a tool
-/// that parses every file in the repository. That is a better mutant, and a
-/// floor that punished it would push fixture authors toward weaker ones. The
-/// floor's job is only to fail loudly if the catalogue stops injecting
-/// unparsed-reference liveness at all.
+/// be harder than the naive heuristic. The seven that pass it do so honestly:
+/// they inject liveness a *stem-matching whole-repo grep* can see, which §6.2
+/// marks mandatory, so a tool implementing only that counter-signal is supposed
+/// to survive them.
 ///
-/// Measured while the catalogue was still landing: with 7 of the 19 classes
-/// implemented, 4 of them (m02, m03, m08, m10) caught the naive cleaner for 7
-/// false removals. Raise this floor to the observed count once all 19 exist —
-/// a floor that trails the truth by six classes is weaker than it needs to be.
-const NAIVE_MUST_FAIL_AT_LEAST: usize = 5;
+/// **Set this to the observed count, not below it.** Measured with all 19
+/// classes implemented: the naive cleaner is caught by 12 (m01, m02, m03, m08,
+/// m09, m10, m12, m13, m14, m16, m18, m19). An earlier revision left the floor
+/// at 5 against an observed 11, which meant six classes could quietly go soft —
+/// a soft class contributes no false removals, and to an assertion counting
+/// only the total that is indistinguishable from the class not existing. The
+/// suite's own anti-rot guard would have stayed green through a 55% loss of
+/// discriminating power. A floor that trails the truth is not a floor.
+const NAIVE_MUST_FAIL_AT_LEAST: usize = 12;
 
 fn failing_classes(report: &SuiteReport) -> BTreeSet<String> {
     report
@@ -120,6 +122,24 @@ fn naive_sut_is_caught_by_the_catalogue() {
          reachable only through an unparsed reference. Every green result this \
          suite has ever produced is now unsupported."
     );
+    // Per class, not just in total. A count alone cannot tell "m03 went soft
+    // and m11 got harder" from "nothing changed" — the two are the same
+    // integer. §3.7 makes exactly this point about positive controls: asserted
+    // at the wrong granularity, the control passes while the thing it guards
+    // is broken. These five are the classes whose only reference is
+    // definitionally not source, so a tool reading only source must miss them.
+    // If one of them stops catching the naive cleaner, that fixture no longer
+    // injects what its class name claims.
+    const ALWAYS_CATCH: [&str; 5] = ["m03", "m08", "m09", "m13", "m18"];
+    for id in ALWAYS_CATCH {
+        assert!(
+            caught.contains(id),
+            "{id} did not catch the naive cleaner. Its class is defined by a \
+             reference that is not source, so a source-only tool cannot see it; \
+             if this fixture passes, it has stopped injecting its own mechanism. \
+             Caught: {caught:?}"
+        );
+    }
     assert!(
         caught.len() >= NAIVE_MUST_FAIL_AT_LEAST,
         "the naive cleaner was caught by only {} of {} classes ({:?}), below the \

@@ -108,6 +108,7 @@ dependencies = [
  "judged-core",
  "judged-mutants",
  "judged-ratchet",
+ "serde_json",
 ]
 
 [[package]]

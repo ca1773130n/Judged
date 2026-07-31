@@ -46,11 +46,6 @@ const LIVE_SYMBOL: &str = "signal_waiting_consumer";
 /// The one file that calls [`LIVE_SYMBOL`], from one branch.
 const MECHANISM: &str = "src/lib.rs";
 
-/// The condition in [`MECHANISM`] that opens the contended branch. Every call
-/// to the helper must appear after it, so the fixture cannot decay into an
-/// unconditional call that a single-threaded test would cover.
-const CONTENDED_BRANCH: &str = "if state.waiting > 0 {";
-
 /// Files written into the mutant repository, as `(repo-relative path, body)`.
 const FILES: &[(&str, &str)] = &[
     (
@@ -245,6 +240,11 @@ mod tests {
     use judged_core::git::Repo;
     use std::process::Command;
 
+    /// The condition in [`MECHANISM`] that opens the contended branch. Every
+    /// call to the helper must appear after it, so the fixture cannot decay
+    /// into an unconditional call that a single-threaded test would cover.
+    const CONTENDED_BRANCH: &str = "if state.waiting > 0 {";
+
     /// Every file in `root` whose bytes contain `needle`, repo-relative.
     ///
     /// Deliberately `git grep --fixed-strings`: the claim under test is about
@@ -293,7 +293,10 @@ mod tests {
 
         assert_eq!(truth.live_paths, vec![Path::new(LIVE).to_path_buf()]);
         assert_eq!(truth.live_symbols, vec![LIVE_SYMBOL.to_string()]);
-        assert_eq!(truth.decoy_dead_paths.len(), ConcurrencyHelper::DECOYS.len());
+        assert_eq!(
+            truth.decoy_dead_paths.len(),
+            ConcurrencyHelper::DECOYS.len()
+        );
 
         for path in truth.live_paths.iter().chain(&truth.decoy_dead_paths) {
             assert!(

@@ -170,8 +170,7 @@ def test_app_is_configured():
 /// mutant assert a liveness that does not exist. The unit test decodes it with
 /// a separate implementation for exactly that reason.
 fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let bytes: [u32; 3] = [
@@ -260,8 +259,7 @@ mod tests {
     /// shared code, a broken alphabet would round-trip and the test would
     /// certify a payload no Celery worker could read.
     fn base64_decode(input: &str) -> Vec<u8> {
-        const ALPHABET: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut bits = 0u32;
         let mut held = 0u32;
         let mut out = Vec::new();
@@ -291,7 +289,10 @@ mod tests {
     #[test]
     fn materializes_a_real_git_repo_with_one_commit() {
         let (_dir, repo, _truth) = materialize();
-        assert!(repo.root().join(".git").is_dir(), "expected a git directory");
+        assert!(
+            repo.root().join(".git").is_dir(),
+            "expected a git directory"
+        );
         assert!(
             repo.is_tracked(Path::new("var/broker/celery-default.jsonl"))
                 .expect("query the index"),
@@ -302,7 +303,10 @@ mod tests {
     #[test]
     fn ground_truth_paths_all_exist_on_disk() {
         let (_dir, repo, truth) = materialize();
-        assert!(!truth.live_paths.is_empty(), "m15's live artifact is a file");
+        assert!(
+            !truth.live_paths.is_empty(),
+            "m15's live artifact is a file"
+        );
         assert!(
             !truth.decoy_dead_paths.is_empty(),
             "without a decoy, a tool that claims nothing passes m15 for free"

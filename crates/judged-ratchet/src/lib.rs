@@ -13,5 +13,5 @@ pub mod diff;
 pub mod rot;
 
 pub use baseline::{Baseline, BaselineEntry};
-pub use diff::{ratchet, RatchetOutcome};
+pub use diff::{baseline_state, exit_code, ratchet, RatchetOutcome};
 pub use rot::{detect_rot, RotReason};

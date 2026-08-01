@@ -19,4 +19,7 @@ pub mod sut;
 
 pub use mutant::{Ecosystem, GroundTruth, Mutant};
 pub use runner::{run_suite, MutantReport, SuiteReport};
-pub use sut::{NaiveSut, RefusingSut, Sut, SutVerdict};
+// `SymbolClaim` rides along with `SutVerdict` because it is the type of one of
+// its two fields: re-exporting the verdict without it would leave a consumer
+// unable to name what it holds.
+pub use sut::{NaiveSut, RefusingSut, Sut, SutVerdict, SymbolClaim};

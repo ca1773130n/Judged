@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use judged_core::Result;
 use judged_mutants::fixtures;
 use judged_mutants::runner::{run_suite, SuiteReport};
-use judged_mutants::sut::{NaiveSut, RefusingSut, Sut, SutVerdict};
+use judged_mutants::sut::{NaiveSut, RefusingSut, Sut, SutVerdict, SymbolClaim};
 
 /// A naive cleaner must be caught by at least this many distinct classes.
 ///
@@ -177,11 +177,14 @@ impl Sut for SymbolOnlySut {
     fn run(&self, repo: &Path) -> Result<SutVerdict> {
         Ok(SutVerdict {
             claimed_dead_paths: Vec::new(),
+            // The declaring file is right there in the pair, so the claim
+            // carries it: this stub stands in for a symbol-level analyzer, and
+            // every real one says where it found the symbol.
             claimed_dead_symbols: self
                 .decoys
                 .iter()
                 .filter(|(path, _)| repo.join(path).is_file())
-                .map(|(_, symbol)| symbol.clone())
+                .map(|(path, symbol)| SymbolClaim::declared_in(symbol, path))
                 .collect(),
         })
     }

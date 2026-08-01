@@ -17,5 +17,6 @@ pub mod error;
 pub mod fingerprint;
 pub mod git;
 pub mod sarif;
+pub mod veto;
 
 pub use error::{Error, Result};

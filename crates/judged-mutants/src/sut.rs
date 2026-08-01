@@ -1,11 +1,15 @@
 //! The system under test, and the two controls the suite needs to be meaningful.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use judged_core::git::Repo;
+use judged_core::veto::{literal, reachability, recency};
 use judged_core::{Error, Result};
 
 use crate::mutant::Ecosystem;
@@ -21,7 +25,161 @@ pub struct SutVerdict {
     /// Repo-relative paths the tool says can be removed.
     pub claimed_dead_paths: Vec<PathBuf>,
     /// Symbols the tool says can be removed.
-    pub claimed_dead_symbols: Vec<String>,
+    pub claimed_dead_symbols: Vec<SymbolClaim>,
+}
+
+/// One symbol a tool says can be removed, and the file it attributed it to.
+///
+/// # Why the file is part of the claim
+///
+/// Gate 2a asks whether an artifact's name occurs anywhere in the repository,
+/// and excludes the artifact's own file from the corpus first — a declaration is
+/// not a reference to itself. For a path claim the file to exclude is the claim.
+/// For a symbol claim it is the file that declares the symbol, and a bare name
+/// cannot say which file that is.
+///
+/// A bare name therefore excludes nothing, every symbol is found in its own
+/// declaration, and every symbol claim is rescued. That is safe and it is
+/// useless: a veto that fires on every input is a constant function, and a
+/// constant function measures nothing. §3.7 makes the point about positive
+/// controls — a control that always passes is theatre — and it holds for a gate
+/// the same way.
+///
+/// The information was never missing. Vulture prints `path:line: unused ...`,
+/// deadcode carries a `Position`, knip carries an artifact `uri`. Only the type
+/// lost it.
+///
+/// # Why the file is optional
+///
+/// Because a tool genuinely may not say, and that has to stay distinguishable
+/// from *said, and it is this file*. [`SymbolClaim::unattributed`] is the case
+/// with no location; see [`UNKNOWN_DEFINING_FILE`] for what Gate 2a does with
+/// it and why that direction is the right one **for that case**.
+///
+/// # What it is not
+///
+/// Not a claim that the file is dead. `claimed_dead_paths` is where a tool says
+/// that, and putting a declaration site there would invent a claim the tool
+/// never made — the same error every adapter's `files_touched` exists to avoid.
+/// Nor is it graded: [`crate::runner`] matches claims against ground truth by
+/// **name**, exactly as before. Provenance is for the veto.
+///
+/// Fields are private and the two cases have their own constructors, so
+/// "attributed to nothing" can only ever be written on purpose.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SymbolClaim {
+    // Ordered before the path, so a set of claims collates by symbol name and
+    // the report keeps the order it had when a claim was a bare string.
+    name: String,
+    declared_in: Option<PathBuf>,
+}
+
+impl SymbolClaim {
+    /// A symbol the analyzer attributed to a file, repo-relative.
+    pub fn declared_in(name: impl Into<String>, file: impl Into<PathBuf>) -> SymbolClaim {
+        SymbolClaim {
+            name: name.into(),
+            declared_in: Some(file.into()),
+        }
+    }
+
+    /// A symbol the analyzer named without saying where it lives.
+    ///
+    /// Spelled out rather than reached by passing `None`, because this is the
+    /// case that costs a decoy and it should be legible at the call site.
+    pub fn unattributed(name: impl Into<String>) -> SymbolClaim {
+        SymbolClaim {
+            name: name.into(),
+            declared_in: None,
+        }
+    }
+
+    /// The symbol, spelled exactly as the analyzer spelled it.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The file the analyzer said declares it, or `None` when it did not say.
+    pub fn declaration_site(&self) -> Option<&Path> {
+        self.declared_in.as_deref()
+    }
+
+    /// The same claim with its declaration site replaced — `None` to drop one
+    /// that cannot be used.
+    ///
+    /// The name is carried through untouched on purpose: a site that could not
+    /// be resolved must never be able to change what was claimed, only how well
+    /// the gate can be told where to look.
+    pub(crate) fn with_declaration_site(self, file: Option<PathBuf>) -> SymbolClaim {
+        SymbolClaim {
+            name: self.name,
+            declared_in: file,
+        }
+    }
+
+    /// One claim per distinct name, sorted, keeping a declaration site only
+    /// where every claim of that name agreed on one.
+    ///
+    /// Every adapter needs this and needs it to mean the same thing, so it lives
+    /// here rather than three times over.
+    ///
+    /// # Why one claim per name
+    ///
+    /// Because that is the contract each adapter already documents and the
+    /// reason is unchanged: a tool reports the same name once per file it occurs
+    /// in, and a claim list whose length depends on how many copies of a module
+    /// a repository happens to hold cannot be diffed between runs. Collapsing
+    /// cannot hide a false removal either — grading asks whether a live name was
+    /// claimed at all, not how often.
+    ///
+    /// # Why disagreement drops the site
+    ///
+    /// Gate 2a excludes the declaring file before searching for references. When
+    /// two files both declare `Whatever`, there is no single file to exclude,
+    /// and picking one — whichever sorted first, say — would exclude one
+    /// declaration and then find the symbol in the other, rescuing on evidence
+    /// the harness manufactured by choosing. There is nothing to exclude, which
+    /// is what [`SymbolClaim::unattributed`] means, and the conservative
+    /// treatment at [`UNKNOWN_DEFINING_FILE`] is right for it in the way it was
+    /// never right for the ordinary case.
+    ///
+    /// A `Some` beside a `None` is disagreement too: one of the tool's findings
+    /// located the symbol and another did not, so the harness cannot say the
+    /// located file is the only one.
+    pub fn dedup_by_name(claims: impl IntoIterator<Item = SymbolClaim>) -> Vec<SymbolClaim> {
+        // `Option<Option<PathBuf>>`: the outer layer is "have we seen this name
+        // before", the inner one is the site itself, which is legitimately
+        // absent. Flattening the two would make the first unattributed claim
+        // look like a name never seen.
+        let mut by_name: BTreeMap<String, Option<Option<PathBuf>>> = BTreeMap::new();
+        for claim in claims {
+            let site = claim.declared_in;
+            by_name
+                .entry(claim.name)
+                .and_modify(|agreed| {
+                    if *agreed != Some(site.clone()) {
+                        *agreed = Some(None);
+                    }
+                })
+                .or_insert(Some(site));
+        }
+        by_name
+            .into_iter()
+            .map(|(name, agreed)| SymbolClaim {
+                name,
+                declared_in: agreed.flatten(),
+            })
+            .collect()
+    }
+}
+
+impl fmt::Display for SymbolClaim {
+    /// The name alone. A claim is rendered wherever the old bare string was
+    /// rendered, and the declaration site is reported as its own field rather
+    /// than smuggled into the middle of a sentence.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.name)
+    }
 }
 
 /// A cleaner the suite can grade.
@@ -394,6 +552,33 @@ impl Sut for CommandSut {
             .into_iter()
             .map(|path| self.repo_relative(path, &root))
             .collect::<Result<Vec<_>>>()?;
+
+        // The same re-rooting for the file a symbol was attributed to, and for
+        // the same reason: deadcode's `Position.File` is absolute because the go
+        // tool resolves it against an absolute directory, and an absolute path
+        // strips against nothing.
+        //
+        // `.ok()` here where the loop above propagates, and the difference is
+        // deliberate. A *claimed path* outside the repository is a claim, and
+        // §9.3 gate 0c says refuse it — dropping it would erase the tool's
+        // riskiest assertion from the report. A *declaration site* outside the
+        // repository is not a claim about anything; it is a hint about where to
+        // look, and there is nothing there to look at. Degrading it to
+        // "unattributed" says exactly what is true — no in-tree file was named —
+        // and lands on the conservative branch documented at
+        // [`UNKNOWN_DEFINING_FILE`], which can only rescue more. The symbol
+        // itself is carried through untouched, so nothing the tool claimed is
+        // lost and grading is not affected either way.
+        let symbols = std::mem::take(&mut verdict.claimed_dead_symbols);
+        verdict.claimed_dead_symbols = symbols
+            .into_iter()
+            .map(|claim| {
+                let site = claim
+                    .declaration_site()
+                    .and_then(|path| self.repo_relative(path.to_path_buf(), &root).ok());
+                claim.with_declaration_site(site)
+            })
+            .collect();
         Ok(verdict)
     }
 }
@@ -509,19 +694,30 @@ impl Sut for NaiveSut {
         // in the corpus is its own declaration is called dead. This is what
         // makes the control fail the classes whose live artifact is a symbol
         // rather than a file — reflection, link-time registries, ABI exports.
-        let mut declared: BTreeSet<String> = BTreeSet::new();
-        for (_, text) in &corpus {
-            declared.extend(declarations(text));
+        //
+        // The declaring file is carried with each name. Not extra work for its
+        // own sake: it is the same fact the real adapters already parse and used
+        // to throw away, and the control has to be able to make the claim a real
+        // tool makes or it stops being a control for the gate behind it. The
+        // first declaration wins, which for anything that survives the filter
+        // below is also the only one — a name declared in two files occurs at
+        // least twice and is not claimed at all.
+        let mut declared: BTreeMap<String, &str> = BTreeMap::new();
+        for (owner, text) in &corpus {
+            for name in declarations(text) {
+                declared.entry(name).or_insert(owner.as_str());
+            }
         }
         let claimed_dead_symbols = declared
             .into_iter()
-            .filter(|name| {
+            .filter(|(name, _)| {
                 corpus
                     .iter()
                     .map(|(_, text)| text.matches(name.as_str()).count())
                     .sum::<usize>()
                     <= 1
             })
+            .map(|(name, owner)| SymbolClaim::declared_in(name, owner))
             .collect();
 
         Ok(SutVerdict {
@@ -712,5 +908,733 @@ impl Sut for RefusingSut {
 
     fn run(&self, _repo: &Path) -> Result<SutVerdict> {
         Ok(SutVerdict::default())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gate 2, wrapped around an accuser
+// ---------------------------------------------------------------------------
+
+/// One of the §9.3 Gate 2 sub-gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Gate {
+    /// 2a — the whole-repo literal search. Meta's BigGrep.
+    Literal,
+    /// 2b/2c — a manifest names the path, or something enumerates its directory
+    /// at runtime.
+    Reachability,
+    /// 2e — the path was modified recently enough to be work in progress.
+    Recency,
+}
+
+impl Gate {
+    /// Stable lower-case label, for reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Gate::Literal => "literal",
+            Gate::Reachability => "reachability",
+            Gate::Recency => "recency",
+        }
+    }
+}
+
+impl fmt::Display for Gate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Which sub-gates a [`VetoedSut`] runs.
+///
+/// [`Gate::Literal`] is **structurally mandatory**: it has no field here, so
+/// [`GateSet::includes`] always answers `true` for it and no constructor can
+/// remove it. Exactly the shape, and exactly the reason, of
+/// `NeedleStrategy`'s treatment of the basename needle: §9.3 makes the
+/// whole-repo literal search the floor of Gate 2, and a caller must not be able
+/// to disable the gate while appearing to run it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateSet {
+    reachability: bool,
+    recency: bool,
+}
+
+impl GateSet {
+    /// The floor: the whole-repo literal search alone.
+    pub const LITERAL_ONLY: GateSet = GateSet {
+        reachability: false,
+        recency: false,
+    };
+
+    /// The two gates whose evidence is the repository's **content**: 2a plus
+    /// 2b/2c. The default.
+    pub const CONTENT: GateSet = GateSet {
+        reachability: true,
+        recency: false,
+    };
+
+    /// Everything §9.3 Gate 2 lists that this build implements, including 2e.
+    ///
+    /// Not the default, and the reason is a measurement rather than a
+    /// preference. A fixture repository is created, written and committed
+    /// seconds before the analyzer is spawned, so the newest commit touching
+    /// any path in it is always inside any window — Gate 2e rescues every claim
+    /// in every class. That is a true answer about the scratch directory and no
+    /// answer at all about the tool, and a suite run through it would report a
+    /// veto that prevented everything at the cost of everything. Pinned by
+    /// `tests/veto_gate.rs` rather than asserted here.
+    pub const ALL: GateSet = GateSet {
+        reachability: true,
+        recency: true,
+    };
+
+    /// Whether `gate` is in this set. Always `true` for [`Gate::Literal`].
+    pub fn includes(self, gate: Gate) -> bool {
+        match gate {
+            Gate::Literal => true,
+            Gate::Reachability => self.reachability,
+            Gate::Recency => self.recency,
+        }
+    }
+
+    /// The gates in this set, in §9.3 order, for a report that has to say which
+    /// grading it is.
+    pub fn gates(self) -> Vec<Gate> {
+        [Gate::Literal, Gate::Reachability, Gate::Recency]
+            .into_iter()
+            .filter(|gate| self.includes(*gate))
+            .collect()
+    }
+}
+
+impl Default for GateSet {
+    fn default() -> GateSet {
+        GateSet::CONTENT
+    }
+}
+
+/// Whether a blocked claim was about a file or about a symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimKind {
+    Path,
+    Symbol,
+}
+
+impl ClaimKind {
+    /// Stable lower-case label, for reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClaimKind::Path => "path",
+            ClaimKind::Symbol => "symbol",
+        }
+    }
+}
+
+/// One claim Gate 2 dropped, with the evidence that dropped it.
+///
+/// §9.13 asks for a conflict list rather than a score, and §7.3 records that the
+/// best-validated prior art in the whole document — IntelliJ's Safe Delete —
+/// shows the *usage list*, not a probability. A blocked claim that cannot say
+/// what fired and where is a score wearing a longer name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedClaim {
+    /// The claim, spelled exactly as the analyzer spelled it.
+    pub claim: String,
+    /// Whether that was a path or a symbol.
+    pub kind: ClaimKind,
+    /// Which sub-gate rescued it.
+    pub gate: Gate,
+    /// The literal that fired, when one did. `None` when the veto came from a
+    /// search that did not finish — the §6.20 case, where nothing fired
+    /// *because nothing looked*.
+    pub needle: Option<String>,
+    /// Which derivation that literal came from: `basename`, `stem`,
+    /// `parent-dir` or `symbol`.
+    pub needle_kind: Option<String>,
+    /// The file the evidence was found in, repo-relative.
+    pub found_in: Option<PathBuf>,
+    /// For a symbol claim, the file the analyzer said declares it — the file
+    /// Gate 2a excluded from the corpus before searching. `None` for a path
+    /// claim, and for a symbol the analyzer did not attribute to any file.
+    ///
+    /// Reported beside [`Self::found_in`] because without it the one thing a
+    /// reader most needs to check is invisible: whether the rescue is a genuine
+    /// cross-file reference or the symbol's own declaration read back at it.
+    /// Both cases print a plausible file name, and the difference between them
+    /// is the difference between a gate and a constant function. That is what
+    /// let a veto that rescued *every* symbol claim survive review.
+    pub declared_in: Option<PathBuf>,
+    /// The whole reason, in a sentence somebody can act on.
+    pub detail: String,
+}
+
+/// What Gate 2 did during one call to the inner SUT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VetoRun {
+    /// The repository the gate ran over.
+    pub repo: PathBuf,
+    /// Claims the analyzer made.
+    pub claimed: usize,
+    /// Claims that survived Gate 2.
+    pub survived: usize,
+    /// Every claim that did not, with its evidence. In the order the analyzer
+    /// made them, never sorted by anything that would flatter the gate (§9.13
+    /// invariant 3).
+    pub blocked: Vec<BlockedClaim>,
+}
+
+/// Any [`Sut`], with §9.3's Gate 2 run over every claim it makes.
+///
+/// This is the shape §9.1 describes and the shape §11 R1 actually asks about:
+/// an analyzer orchestrated as a **bounded accuser**, never as an oracle, with
+/// a veto layer behind it. Everything the suite measured before this type
+/// existed was a bare accuser, and a bare accuser's false-removal count is not
+/// an answer to "does any signal combination clear the catalogue".
+///
+/// # A pure filter, and nothing else
+///
+/// The ordering is §9.3's: the accuser runs first, and Gate 2 runs on every
+/// survivor. Nothing here can add a claim, promote one, or turn a rescue into
+/// an accusation — the only operation is dropping, and `tests/veto_gate.rs`
+/// asserts the subset relation on the claim sets rather than on their sizes.
+///
+/// # Failure is a veto or an error, never a quiet absence
+///
+/// If the repository cannot be opened, this returns `Err` rather than passing
+/// the claims through ungated. A gate that silently does not run is worse than
+/// no gate: the report still says the run was gated. Inside a gate that did
+/// run, every incomplete search — a file that would not read, an enumeration
+/// that failed, a budget that expired — is a **hit**, because a search that did
+/// not finish found nothing precisely *because it did not look* (§6.20, and the
+/// truncated-BigGrep incident in §6.20 that turned Meta's safety net into its
+/// deletion trigger).
+pub struct VetoedSut {
+    inner: Box<dyn Sut>,
+    name: String,
+    gates: GateSet,
+    needles: literal::NeedleStrategy,
+    /// One entry per call to [`Sut::run`], in call order.
+    ///
+    /// `RefCell` because [`Sut::run`] takes `&self`: the trait is shaped for an
+    /// analyzer that computes an answer, and this wrapper additionally has to
+    /// record what it did. Single-threaded by construction —
+    /// [`crate::runner::run_suite`] drives one mutant at a time — so there is
+    /// nothing here for a lock to protect.
+    runs: RefCell<Vec<VetoRun>>,
+}
+
+impl VetoedSut {
+    /// `inner`, gated by [`GateSet::CONTENT`].
+    pub fn new(inner: Box<dyn Sut>) -> VetoedSut {
+        VetoedSut::with_gates(inner, GateSet::default())
+    }
+
+    /// `inner`, gated by an explicit set.
+    pub fn with_gates(inner: Box<dyn Sut>, gates: GateSet) -> VetoedSut {
+        let name = format!("{}+veto", inner.name());
+        VetoedSut {
+            inner,
+            name,
+            gates,
+            needles: DEFAULT_NEEDLES,
+            runs: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Which needles Gate 2a derives from a claimed path. See
+    /// [`DEFAULT_NEEDLES`].
+    pub fn with_needles(mut self, needles: literal::NeedleStrategy) -> VetoedSut {
+        self.needles = needles;
+        self
+    }
+
+    /// The gates in force.
+    pub fn gates(&self) -> GateSet {
+        self.gates
+    }
+
+    /// The needle strategy in force.
+    pub fn needles(&self) -> literal::NeedleStrategy {
+        self.needles
+    }
+
+    /// What Gate 2 did, one entry per call to the inner SUT, in call order.
+    pub fn runs(&self) -> Vec<VetoRun> {
+        self.runs.borrow().clone()
+    }
+}
+
+/// Which needles Gate 2a derives from a claimed **path**, by default.
+///
+/// Basename and stem: the file's own name, with and without its extension.
+/// This is the shape Meta's BigGrep has and the shape §0 ranks the
+/// second-cheapest high-value safety mechanism in the research.
+///
+/// The parent-directory needle is left out, and §11 R8 is why. It records two
+/// requirements that genuinely conflict — §9.3 says block on any hit, while a
+/// usable tool needs a tolerable flag rate — and notes that a parent-directory
+/// needle over names like `src`, `app` or `config` blocks nearly everything.
+/// A gate that rescues every candidate has the same output as a gate that is
+/// not wired in, so leaving it on by default would make the suite unable to
+/// measure the trade it exists to measure. It is one call away
+/// ([`VetoedSut::with_needles`]) and the report states which strategy produced
+/// its numbers.
+pub const DEFAULT_NEEDLES: literal::NeedleStrategy = literal::NeedleStrategy::WITH_STEM;
+
+/// The defining file of a claimed symbol, when the analyzer did not say.
+///
+/// Gate 2a excludes a symbol's defining file from the corpus so that a
+/// declaration is not read as a reference to itself. With no location to
+/// exclude, this excludes nothing: the empty path matches no tracked file, so
+/// the search covers the whole repository including whatever declares the
+/// symbol.
+///
+/// That is the conservative direction and it is the only one available **here**.
+/// Excluding nothing can only produce more vetoes than excluding the true
+/// declaration, never fewer, and a gate that may only rescue is allowed to be
+/// wrong in exactly that direction. What it costs is stated rather than hidden:
+/// a symbol that really is dead still occurs once, in its own declaration, so
+/// Gate 2a rescues it too and the decoy is lost. That number is a column in the
+/// report, not a footnote.
+///
+/// # This is the fallback, not the rule
+///
+/// It used to be the rule, and that was a measurement defect rather than a
+/// conservative choice. Every symbol claim reached Gate 2a with the empty path,
+/// so every symbol was found in its own declaration and every symbol claim was
+/// rescued — vulture went from 11 of 16 decoys to 0 of 16, deadcode from 2 of 2
+/// to 0 of 2, and both reached "zero false removals, GATE PASSED" by claiming
+/// nothing at all. The reasoning above is sound and was applied to a case it
+/// does not describe: safety is not the question when the alternative is a
+/// constant function, because a veto that fires on every input measures nothing
+/// (§3.7 makes the same point about a positive control that always passes).
+///
+/// The information was there the whole time. Vulture prints `path:line:`,
+/// deadcode carries a `Position`, knip carries an artifact `uri`; only
+/// [`SutVerdict`] lost it. It does not any more — see [`SymbolClaim`] — and this
+/// constant is reached only by [`SymbolClaim::unattributed`], where the analyzer
+/// genuinely named no file and there is genuinely nothing to exclude.
+const UNKNOWN_DEFINING_FILE: &str = "";
+
+/// Separators an analyzer may use to qualify a symbol name, longest first so
+/// that `::` is not split as two `:`.
+///
+/// The same set [`crate::runner`] matches ground-truth symbols with, and for the
+/// same reason: ground truth spells a symbol bare, and a tool spells it however
+/// its ecosystem does.
+const SYMBOL_SEPARATORS: [&str; 4] = ["::", ".", "/", "#"];
+
+impl VetoedSut {
+    /// The needles Gate 2a derives for a claimed symbol: the symbol, plus the
+    /// basename of the file that declares it when one is known.
+    ///
+    /// Built here rather than as a `const` because
+    /// [`literal::NeedleStrategy::with`] is not a const fn.
+    ///
+    /// The basename needle is structurally present —
+    /// [`literal::NeedleStrategy`] cannot be asked to leave it out, deliberately
+    /// — and it derives to nothing from [`UNKNOWN_DEFINING_FILE`], which is why
+    /// this used to be describable as "the symbol alone". With a real
+    /// declaration site it derives a real literal, so a symbol is also rescued
+    /// when another tracked file names the file it lives in. That is a wider
+    /// gate than the name alone and it is the right side to be wide on: the
+    /// declaring file is excluded first, so a hit means a different file spells
+    /// it, which is evidence about the same artifact and can only add rescues.
+    /// The stem is still left out — see [`DEFAULT_NEEDLES`] on why a needle that
+    /// blocks nearly everything makes the suite unable to measure anything.
+    fn symbol_needles() -> literal::NeedleStrategy {
+        literal::NeedleStrategy::BASENAME_ONLY.with(literal::NeedleKind::Symbol)
+    }
+
+    /// Gate 2 over one claimed path: `Some` when it was rescued, `None` when it
+    /// survived.
+    ///
+    /// The gates are asked in §9.3's order and the first veto wins, because a
+    /// veto is absorbing — no later evidence overrides it, so there is nothing
+    /// for a second gate to add once one has fired.
+    fn judge_path(
+        &self,
+        claim: &Path,
+        literal_veto: &literal::LiteralVeto<'_>,
+        reach: Option<&reachability::Reachability>,
+        recency_veto: Option<&recency::RecencyVeto>,
+        repo: &Repo,
+    ) -> Option<BlockedClaim> {
+        let verdict = literal_veto.query(&literal::Candidate::file(claim), self.needles);
+        if let Some(record) = from_literal(claim.display().to_string(), ClaimKind::Path, &verdict) {
+            return Some(record);
+        }
+
+        if let Some(reach) = reach {
+            if let reachability::Verdict::Vetoed { reason } = reach.verdict(claim) {
+                return Some(from_reachability(
+                    claim.display().to_string(),
+                    ClaimKind::Path,
+                    &reason,
+                ));
+            }
+        }
+
+        if let Some(recency_veto) = recency_veto {
+            if let recency::RecencyVerdict::Vetoed(reason) = recency_veto.judge(repo, claim) {
+                return Some(BlockedClaim {
+                    claim: claim.display().to_string(),
+                    kind: ClaimKind::Path,
+                    gate: Gate::Recency,
+                    needle: None,
+                    needle_kind: None,
+                    found_in: Some(claim.to_path_buf()),
+                    declared_in: None,
+                    detail: reason.to_string(),
+                });
+            }
+        }
+
+        None
+    }
+
+    /// Gate 2 over one claimed symbol.
+    ///
+    /// Only Gate 2a runs. 2b, 2c and 2e are path-scoped — a manifest names a
+    /// file, a directory is enumerated, a path was committed recently — and a
+    /// declaration site is not a claim that the file is dead, so it is not a
+    /// path those gates may be asked about. Feeding it to them would convert a
+    /// symbol claim into a file claim the analyzer never made, which is the same
+    /// invention every adapter's `files_touched` exists to refuse.
+    ///
+    /// What the declaration site *is* for is the exclusion Gate 2a performs
+    /// before it searches: drop the file that declares the symbol, then ask
+    /// whether anything else names it. Without that exclusion the declaration
+    /// answers the question about itself and the gate rescues unconditionally
+    /// — see [`UNKNOWN_DEFINING_FILE`], which is now only the fallback for a
+    /// claim the analyzer did not attribute to any file.
+    ///
+    /// Both spellings are searched: the claim as the tool wrote it, and its
+    /// trailing identifier. A tool that qualifies a name has not told us which
+    /// spelling occurs in the source — `deadcode` reports `Ledger.Add` for
+    /// source that reads `func (l *Ledger) Add()` — so searching only the
+    /// qualified form would let a rescue be missed on a spelling difference.
+    /// Searching both can only add rescues.
+    fn judge_symbol(
+        &self,
+        claim: &SymbolClaim,
+        literal_veto: &literal::LiteralVeto<'_>,
+    ) -> Option<BlockedClaim> {
+        let name = claim.name();
+        let mut spellings = vec![name.to_string()];
+        if let Some(tail) = trailing_identifier(name) {
+            if tail != name {
+                spellings.push(tail);
+            }
+        }
+
+        // The declaration site the analyzer gave, so Gate 2a can exclude it and
+        // ask the question it means to ask: is this symbol named ANYWHERE ELSE.
+        // [`UNKNOWN_DEFINING_FILE`] only when the analyzer did not say.
+        let declaring = claim
+            .declaration_site()
+            .map_or_else(|| PathBuf::from(UNKNOWN_DEFINING_FILE), Path::to_path_buf);
+
+        for spelling in spellings {
+            let candidate = literal::Candidate::symbol(declaring.clone(), spelling);
+            let verdict = literal_veto.query(&candidate, VetoedSut::symbol_needles());
+            if let Some(mut record) = from_literal(name.to_string(), ClaimKind::Symbol, &verdict) {
+                record.declared_in = claim.declaration_site().map(Path::to_path_buf);
+                return Some(record);
+            }
+        }
+        None
+    }
+}
+
+/// The trailing identifier of a qualified symbol name, or `None` when there is
+/// no separator to strip.
+fn trailing_identifier(symbol: &str) -> Option<String> {
+    let mut best: Option<&str> = None;
+    for separator in SYMBOL_SEPARATORS {
+        if let Some((_, tail)) = symbol.rsplit_once(separator) {
+            // The shortest tail is the one produced by the last separator in the
+            // string, whichever separator that was.
+            if best.is_none_or(|current| tail.len() < current.len()) {
+                best = Some(tail);
+            }
+        }
+    }
+    best.filter(|tail| !tail.is_empty()).map(str::to_string)
+}
+
+/// A [`BlockedClaim`] from Gate 2a's answer, or `None` when it did not veto.
+fn from_literal(
+    claim: String,
+    kind: ClaimKind,
+    verdict: &literal::Verdict,
+) -> Option<BlockedClaim> {
+    let literal::Verdict::Vetoed { reason, .. } = verdict else {
+        return None;
+    };
+    Some(match reason {
+        literal::VetoReason::Reference { first } => {
+            let needle = first.needle();
+            BlockedClaim {
+                claim,
+                kind,
+                gate: Gate::Literal,
+                needle: Some(needle.text().to_string()),
+                needle_kind: Some(needle.kind().as_str().to_string()),
+                found_in: Some(first.file().to_path_buf()),
+                // Filled in by `judge_symbol` for a symbol claim; there is no
+                // declaration site to name for a path claim, and none to
+                // invent here.
+                declared_in: None,
+                detail: format!(
+                    "{} names it: the {} needle {:?} occurs at byte {}",
+                    first.file().display(),
+                    needle.kind().as_str(),
+                    needle.text(),
+                    first.offset()
+                ),
+            }
+        }
+        // The §6.20 case, and the one rule that outranks everything else in this
+        // layer. Nothing fired, and that is not an absence of references — it is
+        // an absence of looking.
+        literal::VetoReason::IncompleteSearch { state } => {
+            let (file, what) = describe_scan_state(state);
+            BlockedClaim {
+                claim,
+                kind,
+                gate: Gate::Literal,
+                needle: None,
+                needle_kind: None,
+                found_in: file,
+                declared_in: None,
+                detail: format!(
+                    "the whole-repo search did not complete ({what}); an incomplete \
+                     search is a hit, never an absence (§6.20)"
+                ),
+            }
+        }
+    })
+}
+
+/// How far a scan got, as a file to blame and a sentence.
+fn describe_scan_state(state: &literal::ScanState) -> (Option<PathBuf>, String) {
+    match state {
+        // Unreachable: `Verdict::Vetoed { IncompleteSearch }` is never built from
+        // a completed scan. Spelled out rather than `unreachable!` so that an
+        // impossible state is a message instead of a panic (AGENTS.md rule 12).
+        literal::ScanState::Completed => (
+            None,
+            "the scanner reported an incomplete search over a completed scan, \
+             which is a bug in Gate 2a"
+                .to_string(),
+        ),
+        literal::ScanState::Truncated {
+            file,
+            limit_bytes,
+            actual_bytes,
+        } => (
+            Some(file.clone()),
+            format!(
+                "{} is {actual_bytes} bytes, over the {limit_bytes}-byte per-file \
+                 limit, so its contents were never searched",
+                file.display()
+            ),
+        ),
+        literal::ScanState::Errored { file, message } => (
+            file.clone(),
+            match file {
+                Some(file) => format!("{} could not be read: {message}", file.display()),
+                None => message.clone(),
+            },
+        ),
+        literal::ScanState::TimedOut {
+            budget,
+            elapsed,
+            files_searched,
+            files_total,
+        } => (
+            None,
+            format!(
+                "the {}ms budget expired after {}ms with {files_searched} of \
+                 {files_total} files searched",
+                budget.as_millis(),
+                elapsed.as_millis()
+            ),
+        ),
+    }
+}
+
+/// A [`BlockedClaim`] from Gate 2b/2c's answer.
+fn from_reachability(
+    claim: String,
+    kind: ClaimKind,
+    reason: &reachability::VetoReason,
+) -> BlockedClaim {
+    let (needle, needle_kind, found_in) = match reason {
+        reachability::VetoReason::EnumeratedDirectory {
+            construct,
+            found_in,
+            ..
+        } => (
+            Some(construct.clone()),
+            Some("construct".to_string()),
+            Some(found_in.clone()),
+        ),
+        reachability::VetoReason::ManifestPath { manifest, rooted } => (
+            Some(rooted.display().to_string()),
+            Some("manifest-path".to_string()),
+            Some(manifest.clone()),
+        ),
+        reachability::VetoReason::IncompleteRead { path, .. } => (None, None, Some(path.clone())),
+    };
+    BlockedClaim {
+        claim,
+        kind,
+        gate: Gate::Reachability,
+        needle,
+        needle_kind,
+        found_in,
+        // 2b/2c are path-scoped; `judge_symbol` never reaches them.
+        declared_in: None,
+        detail: reason.to_string(),
+    }
+}
+
+impl Sut for VetoedSut {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn cannot_emit(&self) -> Vec<String> {
+        self.inner.cannot_emit()
+    }
+
+    fn reads(&self) -> Option<&[Ecosystem]> {
+        self.inner.reads()
+    }
+
+    /// §9.3's ordering: the accuser runs first, and Gate 2 runs on **every**
+    /// survivor.
+    fn run(&self, repo: &Path) -> Result<SutVerdict> {
+        let claims = self.inner.run(repo)?;
+
+        // Before any claim is judged. A Gate 2 that cannot open the repository
+        // must not hand the claims back untouched: the report would still say
+        // the run was gated, and a gate that silently did not run is worse than
+        // one that was never added — it is the disarming failure of §6.20 with a
+        // reassuring label on it.
+        let handle = Repo::discover(repo).map_err(|source| Error::Sut {
+            sut: self.name.clone(),
+            message: format!(
+                "Gate 2 could not open the repository at {}: {source}. Refusing to \
+                 report an ungated run as a gated one.",
+                repo.display()
+            ),
+        })?;
+
+        let literal_veto = literal::LiteralVeto::new(&handle);
+        // Scanned once per repository, not once per claim: 2b/2c is a single
+        // pass whose result is queried per candidate.
+        let reach = self
+            .gates
+            .includes(Gate::Reachability)
+            .then(|| reachability::Reachability::scan(handle.root()));
+        let recency_veto = self
+            .gates
+            .includes(Gate::Recency)
+            .then(recency::RecencyVeto::default);
+
+        let claimed = claims.claimed_dead_paths.len() + claims.claimed_dead_symbols.len();
+        let mut blocked: Vec<BlockedClaim> = Vec::new();
+        let mut claimed_dead_paths: Vec<PathBuf> = Vec::new();
+        let mut claimed_dead_symbols: Vec<SymbolClaim> = Vec::new();
+
+        for path in &claims.claimed_dead_paths {
+            match self.judge_path(
+                path,
+                &literal_veto,
+                reach.as_ref(),
+                recency_veto.as_ref(),
+                &handle,
+            ) {
+                Some(record) => blocked.push(record),
+                None => claimed_dead_paths.push(path.clone()),
+            }
+        }
+        for symbol in &claims.claimed_dead_symbols {
+            match self.judge_symbol(symbol, &literal_veto) {
+                Some(record) => blocked.push(record),
+                None => claimed_dead_symbols.push(symbol.clone()),
+            }
+        }
+
+        let survived = claimed_dead_paths.len() + claimed_dead_symbols.len();
+        self.runs.borrow_mut().push(VetoRun {
+            repo: handle.root().to_path_buf(),
+            claimed,
+            survived,
+            blocked,
+        });
+
+        Ok(SutVerdict {
+            claimed_dead_paths,
+            claimed_dead_symbols,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The collapse rule, stated as the three cases that matter.
+    ///
+    /// The middle one is the whole reason this is not a one-liner: two files
+    /// declaring the same name give Gate 2a no single file to exclude, and
+    /// keeping either would let the gate find the symbol in the other and
+    /// "rescue" it on evidence the harness manufactured by choosing.
+    #[test]
+    fn a_declaration_site_survives_dedup_only_when_every_claim_agreed() {
+        let claims = vec![
+            SymbolClaim::declared_in("agreed", "a.py"),
+            SymbolClaim::declared_in("agreed", "a.py"),
+            SymbolClaim::declared_in("split", "a.py"),
+            SymbolClaim::declared_in("split", "b.py"),
+            SymbolClaim::declared_in("partly", "a.py"),
+            SymbolClaim::unattributed("partly"),
+            SymbolClaim::unattributed("never"),
+        ];
+
+        let deduped = SymbolClaim::dedup_by_name(claims);
+
+        assert_eq!(
+            deduped,
+            vec![
+                SymbolClaim::declared_in("agreed", "a.py"),
+                SymbolClaim::unattributed("never"),
+                SymbolClaim::unattributed("partly"),
+                SymbolClaim::unattributed("split"),
+            ],
+            "one claim per name, sorted by name, and a site only where the \
+             claims agreed on one"
+        );
+    }
+
+    /// Order must not decide the answer. `Some` seen before `None` and `None`
+    /// seen before `Some` are the same disagreement, and a rule that kept the
+    /// first-seen site would make the verdict depend on how the tool happened to
+    /// order its output.
+    #[test]
+    fn disagreement_is_symmetric_in_the_order_the_claims_arrived() {
+        let forwards = SymbolClaim::dedup_by_name(vec![
+            SymbolClaim::declared_in("x", "a.py"),
+            SymbolClaim::unattributed("x"),
+        ]);
+        let backwards = SymbolClaim::dedup_by_name(vec![
+            SymbolClaim::unattributed("x"),
+            SymbolClaim::declared_in("x", "a.py"),
+        ]);
+        assert_eq!(forwards, backwards);
+        assert_eq!(forwards, vec![SymbolClaim::unattributed("x")]);
     }
 }

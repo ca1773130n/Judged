@@ -12,6 +12,8 @@
 
 use std::path::PathBuf;
 
+use judged_core::veto::literal::NeedleStrategy;
+use judged_mutants::sut::DEFAULT_NEEDLES;
 use judged_ratchet::baseline::BASELINE_PATH;
 
 /// Flag spellings that are refused with an explanation instead of an
@@ -78,13 +80,72 @@ pub struct RatchetArgs {
 }
 
 /// `judged mutants [--sut naive|refusing|vulture|knip|deadcode|shear|command]
-/// [--json] [-- <argv>]`.
+/// [--veto] [--json] [-- <argv>]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutantsArgs {
     /// Which system under test to grade.
     pub sut: SutChoice,
+    /// Run §9.3's Gate 2 over every claim the SUT makes, and report the trade.
+    ///
+    /// Composable with every `--sut`, because the thing being measured is not a
+    /// tool but a **combination**: §11 R1 asks whether any signal combination
+    /// clears the catalogue, and §9.1's architecture is an analyzer orchestrated
+    /// as a bounded accuser with a veto behind it. A bare analyzer's
+    /// false-removal count is what an accuser does unprotected, which is not the
+    /// question.
+    pub veto: bool,
+    /// Which needles Gate 2a derives from a claimed **path** (§11 R8).
+    ///
+    /// Defaults to `judged_mutants::sut::DEFAULT_NEEDLES`, so an unadorned
+    /// `--veto` is the shipped configuration and the sweep's baseline row is the
+    /// build people run.
+    ///
+    /// Selectable because R8 asks for a measurement of this axis rather than an
+    /// argument about it, and a swept number is evidence only if a reader can
+    /// re-derive it. `VetoedSut::with_needles` existed from the start and no
+    /// command line reached it, which made the first published sweep
+    /// unreproducible from the repository that published it — for an evaluation
+    /// the same as not having run it.
+    ///
+    /// It reaches path claims only. A **symbol** claim is judged by
+    /// `VetoedSut::symbol_needles`, a fixed strategy, so this flag moves the
+    /// path-claim rows of a sweep and leaves the symbol-claim rows exactly where
+    /// they were. That is a limit of the axis, and stating it is the difference
+    /// between a sweep and a table.
+    pub needles: NeedleStrategy,
     /// Emit the report as JSON instead of as text.
     pub json: bool,
+}
+
+/// The needle strategies `--needles` accepts, spelled the way the report spells
+/// them back.
+///
+/// The spellings are `mutants_cmd::describe_needles`'s output rather than short
+/// nicknames, and that round trip is the point: the string in a swept table's
+/// row and the string on the command line that produced it are the same string,
+/// so a reader can check a published number against the run that made it
+/// without a translation table nobody maintains.
+const NEEDLE_STRATEGIES: [(&str, NeedleStrategy); 4] = [
+    ("basename", NeedleStrategy::BASENAME_ONLY),
+    ("basename+stem", NeedleStrategy::WITH_STEM),
+    ("basename+stem+parent-dir", NeedleStrategy::WITH_PARENT_DIR),
+    ("basename+stem+parent-dir+symbol", NeedleStrategy::MAXIMAL),
+];
+
+/// How [`DEFAULT_NEEDLES`] is spelled on the command line.
+///
+/// Looked up rather than written down a second time. A hard-coded string here
+/// would be a copy of the default that nothing keeps in step with it, and the
+/// first person to move `DEFAULT_NEEDLES` would ship a usage message naming the
+/// old one. The `expect` is the loud version of the same guard: a default that
+/// cannot be asked for by name is a configuration nobody can reproduce, which is
+/// the whole failure this flag exists to fix.
+fn default_needles_spelling() -> &'static str {
+    NEEDLE_STRATEGIES
+        .iter()
+        .find(|(_, strategy)| *strategy == DEFAULT_NEEDLES)
+        .map(|(spelling, _)| *spelling)
+        .expect("DEFAULT_NEEDLES must be one of the strategies `--needles` accepts")
 }
 
 /// The systems under test this build can grade.
@@ -307,8 +368,8 @@ judged — evidence about what a repository is still using.
 USAGE:
     judged ratchet --sarif <path>... [--baseline <path>] [--update]
                                      [--expected-targets <n>]
-    judged mutants [--sut <sut>] [--json]
-    judged mutants --sut command [--json] -- <analyzer> [args...]
+    judged mutants [--sut <sut>] [--veto [--needles <strategy>]] [--json]
+    judged mutants --sut command [--veto] [--json] -- <analyzer> [args...]
 
 RATCHET (§9.14) — baseline today's findings, fail CI only on new ones.
     --sarif <path>             A SARIF 2.1.0 log to judge. Repeatable, required.
@@ -338,7 +399,36 @@ MUTANTS (§10 E2) — inject 19 known-live artifacts and see what gets called de
                                the repository path appended as the last argument,
                                and must exit 0. Its stdout is parsed as vulture's
                                format, the only format the escape hatch reads.
-    --json                     Machine-readable report.
+    --veto                     Run §9.3's Gate 2 over every claim the SUT makes,
+                               and report the trade. Composable with every --sut.
+                               A veto can only RESCUE, never nominate, so this can
+                               only ever shrink a claim set. The suite is run
+                               TWICE — once bare, once gated — because the number
+                               that matters is the difference: how many false
+                               removals were prevented, and how many decoys were
+                               lost paying for them. Both are printed.
+    --needles <strategy>       Which needles Gate 2a derives from a claimed PATH
+                               (§11 R8). Requires --veto; refused without it,
+                               because there would be no gate to configure.
+                               Default: basename+stem. One of:
+        basename               The file's own name. The floor: Gate 2a cannot be
+                               narrowed past it.
+        basename+stem          ...plus the name without its extension. SHIPPED.
+        basename+stem+parent-dir
+                               ...plus the containing directory's name. §11 R8
+                               expects this one to dominate the flag rate: it
+                               fires on `src`, `app` and `dist`, and such a hit
+                               reads in the report exactly like a real reference.
+        basename+stem+parent-dir+symbol
+                               ...plus the claimed symbol's own name.
+                               Each spelling is what the report prints back in
+                               its `needles` field, so a swept number and the
+                               command that produced it name one configuration.
+                               A SYMBOL claim is judged by a fixed strategy this
+                               flag does not reach.
+    --json                     Machine-readable report. Under --veto it also
+                               carries the conflict list: for every blocked claim,
+                               which needle fired and in which file (§9.13, §7.3).
 
     Exit 0 only when the false-removal count is zero; 2 if the suite could not
     be run at all — including when the selected analyzer is not installed. An
@@ -497,14 +587,57 @@ fn parse_mutants<'a>(
     // nothing would be a green result nobody earned.
     let mut sut = "naive";
     let mut json = false;
+    // Off by default, so that the number the suite has always reported keeps
+    // meaning what it meant: what the analyzer does unprotected.
+    let mut veto = false;
+    let mut needles: Option<&str> = None;
 
     while let Some(word) = rest.next() {
         match word {
             "--sut" => sut = value("--sut", &mut rest)?,
             "--json" => json = true,
+            "--veto" => veto = true,
+            "--needles" => needles = Some(value("--needles", &mut rest)?),
             other => return Err(usage(format!("`{other}` is not a `judged mutants` flag."))),
         }
     }
+
+    // Refused rather than ignored. `--needles` configures a gate; without
+    // `--veto` there is no gate, so accepting it would let somebody publish a
+    // sweep in which every row was the same ungated run — a table of identical
+    // numbers, produced by command lines that each looked like they had asked
+    // for something different.
+    if needles.is_some() && !veto {
+        return Err(usage(
+            "`--needles` configures Gate 2a, which only runs under `--veto`. Without it there is \
+             no gate to configure and the flag would change nothing about the run — so it is \
+             refused rather than accepted and ignored."
+                .to_string(),
+        ));
+    }
+    let needles = match needles {
+        None => DEFAULT_NEEDLES,
+        Some(given) => NEEDLE_STRATEGIES
+            .iter()
+            .find(|(spelling, _)| *spelling == given)
+            .map(|(_, strategy)| *strategy)
+            .ok_or_else(|| {
+                usage(format!(
+                    "`--needles` accepts {}, got `{given}`. Each spelling is what the report \
+                     prints back in its `needles` field, so a swept number and the command that \
+                     produced it name the same configuration. The default is `{}` \
+                     (DEFAULT_NEEDLES). Widening to `parent-dir` is the §11 R8 case: the \
+                     directory needle fires on names like `src`, `app` and `dist`, and a hit on \
+                     one of those is not distinguishable in the report from a real reference.",
+                    NEEDLE_STRATEGIES
+                        .iter()
+                        .map(|(spelling, _)| format!("`{spelling}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    default_needles_spelling(),
+                ))
+            })?,
+    };
 
     let sut = match sut {
         "naive" => in_process(SutChoice::Naive, tail)?,
@@ -525,7 +658,12 @@ fn parse_mutants<'a>(
         }
     };
 
-    Ok(MutantsArgs { sut, json })
+    Ok(MutantsArgs {
+        sut,
+        veto,
+        needles,
+        json,
+    })
 }
 
 /// A SUT that takes no command line of its own, having checked it was not given
@@ -652,6 +790,87 @@ mod tests {
 
         assert_eq!(args.sut, SutChoice::Naive);
         assert!(!args.json);
+        // Off unless asked for. The false-removal count this suite has always
+        // published is what an analyzer does UNPROTECTED, and turning the veto
+        // on by default would silently redefine it.
+        assert!(!args.veto);
+    }
+
+    #[test]
+    fn veto_composes_with_every_sut() {
+        // §11 R1 asks whether any signal COMBINATION clears the catalogue, so
+        // the veto is not a property of one analyzer and cannot be offered for
+        // only some of them.
+        for sut in ["naive", "refusing", "vulture", "knip", "deadcode", "shear"] {
+            let args = mutants_args(&format!("mutants --sut {sut} --veto"));
+            assert!(args.veto, "--veto must compose with --sut {sut}");
+        }
+
+        let args = mutants_args("mutants --sut command --veto --json -- vulture");
+        assert!(args.veto);
+        assert!(args.json);
+        assert_eq!(
+            args.sut,
+            SutChoice::Command(vec!["vulture".to_string()]),
+            "--veto before `--` must not be swallowed into the analyzer's argv"
+        );
+    }
+
+    #[test]
+    fn the_needle_strategy_is_selectable_and_defaults_to_the_shipped_one() {
+        // §11 R8 asks for a measurement of this axis rather than an argument
+        // about it. `VetoedSut::with_needles` has always existed; until this
+        // flag, no command line reached it, so a published sweep could not be
+        // re-derived from the repository that published it.
+        assert_eq!(
+            mutants_args("mutants --veto").needles,
+            NeedleStrategy::WITH_STEM,
+            "the default must be the shipped DEFAULT_NEEDLES, so the sweep's \
+             baseline row is the shipped build"
+        );
+
+        for (spelling, expected) in [
+            ("basename", NeedleStrategy::BASENAME_ONLY),
+            ("basename+stem", NeedleStrategy::WITH_STEM),
+            ("basename+stem+parent-dir", NeedleStrategy::WITH_PARENT_DIR),
+            ("basename+stem+parent-dir+symbol", NeedleStrategy::MAXIMAL),
+        ] {
+            assert_eq!(
+                mutants_args(&format!("mutants --veto --needles {spelling}")).needles,
+                expected,
+                "`--needles {spelling}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_needle_strategy_without_a_veto_is_refused_rather_than_ignored() {
+        // Accepting it silently would let a sweep be published in which every
+        // row was the same ungated run.
+        let message = usage_error("mutants --needles basename");
+
+        assert!(
+            message.contains("--veto"),
+            "the refusal has to say which flag turns the gate on; got {message}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_needle_strategy_names_the_ones_that_exist() {
+        let message = usage_error("mutants --veto --needles everything");
+
+        for known in [
+            "basename",
+            "basename+stem",
+            "basename+stem+parent-dir",
+            "basename+stem+parent-dir+symbol",
+        ] {
+            assert!(
+                message.contains(known),
+                "the unknown-strategy message is this flag's discovery surface \
+                 and must name `{known}`; got {message}"
+            );
+        }
     }
 
     #[test]

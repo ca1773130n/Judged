@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use judged_core::{Error, Result};
 use judged_mutants::mutant::{Ecosystem, GroundTruth, Mutant};
 use judged_mutants::runner::run_suite;
-use judged_mutants::sut::{Sut, SutVerdict};
+use judged_mutants::sut::{Sut, SutVerdict, SymbolClaim};
 
 /// Every directory `run_suite` handed to a [`RecordingMutant`], in order.
 static MATERIALIZED_IN: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
@@ -188,7 +188,13 @@ fn truth(live: &[&str], decoys: &[&str]) -> GroundTruth {
 fn claims(paths: &[&str], symbols: &[&str]) -> SutVerdict {
     SutVerdict {
         claimed_dead_paths: paths.iter().map(PathBuf::from).collect(),
-        claimed_dead_symbols: symbols.iter().map(|s| (*s).to_string()).collect(),
+        // Unattributed: these tests are about grading, which matches on the
+        // name, and a file invented here would be a fact no analyzer supplied.
+        claimed_dead_symbols: symbols
+            .iter()
+            .copied()
+            .map(SymbolClaim::unattributed)
+            .collect(),
     }
 }
 

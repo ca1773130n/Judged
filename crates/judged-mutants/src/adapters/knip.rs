@@ -87,7 +87,7 @@ use judged_core::sarif::{
 use judged_core::{Error, Result};
 
 use crate::mutant::Ecosystem;
-use crate::sut::SutVerdict;
+use crate::sut::{SutVerdict, SymbolClaim};
 
 /// The tool name every error and every notification from this module carries.
 const TOOL: &str = "knip";
@@ -368,6 +368,25 @@ impl KnipFinding {
             _ => None,
         }
     }
+
+    /// The same symbol, with the module knip located it in.
+    ///
+    /// [`Self::uri`] is `locations[0]` — for a `knip/exports` result, the module
+    /// that exports the symbol, which is the file Gate 2a must exclude from the
+    /// corpus before deciding whether anything references it.
+    ///
+    /// `None` there yields [`SymbolClaim::unattributed`] rather than an error.
+    /// SARIF's `locations` is optional and knip is free to omit it; a finding
+    /// with no location is knip declining to say where the symbol lives, which
+    /// is precisely the case that constructor exists for. Refusing the run would
+    /// discard a claim knip did make over a field it never promised.
+    pub fn symbol_claim(&self) -> Option<SymbolClaim> {
+        let name = self.symbol()?;
+        Some(match self.uri.as_deref() {
+            Some(uri) => SymbolClaim::declared_in(name, uri),
+            None => SymbolClaim::unattributed(name),
+        })
+    }
 }
 
 /// A whole knip SARIF log, parsed.
@@ -428,11 +447,22 @@ pub fn verdict_from_findings(findings: &[KnipFinding]) -> SutVerdict {
     // `default` cannot be diffed between runs. Collapsing duplicates cannot
     // hide a false removal: grading asks whether a live artifact was claimed at
     // all, not how often.
+    //
+    // Each symbol claim now carries the module knip located it in — the `uri`
+    // this adapter has always parsed and never passed on. Gate 2a excludes that
+    // module before asking whether anything imports the symbol; without it every
+    // export is found in its own module and rescued. See
+    // [`crate::sut::SymbolClaim`].
+    //
+    // `SymbolClaim::dedup_by_name` collapses the duplicates and drops the module
+    // when they disagree: `default` exported from two modules has no single file
+    // to exclude, and excluding one would leave the gate finding the symbol in
+    // the other.
     let paths: BTreeSet<&Path> = findings.iter().filter_map(KnipFinding::path).collect();
-    let symbols: BTreeSet<&str> = findings.iter().filter_map(KnipFinding::symbol).collect();
+    let symbols = SymbolClaim::dedup_by_name(findings.iter().filter_map(KnipFinding::symbol_claim));
     SutVerdict {
         claimed_dead_paths: paths.into_iter().map(Path::to_path_buf).collect(),
-        claimed_dead_symbols: symbols.into_iter().map(str::to_string).collect(),
+        claimed_dead_symbols: symbols,
     }
 }
 
@@ -1247,6 +1277,16 @@ mod json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The claimed symbol *names*. A claim also carries the module knip located
+    /// it in; the tests that are about that say so.
+    fn symbol_names(verdict: &SutVerdict) -> Vec<&str> {
+        verdict
+            .claimed_dead_symbols
+            .iter()
+            .map(SymbolClaim::name)
+            .collect()
+    }
     use judged_core::sarif::{assess_run_health, RunHealth};
 
     /// Captured verbatim: `npx knip@6 --reporter sarif` in the materialized m14
@@ -1587,7 +1627,7 @@ src/does-not-exist.ts    knip.json  Refine entry pattern (no matches)
 
         let verdict = verdict_from_findings(&report.findings);
         assert_eq!(
-            verdict.claimed_dead_symbols,
+            symbol_names(&verdict),
             vec!["Blue", "UnusedType", "Widget", "unusedExport"]
         );
         assert!(
@@ -1602,7 +1642,7 @@ src/does-not-exist.ts    knip.json  Refine entry pattern (no matches)
         let report = parse_report(CAPTURED_NAMESPACES).unwrap();
         let verdict = verdict_from_findings(&report.findings);
         assert_eq!(
-            verdict.claimed_dead_symbols,
+            symbol_names(&verdict),
             vec!["ApiType", "Never", "Square", "default", "unusedApi"]
         );
         let default = report
@@ -1622,13 +1662,13 @@ src/does-not-exist.ts    knip.json  Refine entry pattern (no matches)
         let verdict = verdict_from_findings(&report.findings);
 
         assert_eq!(paths(&verdict), vec!["src/dupes.ts"]);
-        assert_eq!(
-            verdict.claimed_dead_symbols,
-            vec!["UnusedNsType", "unusedNs"]
-        );
+        assert_eq!(symbol_names(&verdict), vec!["UnusedNsType", "unusedNs"]);
         for never in ["left-pad", "some-unlisted-package", "src/cycleA.ts"] {
             assert!(
-                !verdict.claimed_dead_symbols.iter().any(|s| s == never),
+                !verdict
+                    .claimed_dead_symbols
+                    .iter()
+                    .any(|s| s.name() == never),
                 "{never} reached claimed_dead_symbols"
             );
             assert!(
@@ -1868,9 +1908,22 @@ src/does-not-exist.ts    knip.json  Refine entry pattern (no matches)
         );
         let report = parse_report(&doubled).unwrap();
         assert_eq!(report.findings.len(), 5, "the forged log has five results");
+        let verdict = verdict_from_findings(&report.findings);
         assert_eq!(
-            verdict_from_findings(&report.findings).claimed_dead_symbols,
+            symbol_names(&verdict),
             vec!["Blue", "UnusedType", "Widget", "unusedExport"]
+        );
+        let widget = verdict
+            .claimed_dead_symbols
+            .iter()
+            .find(|claim| claim.name() == "Widget")
+            .expect("Widget is claimed");
+        assert_eq!(
+            widget.declaration_site(),
+            None,
+            "the forged log reports Widget from src/lib.ts AND src/other.ts, so \
+             there is no single module for Gate 2a to exclude; excluding one \
+             would let it find the symbol in the other"
         );
     }
 

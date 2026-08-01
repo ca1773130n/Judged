@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 use judged_core::{Error, Result};
 
 use crate::mutant::Ecosystem;
-use crate::sut::SutVerdict;
+use crate::sut::{SutVerdict, SymbolClaim};
 
 /// What Vulture can and cannot say, in the form §9.2 requires of every adapter.
 ///
@@ -468,14 +468,29 @@ pub fn verdict_from_findings(findings: &[VultureFinding]) -> SutVerdict {
     // copies of a module a repository happens to have cannot be diffed between
     // runs. Collapsing duplicates cannot hide a false removal either — grading
     // asks whether a live name was claimed at all, not how often.
-    let symbols: BTreeSet<&str> = findings
-        .iter()
-        .filter(|finding| finding.claims_symbol())
-        .map(|finding| finding.name.as_str())
-        .collect();
+    //
+    // Each claim now carries the file vulture printed it against — the `path:`
+    // half of `path:line: unused class 'X'`, which this adapter has always
+    // parsed and used to drop on the floor. Gate 2a excludes that file before
+    // asking whether anything references the symbol, and without it every
+    // symbol is found in its own declaration and rescued. See
+    // [`crate::sut::SymbolClaim`].
+    //
+    // `SymbolClaim::dedup_by_name` is what collapses the duplicates, and it
+    // drops the site when the copies disagree rather than picking one of them;
+    // the two-files case has no single declaration to exclude.
+    //
+    // `finding.path` is the path vulture printed, uncorrected; `CommandSut::run`
+    // re-roots it, being the only thing that knows where the repository is.
+    let symbols = SymbolClaim::dedup_by_name(
+        findings
+            .iter()
+            .filter(|finding| finding.claims_symbol())
+            .map(|finding| SymbolClaim::declared_in(&finding.name, &finding.path)),
+    );
     SutVerdict {
         claimed_dead_paths: Vec::new(),
-        claimed_dead_symbols: symbols.into_iter().map(str::to_string).collect(),
+        claimed_dead_symbols: symbols,
     }
 }
 
@@ -496,6 +511,16 @@ pub fn files_touched(findings: &[VultureFinding]) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The claimed symbol *names*. A claim also carries the file vulture
+    /// attributed it to; the tests that are about that say so.
+    fn symbol_names(verdict: &SutVerdict) -> Vec<&str> {
+        verdict
+            .claimed_dead_symbols
+            .iter()
+            .map(SymbolClaim::name)
+            .collect()
+    }
 
     /// Captured verbatim: `vulture sample/ledger` against a two-file package,
     /// vulture 2.16, 2026-08-01. Covers every node type vulture has a word for
@@ -836,7 +861,10 @@ total  # unused variable (sample/ledger/jobs.py:6)
         let verdict = verdict_from_findings(&findings);
         for keyword in ["return", "while"] {
             assert!(
-                !verdict.claimed_dead_symbols.iter().any(|s| s == keyword),
+                !verdict
+                    .claimed_dead_symbols
+                    .iter()
+                    .any(|s| s.name() == keyword),
                 "claimed the keyword {keyword:?} as a dead symbol"
             );
         }
@@ -852,7 +880,7 @@ total  # unused variable (sample/ledger/jobs.py:6)
             "a name-level finding must never become a file claim"
         );
         assert_eq!(
-            verdict.claimed_dead_symbols,
+            symbol_names(&verdict),
             vec![
                 "Whatever",
                 "after_return",
@@ -875,8 +903,69 @@ total  # unused variable (sample/ledger/jobs.py:6)
     fn a_name_reported_in_two_files_is_claimed_once() {
         let verdict = verdict_from_stdout(CAPTURED_DUPLICATE_NAMES).unwrap();
         assert_eq!(
-            verdict.claimed_dead_symbols,
+            symbol_names(&verdict),
             vec!["Whatever", "context", "handler", "total"]
+        );
+    }
+
+    /// The `path:` half of every vulture line, carried into the claim.
+    ///
+    /// Without it Gate 2a has no file to exclude from the corpus, so it finds
+    /// every symbol in its own declaration and rescues every claim — a veto that
+    /// fires unconditionally, which measures nothing. See
+    /// [`crate::sut::SymbolClaim`].
+    #[test]
+    fn a_claim_carries_the_file_vulture_printed_it_against() {
+        let verdict = verdict_from_stdout(CAPTURED_TWO_FILES).unwrap();
+        let sites: Vec<(&str, Option<&str>)> = verdict
+            .claimed_dead_symbols
+            .iter()
+            .map(|claim| {
+                (
+                    claim.name(),
+                    claim.declaration_site().and_then(Path::to_str),
+                )
+            })
+            .collect();
+        assert_eq!(
+            sites,
+            vec![
+                ("Whatever", Some("sample/ledger/jobs.py")),
+                ("after_return", Some("sample/ledger/dunning.py")),
+                ("context", Some("sample/ledger/jobs.py")),
+                ("escalate", Some("sample/ledger/dunning.py")),
+                ("grace", Some("sample/ledger/dunning.py")),
+                ("handler", Some("sample/ledger/jobs.py")),
+                ("os", Some("sample/ledger/dunning.py")),
+                ("render_badge", Some("sample/ledger/dunning.py")),
+                ("retry_days", Some("sample/ledger/dunning.py")),
+                ("total", Some("sample/ledger/jobs.py")),
+                ("unused_attr", Some("sample/ledger/dunning.py")),
+                ("whilefalse", Some("sample/ledger/dunning.py")),
+            ],
+            "every claim names the file vulture reported it in, uncorrected: \
+             re-rooting is `CommandSut`'s job, being the only thing that knows \
+             where the repository is"
+        );
+    }
+
+    /// A name vulture reported in two different files has no single declaration
+    /// for Gate 2a to exclude, so the claim carries none. Excluding one of the
+    /// two would let the gate find the symbol in the other and rescue on
+    /// evidence the harness manufactured by choosing.
+    #[test]
+    fn a_name_reported_in_two_files_carries_no_declaration_site() {
+        let verdict = verdict_from_stdout(CAPTURED_DUPLICATE_NAMES).unwrap();
+        let ambiguous = verdict
+            .claimed_dead_symbols
+            .iter()
+            .find(|claim| claim.name() == "handler")
+            .expect("`handler` is reported in both captured files");
+        assert_eq!(
+            ambiguous.declaration_site(),
+            None,
+            "two declarations are not one declaration, and the conservative \
+             fallback is what an unattributed claim already gets"
         );
     }
 

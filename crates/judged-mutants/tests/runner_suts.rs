@@ -21,7 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use judged_core::{Error, Result};
-use judged_mutants::sut::{CommandSut, NaiveSut, RefusingSut, Sut, SutVerdict};
+use judged_mutants::sut::{CommandSut, NaiveSut, RefusingSut, Sut, SutVerdict, SymbolClaim};
 use tempfile::TempDir;
 
 /// Build a throwaway repo from `(relative path, contents)` pairs.
@@ -42,6 +42,17 @@ fn claimed_paths(verdict: &SutVerdict) -> Vec<String> {
         .claimed_dead_paths
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// The claimed symbol *names*, which is what every assertion here is about.
+/// A claim also carries the file the tool attributed it to; that is Gate 2a's
+/// business and is asserted in `tests/veto_gate.rs`.
+fn claimed_symbols(verdict: &SutVerdict) -> Vec<String> {
+    verdict
+        .claimed_dead_symbols
+        .iter()
+        .map(|claim| claim.name().to_string())
         .collect()
 }
 
@@ -91,9 +102,7 @@ fn naive_sut_claims_a_module_whose_only_reference_is_a_yaml_string() {
         claimed_paths(&verdict)
     );
     assert!(
-        verdict
-            .claimed_dead_symbols
-            .contains(&"NightlyTask".to_string()),
+        claimed_symbols(&verdict).contains(&"NightlyTask".to_string()),
         "the class is named only in YAML, so a textual scan sees one occurrence; got {:?}",
         verdict.claimed_dead_symbols
     );
@@ -123,9 +132,7 @@ fn naive_sut_spares_a_module_referenced_from_a_file_it_does_parse() {
         claimed_paths(&verdict)
     );
     assert!(
-        !verdict
-            .claimed_dead_symbols
-            .contains(&"NightlyTask".to_string()),
+        !claimed_symbols(&verdict).contains(&"NightlyTask".to_string()),
         "a symbol used in another source file must not be claimed"
     );
 }
@@ -202,9 +209,7 @@ fn naive_sut_claims_an_exported_symbol_with_no_in_repo_caller() {
     let verdict = run_naive(dir.path());
 
     assert!(
-        verdict
-            .claimed_dead_symbols
-            .contains(&"judged_probe".to_string()),
+        claimed_symbols(&verdict).contains(&"judged_probe".to_string()),
         "an ABI export has no in-repo caller; got {:?}",
         verdict.claimed_dead_symbols
     );
@@ -391,10 +396,12 @@ mod command_sut {
     fn parse_symbols(stdout: &str) -> Result<SutVerdict> {
         Ok(SutVerdict {
             claimed_dead_paths: Vec::new(),
+            // Unattributed: this stub echoes argv and the working directory,
+            // which are not declarations of anything.
             claimed_dead_symbols: stdout
                 .lines()
                 .filter(|line| !line.trim().is_empty())
-                .map(str::to_string)
+                .map(SymbolClaim::unattributed)
                 .collect(),
         })
     }
@@ -481,7 +488,7 @@ mod command_sut {
 
         let here = real(&dir);
         assert_eq!(
-            verdict.claimed_dead_symbols,
+            claimed_symbols(&verdict),
             vec![here.clone(), here],
             "the contract is both: cwd is the fixture repo, and the repo path \
              is the last argument"
@@ -506,7 +513,7 @@ mod command_sut {
         let verdict = sut.run(dir.path()).expect("sut runs");
 
         assert_eq!(
-            verdict.claimed_dead_symbols,
+            claimed_symbols(&verdict),
             vec!["--json".to_string(), "--quiet".to_string(), real(&dir)],
             "an adapter's flags must not displace the repo path"
         );

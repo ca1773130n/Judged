@@ -35,6 +35,7 @@ hex = "0.4"
 
 # One error type per fallible boundary, spelled out rather than stringly typed.
 thiserror = "2"
+aho-corasick = "1"
 
 # The E2 mutant suite (§10) materializes each mutant into a throwaway repo.
 tempfile = "3"

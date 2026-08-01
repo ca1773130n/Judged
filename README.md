@@ -62,8 +62,8 @@ or knip output do not exist yet; the contract they will be held to does.
 ### `judged mutants` — inject known-live artifacts and see what gets called dead
 
 ```sh
-judged mutants --sut naive|refusing|vulture|knip|deadcode|shear [--json]
-judged mutants --sut command [--json] -- <analyzer> [args...]
+judged mutants --sut naive|refusing|vulture|knip|deadcode|shear [--veto [--needles <strategy>]] [--json]
+judged mutants --sut command [--veto] [--json] -- <analyzer> [args...]
 ```
 
 Nineteen mutants, each materialized into a temporary repository when graded, each planting
@@ -235,6 +235,78 @@ pre-committed in both directions. Four off-the-shelf analyzers at their defaults
 are not "no signal combination", so nothing here discharges R1; what they
 establish is that the harness grades reality rather than only the two SUTs we
 wrote ourselves.
+
+### `--veto`: the same four analyzers, with Gate 2 behind them
+
+Those ten false removals are what an analyzer does **unprotected**, and no
+architecture in the research proposes shipping one that way. §9.1 orchestrates
+analyzers as bounded accusers with a veto layer behind them, and §11 R1 asks
+whether any signal *combination* clears the catalogue — not whether any tool
+does. `--veto` runs §9.3's Gate 2 over every claim the analyzer makes. It can
+only ever **rescue**; a veto is absorbing, no later evidence overrides it, and
+nothing in the layer can cause a candidate to be claimed dead. Because the
+number that matters is the difference, the suite runs twice — once bare, once
+gated — and prints both halves of the trade.
+
+| SUT | False removals bare → gated | Decoy recall bare → gated |
+| --- | --- | --- |
+| vulture 2.16 | 6 → **4** | 11/16 → 10/16 |
+| knip 6.31.0 | 2 → **1** | 4/6 → 2/6 |
+| deadcode v0.48.0 | 2 → **1** | 2/2 → 2/2 |
+| cargo-shear 1.13.3 | 0 → 0 | 9/9 → 5/9 |
+| all four | **10 → 6** | 26/29 → 19/29 |
+
+**Gate 2 prevents 4 of the 10 false removals at the shipped needle strategy, for
+7 of the 26 decoys the four tools recover.** Three of the seven affected classes
+are cleared; four still remove something live. Every rescue is cross-file: the
+gate excludes a claim's own file before searching, so a symbol found only in its
+own declaration is not rescued by it — **provided the analyzer said where it was
+declared.** When a tool names a symbol without attributing it to a file, there is
+nothing to exclude and the symbol is still rescued by its own declaration. That
+is deliberate (a gate that may only rescue is allowed to err toward rescuing) and
+it is a real remaining cost, not a closed defect: every such claim is a decoy the
+suite will never see found. The four are m01 (a dotted class path in
+`apps.yaml`), m12's `drain` (a `//go:linkname` comment), m16 (a class name inside
+a committed pickle — binaries are searched) and m14 (`widget.7f3a91c.js` in
+`public/index.html`).
+
+The six that survive are the more useful half of the result. Five of them —
+`ReportingConfig`, three reflection-touched model fields and a `//export`ed ABI
+symbol — are named **nowhere outside the file that declares them**. A whole-repo
+literal search rescues what is written down twice and cannot rescue what is
+written down once, and no needle setting changes that. The sixth, a module reached
+by a specifier assembled at runtime, is reachable only through the directory
+needle, at the cost the sweep measures.
+
+The `all four` row's denominator is 29 distinct decoy files, not the 33 you get by
+summing the per-tool columns: m02 and m10 are each graded by two analyzers, which
+counts their four decoys twice.
+
+The §11 R8 needle sweep is in the same document and is reproducible with
+`--needles`. `basename+stem` is what ships and is the narrowest strategy meeting
+R8's own criterion; `basename` alone fails it. `+parent-dir` is the only strategy
+that reaches the tenth false removal, and it buys it by also blocking on the words
+`src` and `dist` — taking knip's decoy recall to zero. Full write-up, per-class
+needle trace, sweep and limits in
+[`docs/evals/2026-08-02-gate2-veto.md`](docs/evals/2026-08-02-gate2-veto.md).
+
+That document also records a defect worth reading on its own account. Until it was
+fixed, `SutVerdict` carried symbol claims as bare names with no location, so Gate
+2a had no declaring file to exclude, found every symbol in its own declaration,
+and rescued **every symbol claim in the suite** — vulture 11/16 decoys to 0/16,
+deadcode 2/2 to 0/2, both printing `GATE PASSED` by claiming nothing. A veto that
+fires on every input is a constant function, and a constant function measures
+nothing. It survived a full review because `--veto --json` printed only where a
+string was found and not where it was declared, so a genuine cross-file rescue and
+a tautology looked identical. Both fields are emitted now.
+
+None of this discharges §11 R1 — it points the other way. Six false removals
+remain across four classes, no measured combination clears the **18 of 19 classes
+any analyzer here can read** (m13 is PHP and nothing reads it), and the
+pre-committed reading of that is that this combination is not an auto-act tier.
+> **Read every number below as an upper bound.** The evaluation is **in-sample**: Gate 2's rescue vocabulary and the 19 classes
+come from the same research document, so it is graded on the exam it studied for
+and every prevention figure is an upper bound.
 
 ## Layout
 

@@ -105,7 +105,7 @@ use std::path::{Path, PathBuf};
 use judged_core::{Error, Result};
 
 use crate::mutant::Ecosystem;
-use crate::sut::SutVerdict;
+use crate::sut::{SutVerdict, SymbolClaim};
 
 /// What deadcode can and cannot say, in the form §9.2 requires of every adapter.
 ///
@@ -423,14 +423,31 @@ pub fn verdict_from_packages(packages: &[DeadPackage]) -> SutVerdict {
     // many packages a repository happens to have cannot be diffed between runs.
     // Collapsing duplicates cannot hide a false removal — grading asks whether a
     // live name was claimed at all, not how often.
-    let symbols: BTreeSet<&str> = packages
-        .iter()
-        .flat_map(|package| &package.funcs)
-        .map(|function| function.name.as_str())
-        .collect();
+    //
+    // Each claim now carries `Position.File`, which this adapter has always
+    // parsed into [`DeadFunction::file`] and never passed on. Gate 2a excludes
+    // that file before asking whether anything references the symbol; without it
+    // every symbol is found in its own declaration and rescued. See
+    // [`crate::sut::SymbolClaim`].
+    //
+    // `SymbolClaim::dedup_by_name` collapses the duplicates and drops the site
+    // when two packages disagree — `Ledger.Add` declared in two files has no one
+    // declaration to exclude, and choosing would be the harness inventing a
+    // fact.
+    //
+    // `function.file` is the path the go tool resolved: relative to the
+    // process's working directory when the file lies under it, absolute
+    // otherwise (see [`DeadFunction::file`]). `CommandSut::run` handles both,
+    // being the only thing that knows where the repository is.
+    let symbols = SymbolClaim::dedup_by_name(
+        packages
+            .iter()
+            .flat_map(|package| &package.funcs)
+            .map(|function| SymbolClaim::declared_in(&function.name, &function.file)),
+    );
     SutVerdict {
         claimed_dead_paths: Vec::new(),
-        claimed_dead_symbols: symbols.into_iter().map(str::to_string).collect(),
+        claimed_dead_symbols: symbols,
     }
 }
 
@@ -1246,7 +1263,10 @@ internal/sampler/legacy_histogram.go:6:6: unreachable func: legacyHistogram
         let verdict = verdict_from_stdout(CAPTURED_M12).unwrap();
         for live in ["drain", "TelemetryFlush"] {
             assert!(
-                verdict.claimed_dead_symbols.iter().any(|s| s == live),
+                verdict
+                    .claimed_dead_symbols
+                    .iter()
+                    .any(|s| s.name() == live),
                 "deadcode must be graded as claiming the live symbol {live}; got {:?}",
                 verdict.claimed_dead_symbols
             );
@@ -1261,7 +1281,10 @@ internal/sampler/legacy_histogram.go:6:6: unreachable func: legacyHistogram
         let verdict = verdict_from_stdout(CAPTURED_M12).unwrap();
         for decoy in ["legacyHistogram", "unusedPercentile"] {
             assert!(
-                verdict.claimed_dead_symbols.iter().any(|s| s == decoy),
+                verdict
+                    .claimed_dead_symbols
+                    .iter()
+                    .any(|s| s.name() == decoy),
                 "the decoy {decoy} must be claimed; got {:?}",
                 verdict.claimed_dead_symbols
             );
@@ -1280,19 +1303,19 @@ internal/sampler/legacy_histogram.go:6:6: unreachable func: legacyHistogram
         assert!(full
             .claimed_dead_symbols
             .iter()
-            .any(|s| s == "TelemetryFlush"));
+            .any(|s| s.name() == "TelemetryFlush"));
         assert!(
             !without_cgo
                 .claimed_dead_symbols
                 .iter()
-                .any(|s| s == "TelemetryFlush"),
+                .any(|s| s.name() == "TelemetryFlush"),
             "under CGO_ENABLED=0 the package holding it is not analyzed at all"
         );
         assert!(
             without_cgo
                 .claimed_dead_symbols
                 .iter()
-                .any(|s| s == "drain"),
+                .any(|s| s.name() == "drain"),
             "and the rest of the analysis proceeds exactly as before, which is what makes the \
              difference invisible"
         );
@@ -1325,7 +1348,10 @@ internal/sampler/legacy_histogram.go:6:6: unreachable func: legacyHistogram
         let verdict = verdict_from_stdout(CAPTURED_M12).unwrap();
         for pseudo in ["runtime_throw", "_cgo_cmalloc"] {
             assert!(
-                verdict.claimed_dead_symbols.iter().any(|s| s == pseudo),
+                verdict
+                    .claimed_dead_symbols
+                    .iter()
+                    .any(|s| s.name() == pseudo),
                 "{pseudo} is in deadcode's output and must survive into the verdict"
             );
         }
@@ -1491,6 +1517,38 @@ internal/sampler/legacy_histogram.go:6:6: unreachable func: legacyHistogram
     fn deeply_nested_input_is_refused_rather_than_overflowing_the_stack() {
         let bomb = "[".repeat(50_000);
         assert!(parse_packages(&bomb).is_err());
+    }
+
+    /// `Position.File`, carried into the claim.
+    ///
+    /// Without it Gate 2a has no file to exclude from the corpus, so it finds
+    /// every symbol in its own declaration and rescues every claim — a veto that
+    /// fires unconditionally, which measures nothing. See
+    /// [`crate::sut::SymbolClaim`].
+    #[test]
+    fn a_claim_carries_the_position_deadcode_reported_it_at() {
+        let verdict = verdict_from_stdout(CAPTURED_M12).unwrap();
+        let drain = verdict
+            .claimed_dead_symbols
+            .iter()
+            .find(|claim| claim.name() == "drain")
+            .expect("m12 claims `drain`");
+        assert_eq!(
+            drain.declaration_site().and_then(Path::to_str),
+            Some("internal/sampler/drain.go"),
+            "`Position.File` exactly as captured, uncorrected: re-rooting is \
+             `CommandSut`'s job, being the only thing that knows where the \
+             repository is"
+        );
+        assert!(
+            verdict
+                .claimed_dead_symbols
+                .iter()
+                .all(|claim| claim.declaration_site().is_some()),
+            "every deadcode finding has a Position, so no claim from this tool \
+             should ever reach Gate 2a unattributed: {:?}",
+            verdict.claimed_dead_symbols
+        );
     }
 
     #[test]

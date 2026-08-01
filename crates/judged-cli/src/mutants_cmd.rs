@@ -32,13 +32,17 @@
 //! because turning it into an exit code would let a fixture author raise a
 //! green by planting easier decoys.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use judged_core::veto::literal::{NeedleKind, NeedleStrategy};
 use judged_mutants::adapters::{deadcode, knip, shear, vulture};
 use judged_mutants::fixtures;
 use judged_mutants::mutant::{Ecosystem, Mutant};
 use judged_mutants::runner::{reads_mutant, run_suite, Grade, MutantReport, SuiteReport};
-use judged_mutants::sut::{CommandSut, NaiveSut, RefusingSut, Sut, SutVerdict};
+use judged_mutants::sut::{
+    BlockedClaim, CommandSut, GateSet, NaiveSut, RefusingSut, Sut, SutVerdict, VetoRun, VetoedSut,
+};
 use serde_json::{json, Value};
 
 use crate::args::{MutantsArgs, SutChoice};
@@ -204,19 +208,319 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
         }
     };
 
+    // Without `--veto` the run is over: `report` is what the bare accuser did,
+    // which is the number this suite has always published.
+    //
+    // With it, the suite is run a **second** time with §9.3's Gate 2 wrapped
+    // around the same analyzer, and the report becomes the difference between
+    // the two. Two runs rather than one, and the extra analyzer time is the
+    // price: "how many false removals did the veto prevent" is a question about
+    // a pair of runs, and deriving it from one of them would mean assuming the
+    // answer.
+    let (report, veto) = if args.veto {
+        let gated_sut = VetoedSut::new(build_sut(&args.sut)).with_needles(args.needles);
+        let gated = match run_suite(&gated_sut, &mutants) {
+            Ok(gated) => gated,
+            Err(error) => {
+                return (
+                    render_refusal(
+                        &Refusal {
+                            headline: "the veto-gated E2 suite did not complete".to_string(),
+                            detail: error.to_string(),
+                            remedy: foreign_ecosystem_hint(sut.as_ref(), &mutants),
+                        },
+                        &args.sut,
+                        args.json,
+                    ),
+                    2,
+                )
+            }
+        };
+        match compare(&report, &gated, &gated_sut) {
+            Ok(summary) => (gated, Some(summary)),
+            Err(refusal) => return (render_refusal(&refusal, &args.sut, args.json), 2),
+        }
+    } else {
+        (report, None)
+    };
+
     // The gate, and only the gate (§10 E2, §11 R1) — but not before checking
     // that there is something for it to be a gate over.
+    //
+    // Under `--veto` this gates on the **gated** run, because the gated run is
+    // the system that was measured. The bare run's numbers do not disappear:
+    // they are printed beside it, and the exit code belongs to the combination
+    // §11 R1 asks about, not to half of it.
     let code = match gate(&report) {
         Ok(code) => code,
         Err(refusal) => return (render_refusal(&refusal, &args.sut, args.json), 2),
     };
 
     let rendered = if args.json {
-        render_json(&report, &catalogue, &args.sut)
+        render_json(&report, &catalogue, &args.sut, veto.as_ref())
     } else {
-        render_text(&report, &catalogue, &args.sut)
+        render_text(&report, &catalogue, &args.sut, veto.as_ref())
     };
     (rendered, code)
+}
+
+// ---------------------------------------------------------------------------
+// The trade
+// ---------------------------------------------------------------------------
+
+/// What Gate 2 changed on one class.
+#[derive(Debug)]
+struct VetoClass {
+    /// Live artifacts the bare run claimed and the gated run did not.
+    prevented: Vec<String>,
+    /// Genuinely-dead decoys the bare run found and the gated run did not.
+    decoys_lost: usize,
+    /// How many claims Gate 2 was handed here — the denominator of §11 R8's flag
+    /// rate, whose numerator is [`Self::blocked`].
+    ///
+    /// Published because R8's two requirements are *block on any hit* and *a
+    /// tolerable flag rate*, and a rate cannot be checked against a report that
+    /// carries only the claims that fired. Taken from Gate 2's own accounting,
+    /// which [`compare_runs`] refuses to publish unless `survived + blocked`
+    /// equals it.
+    claims_judged: usize,
+    /// Every claim Gate 2 dropped on this class, with its evidence.
+    blocked: Vec<BlockedClaim>,
+}
+
+/// The whole trade, per class and in total.
+#[derive(Debug)]
+struct VetoSummary {
+    /// Which sub-gates ran, and which needles Gate 2a derived. A number produced
+    /// under one configuration is not the number produced under another (§11 R8).
+    gates: String,
+    needles: String,
+    /// Live artifacts rescued, and live artifacts still removed after the veto.
+    prevented: usize,
+    remaining: usize,
+    /// Decoys found before and after, and the difference. **The price**, and it
+    /// is a first-class field rather than a note, because a report that showed
+    /// only the prevented column would be selling the veto instead of measuring
+    /// it (§9.13: never sort by, or present, what flatters the tool).
+    decoys_bare: usize,
+    decoys_gated: usize,
+    decoys_lost: usize,
+    decoys_total: usize,
+    /// §11 R8's flag rate, both halves, over the whole run.
+    ///
+    /// Stated here and not left to be summed out of [`Self::classes`]: a class
+    /// where Gate 2 blocked nothing and cost nothing has no row, so summing the
+    /// published rows counts only the classes where the gate fired and inflates
+    /// every rate derived from it — in the direction that flatters the gate.
+    claims_judged: usize,
+    claims_blocked: usize,
+    /// Keyed by mutant id, in catalogue order.
+    classes: Vec<(String, VetoClass)>,
+}
+
+/// Diff a bare run against its veto-gated twin, and refuse to publish a
+/// comparison that violates the one property the layer has.
+///
+/// **Vetoing can only ever remove claims.** That is asserted in
+/// `judged-mutants/tests/veto_gate.rs` on the claim sets themselves; this is the
+/// same property re-checked on the graded output at the moment a report is
+/// about to be printed, because the report is what somebody acts on. A gate that
+/// added a false removal, or found a decoy the bare run missed, would mean the
+/// layer nominated rather than rescued — and there is no rendering of that which
+/// is safe to publish.
+///
+/// The subset check is on the false-removal **sets**, never on their sizes: two
+/// runs can remove the same number of live artifacts without removing the same
+/// ones, and the sets are what carry the meaning.
+fn compare(
+    bare: &SuiteReport,
+    gated: &SuiteReport,
+    gated_sut: &VetoedSut,
+) -> Result<VetoSummary, Refusal> {
+    compare_runs(
+        bare,
+        gated,
+        &gated_sut.runs(),
+        gated_sut.gates(),
+        gated_sut.needles(),
+    )
+}
+
+/// [`compare`] over the values it reads, so the refusals above can be provoked
+/// in a test.
+///
+/// A seam rather than a convenience: the branches this splits out are the ones
+/// that must never be reached in production, which is exactly why they cannot
+/// be left unexercised.
+fn compare_runs(
+    bare: &SuiteReport,
+    gated: &SuiteReport,
+    runs: &[VetoRun],
+    gates: GateSet,
+    needles: NeedleStrategy,
+) -> Result<VetoSummary, Refusal> {
+    let violation = |detail: String| Refusal {
+        headline: "the veto layer did not behave as a veto".to_string(),
+        detail,
+        remedy: Some(
+            "This is a defect in Gate 2 or in the wrapper around it, not a \
+             finding about the analyzer. Nothing about this run may be reported \
+             until it is fixed."
+                .to_string(),
+        ),
+    };
+
+    if bare.reports.len() != gated.reports.len() {
+        return Err(violation(format!(
+            "the bare run covered {} classes and the gated run {}",
+            bare.reports.len(),
+            gated.reports.len()
+        )));
+    }
+
+    // Blocked claims are attributed to classes by run order: `run_suite` calls
+    // the SUT exactly once per graded class, in catalogue order, and skips the
+    // rest before it materializes anything. If those two sequences ever stop
+    // agreeing, the evidence would be printed beside the wrong class — so the
+    // lengths are checked rather than assumed, and a mismatch is a refusal.
+    let graded: Vec<&MutantReport> = gated
+        .reports
+        .iter()
+        .filter(|row| row.grade != Grade::NotRead)
+        .collect();
+    if runs.len() != graded.len() {
+        return Err(violation(format!(
+            "Gate 2 recorded {} runs but the report grades {} classes, so a \
+             blocked claim cannot be attributed to the class it came from",
+            runs.len(),
+            graded.len()
+        )));
+    }
+    // Keyed by class: how many claims Gate 2 was handed, and which of them it
+    // dropped. Both halves, because §11 R8's flag rate is a ratio and a report
+    // that carries only the numerator publishes a number nobody can check.
+    let mut blocked_by_class: Vec<(String, usize, Vec<BlockedClaim>)> = Vec::new();
+    for (row, run) in graded.iter().zip(runs.iter()) {
+        if run.survived + run.blocked.len() != run.claimed {
+            return Err(violation(format!(
+                "{}: Gate 2 was handed {} claims and accounted for {} of them",
+                row.mutant_id,
+                run.claimed,
+                run.survived + run.blocked.len()
+            )));
+        }
+        blocked_by_class.push((row.mutant_id.clone(), run.claimed, run.blocked.clone()));
+    }
+
+    let mut classes: Vec<(String, VetoClass)> = Vec::new();
+    for (before, after) in bare.reports.iter().zip(gated.reports.iter()) {
+        if before.mutant_id != after.mutant_id {
+            return Err(violation(format!(
+                "the two runs disagree about the catalogue: {} against {}",
+                before.mutant_id, after.mutant_id
+            )));
+        }
+
+        let bare_removals: BTreeSet<&str> =
+            before.false_removals.iter().map(String::as_str).collect();
+        let gated_removals: BTreeSet<&str> =
+            after.false_removals.iter().map(String::as_str).collect();
+        if !gated_removals.is_subset(&bare_removals) {
+            return Err(violation(format!(
+                "{}: the gated run removed live artifacts the bare run did not: {:?}. \
+                 A veto may only rescue.",
+                before.mutant_id,
+                gated_removals
+                    .difference(&bare_removals)
+                    .collect::<Vec<_>>()
+            )));
+        }
+        if after.decoys_found > before.decoys_found {
+            return Err(violation(format!(
+                "{}: the gated run found {} decoys and the bare run {}. A veto \
+                 cannot nominate, so it cannot find anything the accuser missed.",
+                before.mutant_id, after.decoys_found, before.decoys_found
+            )));
+        }
+
+        // A class Gate 2 never saw — one the SUT could not read — has no run and
+        // therefore no denominator, which is zero claims judged rather than a
+        // missing number.
+        let (claims_judged, blocked) = blocked_by_class
+            .iter()
+            .find(|(id, _, _)| id == &before.mutant_id)
+            .map(|(_, claimed, blocked)| (*claimed, blocked.clone()))
+            .unwrap_or_default();
+
+        classes.push((
+            before.mutant_id.clone(),
+            VetoClass {
+                prevented: bare_removals
+                    .difference(&gated_removals)
+                    .map(|name| (*name).to_string())
+                    .collect(),
+                decoys_lost: before.decoys_found - after.decoys_found,
+                claims_judged,
+                blocked,
+            },
+        ));
+    }
+
+    let decoys_bare: usize = bare.reports.iter().map(|row| row.decoys_found).sum();
+    let decoys_gated: usize = gated.reports.iter().map(|row| row.decoys_found).sum();
+    Ok(VetoSummary {
+        gates: gates
+            .gates()
+            .into_iter()
+            .map(|gate| gate.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        needles: describe_needles(needles),
+        prevented: classes.iter().map(|(_, class)| class.prevented.len()).sum(),
+        remaining: gated.false_removal_count,
+        decoys_bare,
+        decoys_gated,
+        decoys_lost: decoys_bare - decoys_gated,
+        decoys_total: gated.reports.iter().map(|row| row.decoys_total).sum(),
+        // Over every run Gate 2 made, not over the rows that survived into the
+        // report. See the field.
+        claims_judged: runs.iter().map(|run| run.claimed).sum(),
+        claims_blocked: runs.iter().map(|run| run.blocked.len()).sum(),
+        classes,
+    })
+}
+
+impl VetoSummary {
+    /// What Gate 2 changed on one class, or `None` when it changed nothing and
+    /// the class has no row of its own.
+    fn class(&self, mutant_id: &str) -> Option<&VetoClass> {
+        self.classes
+            .iter()
+            .find(|(id, _)| id == mutant_id)
+            .map(|(_, class)| class)
+            .filter(|class| {
+                !class.prevented.is_empty() || class.decoys_lost > 0 || !class.blocked.is_empty()
+            })
+    }
+}
+
+/// Which needles Gate 2a derived, spelled for a report.
+///
+/// §11 R8 records that the parent-directory needle is the one expected to
+/// dominate the flag rate, so a false-removals-prevented number means nothing
+/// without the strategy that produced it.
+fn describe_needles(strategy: NeedleStrategy) -> String {
+    [
+        NeedleKind::Basename,
+        NeedleKind::Stem,
+        NeedleKind::ParentDir,
+        NeedleKind::Symbol,
+    ]
+    .into_iter()
+    .filter(|kind| strategy.includes(*kind))
+    .map(NeedleKind::as_str)
+    .collect::<Vec<_>>()
+    .join("+")
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +533,7 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
 /// be rendered twice — once for a person and once for whatever reads `--json` —
 /// and the JSON rendering is the one that would otherwise quietly turn a
 /// refusal into a result.
+#[derive(Debug)]
 struct Refusal {
     /// One line, in the log tail a human actually reads.
     headline: String,
@@ -621,6 +926,35 @@ fn disclosure(choice: &SutChoice) -> Option<Disclosure> {
     }
 }
 
+/// One blocked claim, as the conflict list entry §9.13 asks for.
+///
+/// `needle` and `found_in` are `null` rather than absent when the veto came from
+/// a search that did not complete: nothing fired, and the reason nothing fired
+/// is that nothing looked (§6.20). A consumer that sees a null needle beside a
+/// populated `detail` is looking at exactly that case.
+///
+/// `declared_in` sits next to `found_in` so the two can be compared, and that
+/// comparison is the point. For a symbol claim, Gate 2a excludes the declaring
+/// file and searches the rest, so the two fields differing is what makes a
+/// rescue a *cross-file* reference rather than the symbol's own declaration read
+/// back at it. Without both, the two are indistinguishable in the output — which
+/// is how a Gate 2a that rescued every symbol claim in the suite passed review.
+/// `null` means the analyzer named no file, so nothing was excluded and the
+/// rescue is unchecked in exactly that way; it is `null` rather than absent for
+/// the same reason as the fields above.
+fn blocked_json(record: &BlockedClaim) -> Value {
+    json!({
+        "claim": record.claim,
+        "kind": record.kind.as_str(),
+        "gate": record.gate.as_str(),
+        "needle": record.needle,
+        "needle_kind": record.needle_kind,
+        "found_in": record.found_in.as_ref().map(|path| path.display().to_string()),
+        "declared_in": record.declared_in.as_ref().map(|path| path.display().to_string()),
+        "detail": record.detail,
+    })
+}
+
 /// The JSON spelling of a grade. Lower-case and stable, because a consumer will
 /// match on it.
 fn grade_name(grade: Grade) -> &'static str {
@@ -676,10 +1010,34 @@ fn totals(report: &SuiteReport) -> (usize, usize, usize) {
     (passed, decoys_found, decoys_total)
 }
 
+/// What the report calls the system it measured.
+///
+/// Under `--veto` the measured system is the analyzer **and** Gate 2, and the
+/// label says so. A gated run publishes a smaller false-removal count than the
+/// same analyzer bare, and two runs that reported the same `sut` would be
+/// compared as if the tool had improved.
+fn sut_label(choice: &SutChoice, veto: bool) -> String {
+    if veto {
+        format!("{}+veto", choice.label())
+    } else {
+        choice.label()
+    }
+}
+
+/// How many blocked claims a class shows in the text rendering before it stops
+/// listing them.
+///
+/// A cap, not a filter: the count of what is not shown is printed, and `--json`
+/// carries every one. §9.13 budgets a human ten seconds, and a control that
+/// blocks forty claims on each of nineteen classes would push the gate line off
+/// the bottom of the log.
+const BLOCKED_SHOWN: usize = 6;
+
 fn render_text(
     report: &SuiteReport,
     catalogue: &[(String, String, String)],
     choice: &SutChoice,
+    veto: Option<&VetoSummary>,
 ) -> String {
     let classes = report.reports.len();
     let (passed, decoys_found, decoys_total) = totals(report);
@@ -689,8 +1047,17 @@ fn render_text(
          \x20 Any \"dead\" verdict on an injected live artifact is a hard failure, not a tuning\n\
          \x20 opportunity (§10 E2). Decoys are genuinely-dead files planted beside them, so that\n\
          \x20 a tool which refuses to answer cannot score a perfect run.\n\n",
-        choice.label()
+        sut_label(choice, veto.is_some())
     );
+
+    if let Some(veto) = veto {
+        out.push_str(&format!(
+            "Gate 2 (§9.3) ran on every claim this analyzer made: gates {}, needles {}.\n\
+             A veto can only RESCUE, never nominate, so the gated claim set is a subset of the\n\
+             bare one. Both halves of the trade are below: what it prevented, and what it cost.\n\n",
+            veto.gates, veto.needles
+        ));
+    }
 
     // Printed above the table rather than below the summary. §9.13 budgets a
     // human ten seconds and puts the numbers that decide something in the log
@@ -712,6 +1079,51 @@ fn render_text(
             // the finding: a live artifact the tool would have deleted, and the
             // documented incident class it came from.
             out.push_str(&format!("       removed live: {removed}   [{research}]\n"));
+        }
+        if let Some(class) = veto.and_then(|veto| veto.class(&row.mutant_id)) {
+            for rescued in &class.prevented {
+                out.push_str(&format!(
+                    "       veto rescued live: {rescued}   [{research}]\n"
+                ));
+            }
+            if class.decoys_lost > 0 {
+                out.push_str(&format!(
+                    "       veto also rescued {} genuinely-dead decoy file(s) — the price\n",
+                    class.decoys_lost
+                ));
+            }
+            // The conflict list §9.13 asks for, and the usage list §7.3 records
+            // IntelliJ Safe Delete showing instead of a probability: what fired,
+            // and where.
+            //
+            // A symbol also states where it was declared, because `detail`
+            // names the file the evidence was found in and those two being the
+            // same file is a rescue that checked nothing. One line holding only
+            // the second of them cannot be told from a genuine cross-file
+            // reference — the gap that let a Gate 2a rescuing every symbol claim
+            // read as a working gate.
+            for record in class.blocked.iter().take(BLOCKED_SHOWN) {
+                let declared = match &record.declared_in {
+                    Some(path) => format!(" (declared in {})", path.display()),
+                    // Nothing borrowed from `found_in` to fill the gap: the
+                    // analyzer named no file, so Gate 2a excluded none, and
+                    // saying so is the honest form of this row.
+                    None => String::new(),
+                };
+                out.push_str(&format!(
+                    "       [{gate}] blocked {kind} {claim}{declared} — {detail}\n",
+                    gate = record.gate,
+                    kind = record.kind.as_str(),
+                    claim = record.claim,
+                    detail = record.detail,
+                ));
+            }
+            if class.blocked.len() > BLOCKED_SHOWN {
+                out.push_str(&format!(
+                    "       … and {} more blocked claim(s) on this class; --json lists every one\n",
+                    class.blocked.len() - BLOCKED_SHOWN
+                ));
+            }
         }
     }
 
@@ -752,6 +1164,34 @@ fn render_text(
              from the design rather than tuned)"
         }
     ));
+
+    // The two halves of the trade, on adjacent lines and in the same shape.
+    // Printed together on purpose: a report showing only what the veto prevented
+    // would be selling it, and §9.13 invariant 3 forbids presenting the flattering
+    // number without the one that pays for it.
+    if let Some(veto) = veto {
+        out.push_str(&format!(
+            "veto prevented: {} false removal(s) — {} bare, {} still removed after Gate 2\n",
+            veto.prevented,
+            veto.prevented + veto.remaining,
+            veto.remaining,
+        ));
+        out.push_str(&format!(
+            "veto cost: {} decoy(s) lost — {} of {} found bare, {} of {} found gated\n",
+            veto.decoys_lost,
+            veto.decoys_bare,
+            veto.decoys_total,
+            veto.decoys_gated,
+            veto.decoys_total,
+        ));
+        if veto.decoys_gated == 0 && veto.decoys_bare > 0 {
+            out.push_str(
+                "note: the gated combination found no genuinely-dead file at all. It reached this \
+                 false-removal count the way a tool that refuses to answer reaches it, and §11 R1 \
+                 asks whether a signal combination is USABLE, not only whether it is safe.\n",
+            );
+        }
+    }
 
     let failing = failing_classes(report);
     if failing.is_empty() {
@@ -810,6 +1250,7 @@ fn render_json(
     report: &SuiteReport,
     catalogue: &[(String, String, String)],
     choice: &SutChoice,
+    veto: Option<&VetoSummary>,
 ) -> String {
     let (passed, decoys_found, decoys_total) = totals(report);
 
@@ -818,6 +1259,27 @@ fn render_json(
         .iter()
         .map(|row| {
             let (mechanism, research) = lookup(catalogue, &row.mutant_id);
+            let veto_row = veto
+                .and_then(|veto| veto.class(&row.mutant_id))
+                .map(|class| {
+                    json!({
+                        "prevented_false_removals": class.prevented,
+                        "decoys_lost": class.decoys_lost,
+                        // The flag rate's denominator (§11 R8), beside the
+                        // numerator below. Without it a published fire rate
+                        // cannot be re-derived from this report.
+                        "claims_judged": class.claims_judged,
+                        // Every one, uncapped. The text rendering shows the first
+                        // few; a machine gets the whole conflict list, because
+                        // §9.13 asks for a list somebody can check rather than a
+                        // score they have to believe.
+                        "blocked_claims": class
+                            .blocked
+                            .iter()
+                            .map(blocked_json)
+                            .collect::<Vec<Value>>(),
+                    })
+                });
             json!({
                 "id": row.mutant_id,
                 "ecosystem": ecosystem(row.ecosystem),
@@ -835,12 +1297,16 @@ fn render_json(
                 "false_removals": row.false_removals,
                 "decoys_found": row.decoys_found,
                 "decoys_total": row.decoys_total,
+                "veto": veto_row,
             })
         })
         .collect();
 
     let document = json!({
-        "sut": choice.label(),
+        // `vulture+veto`, not `vulture`, when Gate 2 ran. The measured system is
+        // the pair, and a consumer comparing two runs under the same name would
+        // read the veto's rescues as the analyzer having improved.
+        "sut": sut_label(choice, veto.is_some()),
         // Absent for the two in-process controls, present for anything that
         // went through an adapter. A consumer that records `false_removal_count`
         // without it has recorded a number stripped of what bounds it.
@@ -862,6 +1328,26 @@ fn render_json(
         "decoys_found": decoys_found,
         "decoys_total": decoys_total,
         "classes_with_false_removals": failing_classes(report),
+        // Absent without `--veto`, so a consumer can tell a gated report from a
+        // bare one by the presence of a key rather than by parsing a name.
+        "veto": veto.map(|veto| json!({
+            "enabled": true,
+            "gates": veto.gates,
+            "needles": veto.needles,
+            // Both columns, always, and neither is derivable from the other.
+            "false_removals_prevented": veto.prevented,
+            "false_removals_remaining": veto.remaining,
+            "false_removals_bare": veto.prevented + veto.remaining,
+            "decoys_lost": veto.decoys_lost,
+            "decoys_found_bare": veto.decoys_bare,
+            "decoys_found_gated": veto.decoys_gated,
+            "decoys_total": veto.decoys_total,
+            // §11 R8's flag rate, both halves, over every claim Gate 2 saw.
+            // Not summable from the per-class rows: a class where nothing
+            // fired has no row and still had its claims judged.
+            "claims_judged": veto.claims_judged,
+            "claims_blocked": veto.claims_blocked,
+        })),
         "mutants": mutants,
     });
 
@@ -906,6 +1392,73 @@ mod tests {
         }
     }
 
+    /// The same, over two classes, so a run whose gate fired on one of them can
+    /// be told from one that fired on both.
+    fn two_class_suite(first: Vec<String>, second: Vec<String>) -> SuiteReport {
+        let mut suite = suite(first, 1, 1);
+        let mut row = suite.reports[0].clone();
+        row.mutant_id = "m02".to_string();
+        row.false_removals = second;
+        row.grade = if row.false_removals.is_empty() {
+            Grade::Passed
+        } else {
+            Grade::Failed
+        };
+        suite.false_removal_count += row.false_removals.len();
+        suite.reports.push(row);
+        suite
+    }
+
+    /// One Gate 2 run over one class, blocking `blocked` of `claimed` claims.
+    fn veto_run(claimed: usize, blocked: Vec<BlockedClaim>) -> VetoRun {
+        VetoRun {
+            repo: PathBuf::from("/tmp/judged-e2-test"),
+            claimed,
+            survived: claimed - blocked.len(),
+            blocked,
+        }
+    }
+
+    fn blocked_path(claim: &str, needle: &str, found_in: &str) -> BlockedClaim {
+        BlockedClaim {
+            claim: claim.to_string(),
+            kind: judged_mutants::sut::ClaimKind::Path,
+            gate: judged_mutants::sut::Gate::Literal,
+            needle: Some(needle.to_string()),
+            needle_kind: Some("stem".to_string()),
+            found_in: Some(PathBuf::from(found_in)),
+            declared_in: None,
+            detail: format!("{found_in} names it: the stem needle {needle:?} occurs at byte 12"),
+        }
+    }
+
+    /// A symbol Gate 2a rescued. `declared_in` is what the analyzer said, so
+    /// `None` spells the case where it said nothing.
+    fn blocked_symbol(claim: &str, declared_in: Option<&str>, found_in: &str) -> BlockedClaim {
+        BlockedClaim {
+            claim: claim.to_string(),
+            kind: judged_mutants::sut::ClaimKind::Symbol,
+            gate: judged_mutants::sut::Gate::Literal,
+            needle: Some(claim.to_string()),
+            needle_kind: Some("symbol".to_string()),
+            found_in: Some(PathBuf::from(found_in)),
+            declared_in: declared_in.map(PathBuf::from),
+            detail: format!("{found_in} names it: the symbol needle {claim:?} occurs at byte 12"),
+        }
+    }
+
+    /// The bare/gated pair the CLI diffs, compared the way `run` compares it.
+    fn summary(bare: &SuiteReport, gated: &SuiteReport, runs: &[VetoRun]) -> VetoSummary {
+        compare_runs(
+            bare,
+            gated,
+            runs,
+            GateSet::default(),
+            judged_mutants::sut::DEFAULT_NEEDLES,
+        )
+        .expect("the fixture pair satisfies the invariant")
+    }
+
     /// A one-row suite the SUT could not read, in the ecosystem the caller
     /// names — the shape [`run_suite`] produces for a skipped class: no ground
     /// truth, no claims, and a grade that is neither of the other two.
@@ -934,6 +1487,7 @@ mod tests {
             &unread_suite(Ecosystem::Rust),
             &catalogue(),
             &SutChoice::Vulture,
+            None,
         );
 
         assert!(
@@ -959,7 +1513,12 @@ mod tests {
         // The other half, and the one that keeps the marker meaningful: if it
         // appeared on rows the tool genuinely analyzed, it would stop carrying
         // information and start being noise a reader learns to skip.
-        let text = render_text(&suite(Vec::new(), 1, 1), &catalogue(), &SutChoice::Vulture);
+        let text = render_text(
+            &suite(Vec::new(), 1, 1),
+            &catalogue(),
+            &SutChoice::Vulture,
+            None,
+        );
         assert!(!text.contains("NOT READ"), "got {text}");
         assert!(!text.contains("not measured"), "got {text}");
         assert!(
@@ -1135,7 +1694,12 @@ mod tests {
         // The hole the gate deliberately leaves. A report that printed only
         // "GATE PASSED" here would be endorsing a tool that has never called
         // anything dead.
-        let text = render_text(&suite(Vec::new(), 0, 3), &catalogue(), &SutChoice::Refusing);
+        let text = render_text(
+            &suite(Vec::new(), 0, 3),
+            &catalogue(),
+            &SutChoice::Refusing,
+            None,
+        );
 
         assert!(text.contains("false removals: 0"), "got {text}");
         assert!(text.contains("GATE PASSED"), "got {text}");
@@ -1149,6 +1713,7 @@ mod tests {
             &suite(vec!["app/tasks/nightly.py".to_string()], 1, 1),
             &catalogue(),
             &SutChoice::Naive,
+            None,
         );
 
         assert!(text.contains("GATE FAILED"), "got {text}");
@@ -1173,6 +1738,7 @@ mod tests {
             &suite(vec!["x".to_string()], 0, 1),
             &catalogue(),
             &SutChoice::Naive,
+            None,
         );
 
         for expected in [
@@ -1185,5 +1751,417 @@ mod tests {
                 "no line starts with `{expected}`; got {text}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The veto, and the trade it makes
+    // -----------------------------------------------------------------------
+
+    /// The whole point of `--veto` is a **trade**, and a report that printed
+    /// only the prevented column would be selling the veto rather than
+    /// measuring it (§9.13: never present what flatters the tool).
+    ///
+    /// Both numbers, at column zero, where CI shows them.
+    #[test]
+    fn a_veto_report_prints_what_it_cost_beside_what_it_prevented() {
+        let bare = suite(vec!["ledger/dunning.py".to_string()], 2, 2);
+        let gated = suite(Vec::new(), 1, 2);
+        let runs = [veto_run(
+            3,
+            vec![
+                blocked_path("ledger/dunning.py", "dunning", "ledger/apps.yaml"),
+                blocked_path("ledger/old_report.py", "old_report", "docs/CHANGELOG.md"),
+            ],
+        )];
+        let summary = summary(&bare, &gated, &runs);
+
+        let text = render_text(&gated, &catalogue(), &SutChoice::Naive, Some(&summary));
+
+        let prevented = text
+            .lines()
+            .find(|line| line.starts_with("veto prevented: "))
+            .unwrap_or_else(|| panic!("no `veto prevented:` line at column zero; got {text}"));
+        let cost = text
+            .lines()
+            .find(|line| line.starts_with("veto cost: "))
+            .unwrap_or_else(|| panic!("no `veto cost:` line at column zero; got {text}"));
+
+        assert!(prevented.contains('1'), "got {prevented}");
+        assert!(
+            cost.contains("1 decoy(s) lost"),
+            "the price has to be a number on its own line, not a footnote; got {cost}"
+        );
+        assert!(
+            text.find("veto prevented: ").unwrap() < text.find("veto cost: ").unwrap(),
+            "the two lines are adjacent and in this order, so neither can be \
+             read without the other"
+        );
+    }
+
+    /// §9.13 asks for a conflict list rather than a score, and §7.3 records that
+    /// IntelliJ Safe Delete — the best-validated prior art in the document —
+    /// shows the *usage list*. A blocked claim has to say which needle fired and
+    /// in which file.
+    #[test]
+    fn a_blocked_claim_names_its_needle_and_the_file_it_fired_in() {
+        let bare = suite(vec!["ledger/dunning.py".to_string()], 1, 1);
+        let gated = suite(Vec::new(), 1, 1);
+        let runs = [veto_run(
+            1,
+            vec![blocked_path(
+                "ledger/dunning.py",
+                "dunning",
+                "ledger/apps.yaml",
+            )],
+        )];
+        let summary = summary(&bare, &gated, &runs);
+
+        let text = render_text(&gated, &catalogue(), &SutChoice::Naive, Some(&summary));
+        assert!(text.contains("ledger/apps.yaml"), "got {text}");
+        assert!(text.contains("\"dunning\""), "got {text}");
+
+        let json: Value = serde_json::from_str(&render_json(
+            &gated,
+            &catalogue(),
+            &SutChoice::Naive,
+            Some(&summary),
+        ))
+        .expect("the report is JSON");
+        let record = &json["mutants"][0]["veto"]["blocked_claims"][0];
+        assert_eq!(record["claim"], "ledger/dunning.py");
+        assert_eq!(record["needle"], "dunning");
+        assert_eq!(record["needle_kind"], "stem");
+        assert_eq!(record["found_in"], "ledger/apps.yaml");
+        assert_eq!(record["gate"], "literal");
+        assert_eq!(record["kind"], "path");
+    }
+
+    /// **A rescue has to be checkable as cross-file at a glance.**
+    ///
+    /// `found_in` alone cannot be: a symbol rescued by a genuine reference from
+    /// another module and a symbol "rescued" by its own declaration print the
+    /// same shape, a plausible file name beside a plausible needle. That is not
+    /// a cosmetic gap. A Gate 2a with nothing to exclude rescues *every* symbol
+    /// claim — vulture 11 of 16 decoys to 0, deadcode 2 of 2 to 0, both landing
+    /// on "GATE PASSED" by claiming nothing — and this report was the surface
+    /// where that should have been obvious and was invisible.
+    ///
+    /// So the declaration site is emitted beside the evidence, and a reader
+    /// compares two fields.
+    #[test]
+    fn a_blocked_symbol_shows_its_declaration_site_beside_the_evidence() {
+        let bare = suite(vec!["RATES".to_string(), "dump_invoices".to_string()], 1, 1);
+        let gated = suite(Vec::new(), 1, 1);
+        let runs = [veto_run(
+            2,
+            vec![
+                blocked_symbol(
+                    "RATES",
+                    Some("ledger/unused_currency_table.py"),
+                    "docs/fx-runbook.md",
+                ),
+                // The other case, and the reason the field is nullable: the
+                // analyzer named no file, so nothing was excluded and the
+                // rescue may well be self-reference. A reader must be able to
+                // tell that apart from the row above.
+                blocked_symbol("dump_invoices", None, "ledger/legacy_invoice_dump.py"),
+            ],
+        )];
+        let summary = summary(&bare, &gated, &runs);
+
+        // The text rendering is where a reviewer looks first, so it carries the
+        // same fact in the same line as the evidence.
+        let text = render_text(&gated, &catalogue(), &SutChoice::Naive, Some(&summary));
+        assert!(
+            text.contains("declared in ledger/unused_currency_table.py"),
+            "a blocked symbol must say where it was declared, or a self-rescue \
+             reads exactly like a cross-file one; got {text}"
+        );
+        assert!(
+            !text.contains("declared in ledger/legacy_invoice_dump.py"),
+            "the analyzer named no file for dump_invoices, and the report must \
+             not borrow the found_in file to fill the gap; got {text}"
+        );
+
+        let json: Value = serde_json::from_str(&render_json(
+            &gated,
+            &catalogue(),
+            &SutChoice::Naive,
+            Some(&summary),
+        ))
+        .expect("the report is JSON");
+
+        let cross_file = &json["mutants"][0]["veto"]["blocked_claims"][0];
+        assert_eq!(cross_file["claim"], "RATES");
+        assert_eq!(cross_file["kind"], "symbol");
+        assert_eq!(cross_file["declared_in"], "ledger/unused_currency_table.py");
+        assert_eq!(cross_file["found_in"], "docs/fx-runbook.md");
+        assert_ne!(
+            cross_file["declared_in"], cross_file["found_in"],
+            "this is the whole property: the two fields differ, so the rescue \
+             is a real cross-file reference"
+        );
+
+        let unattributed = &json["mutants"][0]["veto"]["blocked_claims"][1];
+        assert_eq!(unattributed["claim"], "dump_invoices");
+        assert_eq!(
+            unattributed["declared_in"],
+            Value::Null,
+            "null, not absent and not the found_in file: the analyzer said \
+             nothing, so nothing was excluded, and a reader must not be able to \
+             mistake this for a checked cross-file rescue"
+        );
+        assert_eq!(unattributed["found_in"], "ledger/legacy_invoice_dump.py");
+    }
+
+    /// A gated run publishes a smaller false-removal count than the same
+    /// analyzer bare. Two runs reported under the same name would be compared as
+    /// if the analyzer had improved, so the name says what was measured.
+    #[test]
+    fn the_measured_system_is_named_as_the_pair_it_is() {
+        let bare = suite(vec!["x".to_string()], 1, 1);
+        let gated = suite(Vec::new(), 1, 1);
+        let runs = [veto_run(1, vec![blocked_path("x", "x", "y")])];
+        let summary = summary(&bare, &gated, &runs);
+
+        let text = render_text(&gated, &catalogue(), &SutChoice::Vulture, Some(&summary));
+        assert!(text.contains("SUT `vulture+veto`"), "got {text}");
+
+        let json: Value = serde_json::from_str(&render_json(
+            &gated,
+            &catalogue(),
+            &SutChoice::Vulture,
+            Some(&summary),
+        ))
+        .expect("the report is JSON");
+        assert_eq!(json["sut"], "vulture+veto");
+        assert_eq!(json["veto"]["false_removals_prevented"], 1);
+        assert_eq!(json["veto"]["false_removals_bare"], 1);
+        assert_eq!(json["veto"]["false_removals_remaining"], 0);
+
+        // And a bare report carries no veto key at all, so a consumer tells the
+        // two apart by presence rather than by parsing a name.
+        let bare_json: Value =
+            serde_json::from_str(&render_json(&bare, &catalogue(), &SutChoice::Vulture, None))
+                .expect("the report is JSON");
+        assert_eq!(bare_json["sut"], "vulture");
+        assert!(bare_json["veto"].is_null(), "got {bare_json}");
+    }
+
+    /// A veto-gated run that cleared the gate by claiming nothing has not
+    /// answered §11 R1's question, and the report says so rather than printing
+    /// GATE PASSED and stopping.
+    #[test]
+    fn a_gated_run_that_found_no_decoy_at_all_is_told_it_scored_like_a_refusal() {
+        let bare = suite(vec!["x".to_string()], 2, 2);
+        let gated = suite(Vec::new(), 0, 2);
+        let runs = [veto_run(3, vec![blocked_path("x", "x", "y")])];
+        let summary = summary(&bare, &gated, &runs);
+
+        let text = render_text(&gated, &catalogue(), &SutChoice::Deadcode, Some(&summary));
+        assert!(text.contains("GATE PASSED"), "got {text}");
+        assert!(
+            text.contains("the way a tool that refuses to answer reaches it"),
+            "a combination that rescued every decoy is safe and useless, and the \
+             report has to say which; got {text}"
+        );
+    }
+
+    /// **The invariant, at the moment a report is about to be published.**
+    ///
+    /// Vetoing can only ever remove claims. A gated run that removed a live
+    /// artifact the bare run kept, or found a decoy the bare run missed, means
+    /// the layer nominated rather than rescued — and there is no rendering of
+    /// that which is safe to print, so it is a refusal rather than a report.
+    #[test]
+    fn a_gated_run_that_added_a_claim_is_refused_rather_than_reported() {
+        let bare = suite(Vec::new(), 1, 1);
+        let gated = suite(vec!["ledger/dunning.py".to_string()], 1, 1);
+
+        let refusal = compare_runs(
+            &bare,
+            &gated,
+            &[veto_run(1, Vec::new())],
+            GateSet::default(),
+            judged_mutants::sut::DEFAULT_NEEDLES,
+        )
+        .expect_err("a gated run with a new false removal must not be reported");
+        assert!(
+            refusal.headline.contains("did not behave as a veto"),
+            "got {}",
+            refusal.headline
+        );
+        assert!(
+            refusal.detail.contains("A veto may only rescue"),
+            "got {}",
+            refusal.detail
+        );
+
+        // The same rule in the other direction: a decoy the accuser never found
+        // cannot appear because a rescue-only layer ran.
+        let bare = suite(Vec::new(), 0, 2);
+        let gated = suite(Vec::new(), 1, 2);
+        let refusal = compare_runs(
+            &bare,
+            &gated,
+            &[veto_run(0, Vec::new())],
+            GateSet::default(),
+            judged_mutants::sut::DEFAULT_NEEDLES,
+        )
+        .expect_err("a gated run cannot find more decoys than the bare run");
+        assert!(
+            refusal.detail.contains("cannot nominate"),
+            "got {}",
+            refusal.detail
+        );
+    }
+
+    /// Blocked claims are attributed to classes by run order. If that ever stops
+    /// holding, the evidence would be printed beside the wrong class — which is
+    /// worse than printing none, because it is checkable and wrong.
+    #[test]
+    fn evidence_that_cannot_be_attributed_to_a_class_is_refused() {
+        let bare = suite(vec!["x".to_string()], 1, 1);
+        let gated = suite(Vec::new(), 1, 1);
+
+        let refusal = compare_runs(
+            &bare,
+            &gated,
+            // One graded class, two recorded runs.
+            &[veto_run(1, Vec::new()), veto_run(1, Vec::new())],
+            GateSet::default(),
+            judged_mutants::sut::DEFAULT_NEEDLES,
+        )
+        .expect_err("a run count that disagrees with the report is not reportable");
+        assert!(
+            refusal.detail.contains("cannot be attributed"),
+            "got {}",
+            refusal.detail
+        );
+    }
+
+    /// §11 R8: the needle strategy is the biggest lever on the flag rate, so a
+    /// prevented/lost pair produced under one configuration is not the pair
+    /// produced under another. The report states which one it was.
+    #[test]
+    fn the_report_states_which_gates_and_which_needles_produced_its_numbers() {
+        let bare = suite(vec!["x".to_string()], 1, 1);
+        let gated = suite(Vec::new(), 1, 1);
+        let runs = [veto_run(1, vec![blocked_path("x", "x", "y")])];
+        let summary = summary(&bare, &gated, &runs);
+
+        assert_eq!(summary.gates, "literal, reachability");
+        assert_eq!(summary.needles, "basename+stem");
+
+        let text = render_text(&gated, &catalogue(), &SutChoice::Naive, Some(&summary));
+        assert!(text.contains("gates literal, reachability"), "got {text}");
+        assert!(text.contains("needles basename+stem"), "got {text}");
+    }
+
+    /// §11 R8's **other** half: how often the gate fires.
+    ///
+    /// R8 records two requirements that conflict — §9.3 says block on any hit,
+    /// and a usable tool needs a tolerable flag rate — and asks for a
+    /// measurement rather than an argument. A flag rate is blocked over
+    /// *claims judged*, and the report published only the numerator: every
+    /// blocked claim, and no count of what Gate 2 was asked about. So a
+    /// published fire rate could not be re-derived from `--json`, which for a
+    /// swept table is the same as not having measured it.
+    ///
+    /// `claims_judged` is the denominator, per class, and it is the count Gate 2
+    /// itself accounted for — `compare_runs` already refuses a run where
+    /// `survived + blocked != claimed`, so the two cannot drift apart silently.
+    #[test]
+    fn a_gated_class_publishes_the_denominator_its_flag_rate_needs() {
+        let bare = suite(vec!["ledger/dunning.py".to_string()], 1, 1);
+        let gated = suite(Vec::new(), 1, 1);
+        // Four claims reached Gate 2 and one of them was blocked.
+        let runs = [veto_run(
+            4,
+            vec![blocked_path(
+                "ledger/dunning.py",
+                "dunning",
+                "ledger/apps.yaml",
+            )],
+        )];
+        let summary = summary(&bare, &gated, &runs);
+
+        let json: Value = serde_json::from_str(&render_json(
+            &gated,
+            &catalogue(),
+            &SutChoice::Naive,
+            Some(&summary),
+        ))
+        .expect("the report is JSON");
+        let veto = &json["mutants"][0]["veto"];
+        assert_eq!(
+            veto["claims_judged"],
+            json!(4),
+            "the denominator of the flag rate, or the rate is unpublishable; got {veto}"
+        );
+        assert_eq!(
+            veto["blocked_claims"]
+                .as_array()
+                .expect("blocked_claims is a list")
+                .len(),
+            1,
+            "and the numerator is the list already published beside it"
+        );
+    }
+
+    /// A run's flag rate cannot be summed out of its per-class rows, so the run
+    /// states it itself.
+    ///
+    /// A class where Gate 2 blocked nothing and cost nothing has no row —
+    /// deliberately, because the text report would otherwise be a list of
+    /// classes where nothing happened. Its claims were still judged. Summing the
+    /// published `claims_judged` column therefore counts only the classes where
+    /// the gate fired, which inflates every flag rate derived from it, and
+    /// inflates it in the direction that flatters the gate.
+    ///
+    /// So the totals are emitted once, at the run level, over every claim Gate 2
+    /// saw.
+    #[test]
+    fn the_run_states_its_own_flag_rate_because_the_class_rows_cannot_be_summed() {
+        // Two classes: the gate fires on the first and is silent on the second,
+        // which is the case the per-class column drops.
+        let bare = two_class_suite(vec!["ledger/dunning.py".to_string()], Vec::new());
+        let gated = two_class_suite(Vec::new(), Vec::new());
+        let runs = [
+            veto_run(
+                4,
+                vec![blocked_path(
+                    "ledger/dunning.py",
+                    "dunning",
+                    "ledger/apps.yaml",
+                )],
+            ),
+            veto_run(6, Vec::new()),
+        ];
+        let summary = summary(&bare, &gated, &runs);
+
+        let json: Value = serde_json::from_str(&render_json(
+            &gated,
+            &catalogue(),
+            &SutChoice::Naive,
+            Some(&summary),
+        ))
+        .expect("the report is JSON");
+
+        assert!(
+            json["mutants"][1]["veto"].is_null(),
+            "the silent class still has no row of its own"
+        );
+        let veto = &json["veto"];
+        assert_eq!(
+            veto["claims_judged"],
+            json!(10),
+            "every claim Gate 2 saw, including the six on the class with no row"
+        );
+        assert_eq!(
+            veto["claims_blocked"],
+            json!(1),
+            "and the numerator beside it, so the ratio is read rather than assembled"
+        );
     }
 }

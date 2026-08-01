@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::mutant::{Ecosystem, GroundTruth, Mutant};
-use crate::sut::{Sut, SutVerdict};
+use crate::sut::{Sut, SutVerdict, SymbolClaim};
 use judged_core::{Error, Result};
 
 /// What happened to one class under one SUT.
@@ -286,10 +286,18 @@ fn grade(
         .iter()
         .map(|p| normalize(p, repo_root))
         .collect();
+    // By name, and only by name. A claim now carries the file the analyzer
+    // attributed it to, and that provenance exists for Gate 2a — which has to
+    // exclude a symbol's own declaration before searching for references to it.
+    // Grading is a different question: ground truth names a live symbol and asks
+    // whether the tool claimed it, and where the tool thought it lived cannot
+    // change the answer. Keying on the pair would make a claim about the right
+    // symbol in an unexpected file grade clean, which is the silent
+    // under-reporting this whole module is built against.
     let claimed_symbols: BTreeSet<&str> = verdict
         .claimed_dead_symbols
         .iter()
-        .map(String::as_str)
+        .map(SymbolClaim::name)
         .collect();
 
     // Ground truth spells symbols bare (`DunningConfig`); real tools spell them

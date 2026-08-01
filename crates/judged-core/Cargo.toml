@@ -13,6 +13,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
+aho-corasick = { workspace = true }
 
 [dev-dependencies]
 # The git tests build real repositories on disk; tempfile owns their creation,

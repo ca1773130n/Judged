@@ -1116,6 +1116,10 @@ impl JsonReader<'_> {
 mod tests {
     use super::*;
 
+    // Only the tests name this type: cargo-shear makes no symbol claim, and the
+    // assertions below are what hold it to that.
+    use crate::sut::SymbolClaim;
+
     /// Captured by the maintainer on 2026-08-01 from the **released** cargo-shear
     /// 1.13.3 binary (installed via the nightly toolchain), on a two-file probe
     /// crate with one unused dependency and one unlinked file.
@@ -1446,7 +1450,7 @@ mod tests {
         );
         assert_eq!(
             verdict.claimed_dead_symbols,
-            Vec::<String>::new(),
+            Vec::<SymbolClaim>::new(),
             "shear has no symbol-level finding class at all"
         );
     }
@@ -1464,7 +1468,7 @@ mod tests {
             !verdict
                 .claimed_dead_symbols
                 .iter()
-                .any(|s| s == "backfill_missing_avatars"),
+                .any(|s| s.name() == "backfill_missing_avatars"),
             "a false removal of the registered function"
         );
         assert!(
@@ -1506,7 +1510,10 @@ mod tests {
         let verdict = verdict_from_stdout(CAPTURED_WORKSPACE).unwrap();
         for name in ["libc", "serde_json"] {
             assert!(
-                !verdict.claimed_dead_symbols.iter().any(|s| s == name),
+                !verdict
+                    .claimed_dead_symbols
+                    .iter()
+                    .any(|s| s.name() == name),
                 "a dependency key leaked into claimed_dead_symbols: {name}"
             );
             assert!(

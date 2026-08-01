@@ -1070,6 +1070,263 @@ fn mutants_json_carries_the_gate_and_every_class() {
 }
 
 // ---------------------------------------------------------------------------
+// judged mutants --veto — the accuser/veto pair §11 R1 actually asks about
+// ---------------------------------------------------------------------------
+
+/// The end-to-end trade, through the real binary, over the real catalogue.
+///
+/// The naive control is the SUT because it is the only one guaranteed to be on
+/// every machine and the only one that removes enough for both halves of the
+/// trade to be non-zero. What is asserted is the **shape of the honesty**: the
+/// gated run publishes fewer removals than the bare one, publishes what that
+/// cost, and names the pair rather than the analyzer.
+#[test]
+fn veto_reports_both_what_it_prevented_and_what_it_cost() {
+    let repo = scratch("mutants-veto");
+
+    let bare: Value = {
+        let run = judged(repo.path(), &["mutants", "--sut", "naive", "--json"]);
+        serde_json::from_str(run.stdout.trim()).expect("--json emits JSON")
+    };
+    let run = judged(
+        repo.path(),
+        &["mutants", "--sut", "naive", "--veto", "--json"],
+    );
+    let gated: Value =
+        serde_json::from_str(run.stdout.trim()).expect("--json emits JSON under --veto too");
+
+    assert_eq!(
+        gated["sut"], "naive+veto",
+        "the measured system is the pair; a report named for the analyzer alone \
+         would be compared against a bare run as though the tool had improved"
+    );
+    assert!(
+        bare["veto"].is_null(),
+        "a bare run carries no veto key, so the two are told apart by presence"
+    );
+
+    let veto = &gated["veto"];
+    let prevented = veto["false_removals_prevented"]
+        .as_u64()
+        .expect("false_removals_prevented is a number");
+    let remaining = veto["false_removals_remaining"]
+        .as_u64()
+        .expect("false_removals_remaining is a number");
+    let lost = veto["decoys_lost"]
+        .as_u64()
+        .expect("decoys_lost is a number");
+
+    // Both columns are present and neither is derivable from the other. A report
+    // carrying only the first would be selling the veto (§9.13).
+    assert!(
+        prevented > 0,
+        "Gate 2 rescued nothing from the naive control across 19 classes, which \
+         means it did not run; got {veto}"
+    );
+    assert!(
+        lost > 0,
+        "Gate 2 rescued live artifacts and cost nothing at all, which no \
+         whole-repo literal search does; got {veto}"
+    );
+    assert_eq!(
+        prevented + remaining,
+        bare["false_removal_count"]
+            .as_u64()
+            .expect("the bare run reports a false-removal count"),
+        "prevented + remaining must reconstruct the bare count exactly, or one \
+         of the two is not what it says it is"
+    );
+    assert!(
+        gated["false_removal_count"].as_u64() <= bare["false_removal_count"].as_u64(),
+        "a veto may only rescue: {gated} against {bare}"
+    );
+    assert!(
+        veto["decoys_found_gated"].as_u64() <= veto["decoys_found_bare"].as_u64(),
+        "a veto cannot find a decoy the accuser missed; got {veto}"
+    );
+
+    // The conflict list §9.13 asks for: what fired, and where. Present for at
+    // least one class, and every record that names a needle names a file too.
+    let mut with_evidence = 0usize;
+    for class in gated["mutants"].as_array().expect("mutants is an array") {
+        let Some(blocked) = class["veto"]["blocked_claims"].as_array() else {
+            continue;
+        };
+        for record in blocked {
+            assert!(
+                record["claim"].as_str().is_some_and(|c| !c.is_empty()),
+                "a blocked claim names the claim it blocked; got {record}"
+            );
+            assert!(
+                record["gate"].as_str().is_some(),
+                "a blocked claim names the gate that fired; got {record}"
+            );
+            if record["needle"].as_str().is_some() {
+                assert!(
+                    record["found_in"].as_str().is_some(),
+                    "a needle that fired fired IN a file, and a veto nobody can \
+                     check is a veto nobody will trust; got {record}"
+                );
+                with_evidence += 1;
+            }
+        }
+    }
+    assert!(
+        with_evidence > 0,
+        "no blocked claim carried a needle and a file. §7.3's best-validated \
+         prior art shows the usage list, not a probability."
+    );
+
+    // And the human rendering says the same two things, at column zero.
+    let text = judged(repo.path(), &["mutants", "--sut", "naive", "--veto"]);
+    for expected in ["veto prevented: ", "veto cost: "] {
+        assert!(
+            text.stdout.lines().any(|line| line.starts_with(expected)),
+            "no line starts with `{expected}`; got {}",
+            text.stdout
+        );
+    }
+}
+
+/// `--veto` composes with the negative control, and changes nothing about it.
+///
+/// A SUT that claims nothing has nothing for a filter to remove, so the gated
+/// run must be the bare run in every number that matters. If it is not, the
+/// veto is doing something other than filtering.
+#[test]
+fn veto_over_a_sut_that_claims_nothing_changes_nothing() {
+    let repo = scratch("mutants-veto-refusing");
+
+    let run = judged(
+        repo.path(),
+        &["mutants", "--sut", "refusing", "--veto", "--json"],
+    );
+    run.expect_code(0, "no claims, so no false removals, gated or not");
+
+    let report: Value = serde_json::from_str(run.stdout.trim()).expect("--json emits JSON");
+    assert_eq!(report["veto"]["false_removals_prevented"], json!(0));
+    assert_eq!(report["veto"]["decoys_lost"], json!(0));
+    assert_eq!(report["veto"]["decoys_found_gated"], json!(0));
+    assert_eq!(
+        report["false_removal_count"],
+        json!(0),
+        "got {}",
+        run.stdout
+    );
+}
+
+/// The flag has to be discoverable, and the usage text has to say what it costs
+/// before somebody turns it on in CI.
+#[test]
+fn help_documents_the_veto_and_that_it_runs_the_suite_twice() {
+    let repo = scratch("mutants-veto-help");
+
+    let run = judged(repo.path(), &["--help"]);
+    run.expect_says("--veto");
+    run.expect_says("TWICE");
+    run.expect_says("prevented");
+}
+
+/// §11 R8's axis is reachable from the command line, and the report echoes the
+/// spelling it was given.
+///
+/// R8 asks for a measurement of the needle strategy rather than an argument
+/// about it, and a swept number is only evidence if a reader can re-run the
+/// sweep. `VetoedSut::with_needles` existed and no command line reached it, so
+/// the first published sweep could not be re-derived from anything in this
+/// repository — which for an evaluation is the same as not having run it.
+///
+/// The round-trip is the property under test, not merely that the flag parses:
+/// every accepted spelling is exactly what `veto.needles` reports back, so a
+/// table row and the command that produced it name the same configuration.
+#[test]
+fn the_needle_strategy_is_selectable_so_the_r8_sweep_can_be_re_derived() {
+    let repo = scratch("mutants-veto-needles");
+
+    for strategy in [
+        "basename",
+        "basename+stem",
+        "basename+stem+parent-dir",
+        "basename+stem+parent-dir+symbol",
+    ] {
+        let run = judged(
+            repo.path(),
+            &[
+                "mutants",
+                "--sut",
+                "naive",
+                "--veto",
+                "--needles",
+                strategy,
+                "--json",
+            ],
+        );
+        let report: Value = serde_json::from_str(run.stdout.trim())
+            .unwrap_or_else(|error| panic!("--needles {strategy} should report JSON: {error}"));
+        assert_eq!(
+            report["veto"]["needles"],
+            json!(strategy),
+            "the report must name the strategy it was run under, verbatim"
+        );
+    }
+
+    // The default is the shipped one, and asking for it explicitly is the same
+    // run — otherwise the sweep's baseline row is not the shipped build.
+    let implicit = judged(
+        repo.path(),
+        &["mutants", "--sut", "naive", "--veto", "--json"],
+    );
+    let implicit: Value = serde_json::from_str(implicit.stdout.trim()).expect("JSON");
+    assert_eq!(implicit["veto"]["needles"], json!("basename+stem"));
+}
+
+/// A needle strategy with no gate to configure is refused, not ignored.
+///
+/// Silently accepting `--needles` without `--veto` would let somebody publish a
+/// sweep in which nothing was ever swept: every row would be a bare run, every
+/// row would be identical, and the command line would look like it had asked
+/// for something. §6.20's shape again — a result that means nothing, wearing
+/// the appearance of a result.
+#[test]
+fn a_needle_strategy_without_a_veto_is_refused_rather_than_quietly_ignored() {
+    let repo = scratch("mutants-needles-no-veto");
+
+    let run = judged(
+        repo.path(),
+        &["mutants", "--sut", "refusing", "--needles", "basename"],
+    );
+    run.expect_code(2, "a flag that configures a gate that is not running");
+    run.expect_says("--veto");
+}
+
+/// An unknown strategy names the ones that exist rather than shrugging.
+#[test]
+fn an_unknown_needle_strategy_lists_the_ones_that_exist() {
+    let repo = scratch("mutants-needles-unknown");
+
+    let run = judged(
+        repo.path(),
+        &[
+            "mutants",
+            "--sut",
+            "refusing",
+            "--veto",
+            "--needles",
+            "everything",
+        ],
+    );
+    run.expect_code(2, "an unknown needle strategy is a usage error");
+    for known in [
+        "basename",
+        "basename+stem",
+        "basename+stem+parent-dir",
+        "basename+stem+parent-dir+symbol",
+    ] {
+        run.expect_says(known);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // judged mutants against an external analyzer
 //
 // The suite has only ever graded two SUTs we wrote ourselves, which bounds the

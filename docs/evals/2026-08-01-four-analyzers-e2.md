@@ -8,6 +8,17 @@ so this round measures 18 of the 19 classes the catalogue defines. One tool, car
 clears the gate at 0 false removals with 9/9 decoy recall; it earns that inside its scope,
 and its scope excludes every claim that would have been wrong.**
 
+> **Still current, and it measures the analyzers UNPROTECTED.** Every number here is a bare
+> accuser's, which is not a system anybody proposed shipping. The same four analyzers with
+> §9.3's Gate 2 behind them are measured in
+> [`2026-08-02-gate2-veto.md`](2026-08-02-gate2-veto.md), which re-verified this document's
+> bare column byte-for-byte and is the only current source for any *gated* figure. Gate 2
+> prevents 4 of the 10 false removals below, for 7 of the 26 decoys. The prediction near the
+> end of this file — that a grep veto would catch the classes naming their live artifact in
+> plain text — was measured: right about m01 and m14, half right about m12, where `drain` is
+> rescued by the `//go:linkname` comment and `TelemetryFlush` is named nowhere outside the
+> file that declares it.
+
 This supersedes [`2026-08-01-vulture-e2-baseline.md`](2026-08-01-vulture-e2-baseline.md),
 which measured one Python tool against the whole 19-class catalogue, because the runner of the
 day handed every class to every analyzer. Under the current runner vulture is handed the 10

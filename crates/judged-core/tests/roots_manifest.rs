@@ -992,6 +992,10 @@ fn corpus() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "package.json", r#"{"name":"w","bin":"./cli.js"}"#);
+    // The file the `bin` above declares. Without it the fixture asserted that a
+    // scan resolves a path to a file the fixture never created, which is the
+    // §4.3 defect written into a test.
+    write(root, "cli.js", "");
     write(
         root,
         "pyproject.toml",
@@ -1962,4 +1966,308 @@ fn auto_discovery_a_manifest_switches_off_is_not_discovered() {
     );
     // The target the manifest does declare is still there.
     assert_path(&roots, "test[0].path", "tests/tests.rs");
+}
+
+// ---------------------------------------------------------------------------
+// the build context, and roots that name nothing
+// (docs/evals/2026-08-02-out-of-sample-corpus.md §4.3, §4.4)
+// ---------------------------------------------------------------------------
+
+/// `src/ad/Dockerfile` from `open-telemetry/opentelemetry-demo` at the corpus
+/// commit `f7408a50`, byte for byte (`git hash-object` =
+/// `1b94014da0906d7b7b9498aabb20216f83979bb4`).
+///
+/// This is the manifest that produced the §4.3 defect: 99 of otel-demo's 130
+/// `packaged_file` roots named a path that does not exist, because every `COPY`
+/// source was rebased onto the Dockerfile's own directory while the build
+/// context is the repository root. `COPY ./src/ad/settings.gradle*` became
+/// `src/ad/src/ad/settings.gradle*`.
+const OTEL_DEMO_AD_DOCKERFILE: &str = r#"# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
+
+
+FROM --platform=${BUILDPLATFORM} docker.io/library/eclipse-temurin:24.0.2_12-jdk@sha256:7493205ffe6caa8074fa8a06a276bb1c5ac41d3dd0fd43a0db66d7f776e80b3e AS builder
+WORKDIR /usr/src/app/
+
+COPY ./src/ad/gradlew* ./src/ad/settings.gradle* ./src/ad/build.gradle ./
+COPY ./src/ad/gradle ./gradle
+
+RUN chmod +x ./gradlew
+RUN ./gradlew
+RUN ./gradlew downloadRepos
+
+COPY ./src/ad/ ./
+COPY ./pb/ ./proto
+RUN chmod +x ./gradlew
+RUN ./gradlew installDist -PprotoSourceDir=./proto
+
+# -----------------------------------------------------------------------------
+
+FROM docker.io/library/eclipse-temurin:24.0.2_12-jre@sha256:8cb2387a28af84cf0db0948d9c67d4480192f4e567027a3963f145d218e8b4f2
+
+ARG OTEL_JAVA_AGENT_VERSION
+WORKDIR /usr/src/app/
+
+COPY --from=builder /usr/src/app/ ./
+ADD --chmod=644 https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/download/v$OTEL_JAVA_AGENT_VERSION/opentelemetry-javaagent.jar /usr/src/app/opentelemetry-javaagent.jar
+ENV JAVA_TOOL_OPTIONS="-javaagent:/usr/src/app/opentelemetry-javaagent.jar -Xmx200m"
+
+EXPOSE ${AD_PORT}
+EXPOSE ${AD_PROMETHEUS_PORT}
+ENTRYPOINT [ "./build/install/opentelemetry-demo-ad/bin/Ad" ]
+"#;
+
+/// The paths `OTEL_DEMO_AD_DOCKERFILE` names, laid out where otel-demo really
+/// has them: under the repository root, not under `src/ad/`.
+fn otel_demo_ad_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/ad/Dockerfile", OTEL_DEMO_AD_DOCKERFILE);
+    write(root, "src/ad/gradlew", "");
+    write(root, "src/ad/gradlew.bat", "");
+    write(root, "src/ad/settings.gradle", "");
+    write(root, "src/ad/build.gradle", "");
+    write(root, "src/ad/gradle/wrapper/gradle-wrapper.properties", "");
+    write(root, "src/ad/src/main/java/oteldemo/AdService.java", "");
+    write(root, "pb/demo.proto", "");
+    dir
+}
+
+#[test]
+fn a_copy_source_is_relative_to_the_build_context_not_to_the_dockerfile() {
+    // §4.3. Docker resolves a COPY source against the build context, and the
+    // Dockerfile does not declare the context. otel-demo builds every service
+    // from the repository root, so its sources are already repo-relative and
+    // rebasing them onto `src/ad/` names nothing.
+    let dir = otel_demo_ad_repo();
+    let roots = scan(dir.path()).unwrap();
+
+    assert_eq!(
+        root_at(&roots, "copy@8[1]").target(),
+        &RootTarget::Glob("src/ad/settings.gradle*".to_string()),
+        "the exact root §4.3 quotes"
+    );
+    assert_eq!(
+        root_at(&roots, "copy@8[0]").target(),
+        &RootTarget::Glob("src/ad/gradlew*".to_string())
+    );
+    assert_eq!(
+        root_at(&roots, "copy@8[2]").target(),
+        &RootTarget::Path(PathBuf::from("src/ad/build.gradle")),
+        "a source with no metacharacter that resolves is a path, not a glob"
+    );
+    assert_eq!(
+        root_at(&roots, "copy@9[0]").target(),
+        &RootTarget::Path(PathBuf::from("src/ad/gradle"))
+    );
+    assert_eq!(
+        root_at(&roots, "copy@15[0]").target(),
+        &RootTarget::Path(PathBuf::from("src/ad"))
+    );
+    assert_eq!(
+        root_at(&roots, "copy@16[0]").target(),
+        &RootTarget::Path(PathBuf::from("pb")),
+        "`COPY ./pb/` is repo-relative too; rebasing gave `src/ad/pb`"
+    );
+
+    for root in roots.roots() {
+        assert!(
+            !root.target().to_string().contains("src/ad/src/ad"),
+            "the doubled prefix is back: {} -> {}",
+            root.origin(),
+            root.target()
+        );
+    }
+}
+
+#[test]
+fn an_add_from_a_url_is_not_a_file_in_this_repository() {
+    // Line 28 of the real Dockerfile fetches the OpenTelemetry Java agent over
+    // HTTPS. It used to be recorded as the repo path
+    // `src/ad/https:/github.com/.../opentelemetry-javaagent.jar` — a file that
+    // exists nowhere, spelled as though it were checked in. Same reasoning as
+    // `COPY --from`: recording it manufactures a root for a file that is not
+    // here.
+    let dir = otel_demo_ad_repo();
+    let roots = scan(dir.path()).unwrap();
+
+    assert!(
+        !keys(&roots).iter().any(|k| k.starts_with("add@28")),
+        "a remote URL names no repository file; keys were {:?}",
+        keys(&roots)
+    );
+    for root in roots.roots() {
+        assert!(
+            !root.target().to_string().contains("https:"),
+            "a URL leaked into a target: {} -> {}",
+            root.origin(),
+            root.target()
+        );
+    }
+}
+
+#[test]
+fn parsing_a_nested_dockerfile_with_no_tree_to_ask_invents_no_context() {
+    // The public parser has no repository to resolve against, and the context
+    // is not in the file. It must say so rather than guess — guessing is what
+    // produced §4.3, and a caller who only has the bytes has no way to tell a
+    // guess from a fact.
+    let roots = parse_dockerfile(Path::new("src/ad/Dockerfile"), OTEL_DEMO_AD_DOCKERFILE).unwrap();
+
+    assert_eq!(
+        root_at(&roots, "copy@8[1]").target(),
+        &RootTarget::Unresolved("./src/ad/settings.gradle*".to_string()),
+        "the Dockerfile's own spelling, with no directory invented for it"
+    );
+    for root in roots.roots() {
+        assert!(
+            !root.target().to_string().contains("src/ad/src/ad"),
+            "a doubled prefix from the parser alone: {} -> {}",
+            root.origin(),
+            root.target()
+        );
+    }
+
+    // A Dockerfile at the repository root needs no tree: both candidate
+    // contexts are the same directory, so nothing can be doubled.
+    let at_root = parse_dockerfile(Path::new("Dockerfile"), FULL_DOCKERFILE).unwrap();
+    assert_eq!(
+        root_at(&at_root, "copy@4[0]").target(),
+        &RootTarget::Glob("package.json".to_string())
+    );
+}
+
+#[test]
+fn a_dockerfile_built_from_its_own_directory_still_rebases() {
+    // The other half of §4.3: rebasing is right when the context *is* the
+    // Dockerfile's directory, and the fix must not throw that away. Here the
+    // sources resolve under `services/api/` and nowhere else.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "services/api/Dockerfile",
+        "FROM python:3.12\nCOPY ./app ./app\nCOPY requirements.txt .\n",
+    );
+    write(root, "services/api/app/main.py", "");
+    write(root, "services/api/requirements.txt", "");
+
+    let roots = scan(root).unwrap();
+    assert_path(&roots, "copy@2[0]", "services/api/app");
+    assert_path(&roots, "copy@3[0]", "services/api/requirements.txt");
+}
+
+#[test]
+fn a_copy_source_that_resolves_under_neither_context_is_not_given_one() {
+    // Neither `services/api/dist` nor `dist` exists, so which one the manifest
+    // meant is unknown. Inventing the deeper of the two is exactly how §4.3
+    // produced 99 roots naming nothing; the honest answer is the source as the
+    // Dockerfile spells it, marked unresolved.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "services/api/Dockerfile",
+        "FROM node:20\nCOPY ./dist ./dist\n",
+    );
+
+    let roots = scan(root).unwrap();
+    assert_eq!(
+        root_at(&roots, "copy@2[0]").target(),
+        &RootTarget::Unresolved("./dist".to_string())
+    );
+}
+
+#[test]
+fn a_whole_tree_copy_names_the_build_context_not_the_empty_string() {
+    // §4.4. djangoproject's `Dockerfile:41` is `COPY . .`, and it produced a
+    // root whose target was the empty string. An empty target is not a root.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "Dockerfile", "FROM python:3.12\nCOPY . .\n");
+    write(root, "manage.py", "");
+
+    let roots = scan(root).unwrap();
+    assert_eq!(
+        root_at(&roots, "copy@2[0]").target(),
+        &RootTarget::Path(PathBuf::from(".")),
+        "a whole-tree copy ships the build context, and at the repo root that is `.`"
+    );
+}
+
+#[test]
+fn a_declared_path_that_names_nothing_is_not_emitted_as_a_resolved_path() {
+    // The general rule §4.3 asks for. `dist/index.js` is a perfectly good
+    // declaration — it is what npm will publish — but in this checkout it names
+    // nothing, and a root set that spells it as a resolved path invites a
+    // caller to believe the file was found.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"name":"w","main":"dist/index.js","types":"src/index.ts"}"#,
+    );
+    write(root, "src/index.ts", "");
+
+    let roots = scan(root).unwrap();
+    assert_eq!(
+        root_at(&roots, "main").target(),
+        &RootTarget::Unresolved("dist/index.js".to_string()),
+        "the declaration survives; the claim that it resolves does not"
+    );
+    assert_path(&roots, "types", "src/index.ts");
+
+    // And the parser on its own still says what the manifest says: resolution
+    // is a question about a tree, and `parse_package_json` is not given one.
+    let parsed = parse_package_json(
+        Path::new("package.json"),
+        r#"{"name":"w","main":"dist/index.js"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        root_at(&parsed, "main").target(),
+        &RootTarget::Path(PathBuf::from("dist/index.js"))
+    );
+}
+
+#[test]
+fn a_declared_path_that_escapes_the_repository_is_not_emitted_as_a_resolved_path() {
+    // `join_rel` keeps a `..` that has nothing to pop, so a path leaving the
+    // repository stays visibly escaped. It must not also be stat-ed: whatever
+    // sits beside the repository is not this repository's root.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"name":"w","main":"../outside.js"}"#,
+    );
+
+    let roots = scan(root).unwrap();
+    assert_eq!(
+        root_at(&roots, "main").target(),
+        &RootTarget::Unresolved("../outside.js".to_string())
+    );
+}
+
+#[test]
+fn an_unresolved_target_is_still_a_root_and_still_prints() {
+    // §9.13: it has to stay auditable. The point is that it is not spelled as a
+    // resolved path, not that it disappears.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"name":"w","main":"dist/index.js"}"#,
+    );
+
+    let roots = scan(root).unwrap();
+    let seeds = roots.printseeds();
+    assert!(
+        seeds.contains("package.json#main\tdist/index.js"),
+        "the declaration must still be readable in -printseeds output, got:\n{seeds}"
+    );
+    assert_eq!(root_at(&roots, "main").tier(), Tier::A);
 }

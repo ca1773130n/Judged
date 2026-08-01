@@ -39,6 +39,7 @@ use std::rc::Rc;
 use judged_core::veto::literal::{NeedleKind, NeedleStrategy};
 use judged_mutants::adapters::{deadcode, knip, shear, vulture};
 use judged_mutants::fixtures;
+use judged_mutants::gate1::{Gate1Sut, RefusedClaim};
 use judged_mutants::mutant::{Ecosystem, Mutant};
 use judged_mutants::roots::{RescuedClaim, RootedSut};
 use judged_mutants::runner::{reads_mutant, run_suite, Grade, MutantReport, SuiteReport};
@@ -226,10 +227,21 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
     // weigh. Each layer keeps its own per-claim record, which is what lets the
     // report say which layer earned a rescue instead of publishing one combined
     // number.
-    let (report, rescue) = if args.veto || args.roots {
+    let (report, rescue) = if args.gate1 || args.veto || args.roots {
         let mut stacked: Box<dyn Sut> = build_sut(&args.sut);
+        let mut gate_one: Option<Rc<Gate1Sut>> = None;
         let mut rooted: Option<Rc<RootedSut>> = None;
         let mut vetoed: Option<Rc<VetoedSut>> = None;
+        // Innermost, so it runs FIRST. §9.3 orders the gates and Gate 1 comes
+        // before the reference veto; here that ordering is the composition
+        // rather than a convention, which is also what makes a Gate 1 refusal
+        // absorbing — a claim it drops is never handed to a later layer, so
+        // there is no later evidence for anything to override it with.
+        if args.gate1 {
+            let layer = Rc::new(Gate1Sut::new(stacked));
+            stacked = Box::new(Rc::clone(&layer));
+            gate_one = Some(layer);
+        }
         if args.roots {
             let layer = Rc::new(RootedSut::new(stacked));
             stacked = Box::new(Rc::clone(&layer));
@@ -260,6 +272,9 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
         };
 
         let mut layers: Vec<Layer> = Vec::new();
+        if let Some(layer) = &gate_one {
+            layers.push(gate1_layer(layer));
+        }
         if let Some(layer) = &rooted {
             layers.push(roots_layer(layer));
         }
@@ -298,6 +313,37 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
         render_text(&report, &catalogue, &args.sut, rescue.as_ref())
     };
     (rendered, code)
+}
+
+/// Gate 1's accounting, normalized.
+///
+/// The unattributed count rides into the layer's `config` string rather than
+/// being dropped, and it is the one number that can turn this layer into a
+/// constant function: a symbol claim the analyzer attributed to no file has no
+/// file for sixteen file classes to be evaluated against, so §9.3's 1p rule
+/// refuses it. An analyzer that attributed nothing would therefore score a
+/// perfect false-removal record by saying nothing at all — §3.7's positive
+/// control that always passes. Every shipped adapter attributes, so the number
+/// is normally zero; a report that did not print it could not show that.
+fn gate1_layer(layer: &Gate1Sut) -> Layer {
+    let runs = layer.runs();
+    let gaps: usize = runs.iter().map(|run| run.gaps.len()).sum();
+    let unattributed: usize = runs.iter().map(|run| run.unattributed).sum();
+    Layer {
+        name: GATE1,
+        config: format!(
+            "classes 1a-1p, {unattributed} claim(s) refused only for having no declaration \
+             site, {gaps} scan gap(s)"
+        ),
+        runs: runs
+            .iter()
+            .map(|run| LayerRun {
+                claimed: run.claimed,
+                survived: run.survived,
+                dropped: run.refused.iter().map(Dropped::from_refused).collect(),
+            })
+            .collect(),
+    }
 }
 
 /// The root-set layer's accounting, normalized.
@@ -368,7 +414,7 @@ fn veto_layer(layer: &VetoedSut) -> Layer {
 /// number, and §11 R1's question is about which signals earn their place.
 #[derive(Debug, Clone)]
 struct Dropped {
-    /// `roots` or `veto`.
+    /// `gate1`, `roots` or `veto`.
     layer: &'static str,
     /// The claim, spelled exactly as the analyzer spelled it.
     claim: String,
@@ -381,6 +427,9 @@ struct Dropped {
     /// The §5.1 tier a root came from. `None` for a veto rescue, which is not a
     /// statement about entry points at all.
     tier: Option<&'static str>,
+    /// The §9.3 Gate 1 class that refused, e.g. `1b`. `None` for the other two
+    /// layers, neither of which is making a claim about irreversibility.
+    class: Option<&'static str>,
     /// The file and key that declared a root. `None` for a veto rescue.
     origin: Option<String>,
     needle: Option<String>,
@@ -399,6 +448,7 @@ impl Dropped {
             rule: record.gate.as_str().to_string(),
             gate: Some(record.gate.as_str()),
             tier: None,
+            class: None,
             origin: None,
             needle: record.needle.clone(),
             needle_kind: record.needle_kind.clone(),
@@ -416,6 +466,7 @@ impl Dropped {
             rule: record.rule.clone(),
             gate: None,
             tier: Some(record.tier.label()),
+            class: None,
             origin: Some(record.origin.clone()),
             needle: None,
             needle_kind: None,
@@ -423,6 +474,35 @@ impl Dropped {
             // check the rescue — the same role `found_in` plays for a veto.
             found_in: record.origin_file.clone(),
             declared_in: None,
+            detail: record.detail.clone(),
+        }
+    }
+
+    /// A Gate 1 refusal.
+    ///
+    /// `rule` carries the §9.3 class code, because the class IS the rule that
+    /// fired — `1b` says secrets and identity, and there is no narrower rule
+    /// underneath it. `class` repeats it under its own key so a consumer can
+    /// group by class without parsing a string it was told is free-form.
+    ///
+    /// `declared_in` is the file that was actually judged for a symbol claim.
+    /// Gate 1's classes are properties of files, so a symbol is judged by the
+    /// file that declares it, and a reader who cannot see which file that was
+    /// cannot check the refusal.
+    fn from_refused(record: &RefusedClaim) -> Dropped {
+        Dropped {
+            layer: GATE1,
+            claim: record.claim.clone(),
+            kind: record.kind.as_str(),
+            rule: record.class.to_string(),
+            gate: None,
+            tier: None,
+            class: Some(record.class),
+            origin: None,
+            needle: None,
+            needle_kind: None,
+            found_in: None,
+            declared_in: record.declared_in.clone(),
             detail: record.detail.clone(),
         }
     }
@@ -454,6 +534,7 @@ struct Layer {
 /// The `layer` tags, spelled once. They appear in JSON keys, in report lines and
 /// in the SUT name, and three spellings of the same layer is how a consumer ends
 /// up matching on the one this build does not emit.
+const GATE1: &str = "gate1";
 const ROOTS: &str = "roots";
 const VETO: &str = "veto";
 
@@ -496,6 +577,26 @@ struct RescueClass {
     /// Every claim any layer dropped on this class, with its evidence, each
     /// tagged with the layer that dropped it.
     blocked: Vec<Dropped>,
+    /// What each layer was handed and what it passed on, in the order the
+    /// layers ran.
+    ///
+    /// [`Self::claims_judged`] is the **accuser's** count, which is the right
+    /// denominator for the stack and the wrong one for any layer but the first:
+    /// under `--gate1 --veto` the veto is handed only what Gate 1 passed
+    /// through, and publishing the accuser's number in the veto's row would
+    /// understate its flag rate by exactly the claims it never saw. The
+    /// composition check in [`compare_runs`] already proves these chain — one
+    /// layer's `survived` is the next layer's `claimed` — so this is that same
+    /// chain, published rather than merely asserted.
+    per_layer: Vec<LayerClass>,
+}
+
+/// One layer's accounting on one class.
+#[derive(Debug, Clone)]
+struct LayerClass {
+    name: &'static str,
+    claimed: usize,
+    survived: usize,
 }
 
 /// The whole trade, per class and in total.
@@ -618,9 +719,10 @@ fn compare_runs(
     // layer dropped. Both halves, because §11 R8's flag rate is a ratio and a
     // report that carries only the numerator publishes a number nobody can
     // check.
-    let mut blocked_by_class: Vec<(String, usize, Vec<Dropped>)> = Vec::new();
+    let mut blocked_by_class: Vec<(String, usize, Vec<Dropped>, Vec<LayerClass>)> = Vec::new();
     for (index, row) in graded.iter().enumerate() {
         let mut dropped: Vec<Dropped> = Vec::new();
+        let mut per_layer: Vec<LayerClass> = Vec::new();
         let mut handed: Option<usize> = None;
         for layer in layers {
             let run = &layer.runs[index];
@@ -646,11 +748,16 @@ fn compare_runs(
                 }
             }
             handed = Some(run.survived);
+            per_layer.push(LayerClass {
+                name: layer.name,
+                claimed: run.claimed,
+                survived: run.survived,
+            });
             dropped.extend(run.dropped.iter().cloned());
         }
         // The accuser's own count: what the inner-most layer was handed.
         let claimed = layers.first().map_or(0, |layer| layer.runs[index].claimed);
-        blocked_by_class.push((row.mutant_id.clone(), claimed, dropped));
+        blocked_by_class.push((row.mutant_id.clone(), claimed, dropped, per_layer));
     }
 
     let mut classes: Vec<(String, RescueClass)> = Vec::new();
@@ -687,10 +794,10 @@ fn compare_runs(
         // A class Gate 2 never saw — one the SUT could not read — has no run and
         // therefore no denominator, which is zero claims judged rather than a
         // missing number.
-        let (claims_judged, blocked) = blocked_by_class
+        let (claims_judged, blocked, per_layer) = blocked_by_class
             .iter()
-            .find(|(id, _, _)| id == &before.mutant_id)
-            .map(|(_, claimed, blocked)| (*claimed, blocked.clone()))
+            .find(|(id, _, _, _)| id == &before.mutant_id)
+            .map(|(_, claimed, blocked, per_layer)| (*claimed, blocked.clone(), per_layer.clone()))
             .unwrap_or_default();
 
         classes.push((
@@ -706,6 +813,7 @@ fn compare_runs(
                 decoys_lost: before.decoys_found - after.decoys_found,
                 claims_judged,
                 blocked,
+                per_layer,
             },
         ));
     }
@@ -1270,6 +1378,7 @@ fn blocked_json(record: &Dropped) -> Value {
         "rule": record.rule,
         "gate": record.gate,
         "tier": record.tier,
+        "class": record.class,
         "origin": record.origin,
         "needle": record.needle,
         "needle_kind": record.needle_kind,
@@ -1685,9 +1794,19 @@ fn render_json(
                         json!(class.decoys_lost),
                     );
                     // The flag rate's denominator (§11 R8), beside the numerator
-                    // below. Without it a published fire rate cannot be
-                    // re-derived from this report.
-                    object.insert("claims_judged".to_string(), json!(class.claims_judged));
+                    // below, and it is THIS layer's denominator rather than the
+                    // accuser's: a layer stacked above another is handed only
+                    // what the one below passed through. Without both halves a
+                    // published fire rate cannot be re-derived from this report.
+                    let mine = class.per_layer.iter().find(|entry| entry.name == name);
+                    object.insert(
+                        "claims_judged".to_string(),
+                        json!(mine.map_or(class.claims_judged, |entry| entry.claimed)),
+                    );
+                    object.insert(
+                        "claims_survived".to_string(),
+                        json!(mine.map_or(class.claims_judged, |entry| entry.survived)),
+                    );
                     // Every one, uncapped. The text rendering shows the first
                     // few; a machine gets the whole conflict list, because §9.13
                     // asks for a list somebody can check rather than a score they
@@ -1704,6 +1823,17 @@ fn render_json(
                     Value::Object(object)
                 })
             };
+            // `refused_claims`, not `blocked_claims` and not `rescued_claims`.
+            // The three verbs are different acts: Gate 2 BLOCKS a claim on
+            // evidence it went looking for, the root set RESCUES one because the
+            // artifact was declared an entry point, and Gate 1 REFUSES one
+            // because destroying it is not reversible — a statement about cost,
+            // not about usefulness. Flattening them into one word would hide the
+            // distinction §9.3 draws between Gate 1 and everything after it.
+            let gate1_row = layer_names
+                .contains(&GATE1)
+                .then(|| layer_row(GATE1, "refused_claims"))
+                .flatten();
             let veto_row = layer_names
                 .contains(&VETO)
                 .then(|| layer_row(VETO, "blocked_claims"))
@@ -1729,6 +1859,9 @@ fn render_json(
                 "false_removals": row.false_removals,
                 "decoys_found": row.decoys_found,
                 "decoys_total": row.decoys_total,
+                // In the order the layers run (§9.3), so a reader following the
+                // trace reads it the way the pipeline evaluated it.
+                "gate1": gate1_row,
                 "veto": veto_row,
                 "roots": roots_row,
             })

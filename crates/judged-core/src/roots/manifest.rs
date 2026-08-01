@@ -166,6 +166,19 @@ pub enum RootTarget {
     /// A repo-relative pattern. Expanding it is a filesystem question this
     /// module deliberately does not answer.
     Glob(String),
+    /// A path a manifest declared that this scan could not point at anything in
+    /// the repository: it names nothing on disk, it escapes the repository, or
+    /// — for a `COPY` source — the build context it is relative to is not
+    /// declared anywhere this module reads.
+    ///
+    /// The declaration is kept verbatim, because it is still a declaration: a
+    /// `"main": "dist/index.js"` is what npm will publish whether or not `dist/`
+    /// has been built yet. What is *not* kept is the claim that it resolves.
+    /// Every root a manifest declares is Tier A — machine-declared — and the
+    /// out-of-sample corpus found 99 Tier A roots naming paths that did not
+    /// exist, spelled exactly like the ones that did (§4.3). A reader could not
+    /// tell them apart, and neither could a caller.
+    Unresolved(String),
     /// A command line, run verbatim by a build, CI or deploy step.
     Command(String),
     /// A name something other than a path lookup resolves: a Python object
@@ -180,9 +193,10 @@ impl fmt::Display for RootTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RootTarget::Path(p) => write!(f, "{}", p.display()),
-            RootTarget::Glob(s) | RootTarget::Command(s) | RootTarget::Reference(s) => {
-                f.write_str(s)
-            }
+            RootTarget::Glob(s)
+            | RootTarget::Command(s)
+            | RootTarget::Reference(s)
+            | RootTarget::Unresolved(s) => f.write_str(s),
         }
     }
 }
@@ -1458,17 +1472,65 @@ const DOCKER_INSTRUCTIONS: [&str; 18] = [
 /// shell-versus-exec distinction changes how it is run, not which files matter.
 ///
 /// `COPY`/`ADD` sources are the roots §5.2 flags with an exclamation mark, and
-/// they are recorded as globs because Docker matches them as patterns. A
-/// `COPY --from=<stage>` is deliberately skipped: it reads out of an earlier
-/// build stage's filesystem, so its source path names nothing in this
-/// repository and recording it would manufacture a root for a file that is not
-/// here.
+/// they are recorded as globs because Docker matches them as patterns. Two
+/// sources are deliberately skipped, for the same reason in both cases —
+/// recording them would manufacture a root for a file that is not here:
+///
+/// - `COPY --from=<stage>` reads out of an earlier build stage's filesystem.
+/// - `ADD https://…` fetches over the network. It used to be rebased like a
+///   relative path, which produced roots spelled
+///   `src/ad/https:/github.com/…/opentelemetry-javaagent.jar`.
+///
+/// # The build context is not in the Dockerfile
+///
+/// A `COPY` source is resolved by Docker against the **build context**, and
+/// nothing in a Dockerfile says what the context is — it is an argument to
+/// `docker build`, or `build.context` in a compose file. Assuming the context is
+/// the Dockerfile's own directory is right for `docker build path/to/svc` and
+/// wrong for a monorepo that builds every service from the root, which is how
+/// 99 of otel-demo's 130 packaged-file roots came to name paths that do not
+/// exist (`COPY ./src/ad/settings.gradle*` in `src/ad/Dockerfile` became
+/// `src/ad/src/ad/settings.gradle*`).
+///
+/// So the context is *resolved rather than assumed*, by
+/// [`docker_build_context`]: the two candidates are the Dockerfile's directory
+/// and the repository root, and the one under which the sources actually name
+/// something wins. When neither does, the source is recorded verbatim as a
+/// [`RootTarget::Unresolved`] — the Dockerfile's own spelling, with no context
+/// invented for it.
+///
+/// This function has no tree to ask, so it resolves nothing: a Dockerfile at
+/// the repository root needs no resolution (both candidates are the same
+/// directory), and for any other Dockerfile the sources come back unresolved.
+/// [`scan`] passes the real tree and gets the real answer.
 ///
 /// Keys are `<instruction>@<line>`, optionally with a source index —
 /// `Dockerfile#copy@4[1]`. A Dockerfile has no other addressable structure, and
 /// the line is what a human checks against the file.
 pub fn parse_dockerfile(manifest: &Path, content: &str) -> ManifestResult<ManifestRoots> {
+    parse_dockerfile_in(manifest, content, &|_| false)
+}
+
+/// One `COPY`/`ADD` source, or one `CMD`/`ENTRYPOINT`, held until the build
+/// context is known.
+///
+/// The context cannot be decided until every source has been read, and the
+/// roots must still come out in the order the file declares them, so the
+/// instructions are collected first and turned into roots afterwards.
+enum DockerRoot {
+    Entry { key: String, command: String },
+    Source { key: String, source: String },
+}
+
+/// [`parse_dockerfile`], given a way to ask whether a repo-relative path names
+/// something in the repository. See that function for everything else.
+fn parse_dockerfile_in(
+    manifest: &Path,
+    content: &str,
+    exists: &dyn Fn(&str) -> bool,
+) -> ManifestResult<ManifestRoots> {
     let mut out = ManifestRoots::from_source(manifest);
+    let mut pending: Vec<DockerRoot> = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
     let mut index = 0;
     let mut saw_from = false;
@@ -1540,16 +1602,14 @@ pub fn parse_dockerfile(manifest: &Path, content: &str) -> ManifestResult<Manife
             }
             match upper.as_str() {
                 "COPY" | "ADD" => {
-                    push_docker_copy(manifest, start_line, &upper, rest, &mut out)?;
+                    push_docker_copy(manifest, start_line, &upper, rest, &mut pending)?;
                 }
                 "CMD" | "ENTRYPOINT" => {
                     let command = docker_command(manifest, start_line, rest)?;
-                    out.push(
-                        RootKind::ContainerEntry,
-                        manifest,
-                        format!("{}@{start_line}", upper.to_ascii_lowercase()),
-                        RootTarget::Command(command),
-                    );
+                    pending.push(DockerRoot::Entry {
+                        key: format!("{}@{start_line}", upper.to_ascii_lowercase()),
+                        command,
+                    });
                 }
                 _ => {}
             }
@@ -1563,7 +1623,105 @@ pub fn parse_dockerfile(manifest: &Path, content: &str) -> ManifestResult<Manife
             "no `FROM` instruction: this is not a complete Dockerfile",
         ));
     }
+
+    let sources: Vec<&str> = pending
+        .iter()
+        .filter_map(|p| match p {
+            DockerRoot::Source { source, .. } => Some(source.as_str()),
+            DockerRoot::Entry { .. } => None,
+        })
+        .collect();
+    let context = docker_build_context(manifest_dir(manifest), &sources, exists);
+
+    for item in pending {
+        match item {
+            DockerRoot::Entry { key, command } => out.push(
+                RootKind::ContainerEntry,
+                manifest,
+                key,
+                RootTarget::Command(command),
+            ),
+            DockerRoot::Source { key, source } => {
+                let target = match &context {
+                    // `COPY . .` resolves to the context directory itself, which
+                    // at the repository root is `.`. It used to resolve to the
+                    // empty string, and an empty target is not a root.
+                    Some(context) => match join_rel(Path::new(context), &source) {
+                        empty if empty.is_empty() => RootTarget::Path(PathBuf::from(".")),
+                        joined => RootTarget::Glob(joined),
+                    },
+                    None => RootTarget::Unresolved(source),
+                };
+                out.push(RootKind::PackagedFile, manifest, key, target);
+            }
+        }
+    }
     Ok(out)
+}
+
+/// Which directory this Dockerfile's `COPY` sources are relative to, when the
+/// tree can settle it.
+///
+/// There are two candidates and no declaration. `docker build path/to/svc`
+/// makes the context the Dockerfile's own directory; `docker build .` with
+/// `-f path/to/svc/Dockerfile`, or a compose file with `context: ./`, makes it
+/// the repository root. Both are ordinary, and picking one by fiat is what
+/// produced §4.3's 99 roots naming nothing.
+///
+/// So each candidate is scored by how many of the sources name something real
+/// under it, and the winner is the one the repository agrees with. A tie goes
+/// to the Dockerfile's directory: it is the narrower claim, and it is the
+/// reading `docker build <dir>` gives. **A score of zero on both is not a tie
+/// but an answer** — the sources name nothing either way, so which context was
+/// meant is genuinely unknown and `None` says so.
+///
+/// A Dockerfile at the repository root needs none of this: the two candidates
+/// are the same directory, so there is nothing to resolve and nothing that
+/// could be doubled.
+fn docker_build_context(
+    dir: &Path,
+    sources: &[&str],
+    exists: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    let dir = dir.to_string_lossy().into_owned();
+    if dir.is_empty() {
+        return Some(String::new());
+    }
+    let score = |context: &str| -> usize {
+        sources
+            .iter()
+            .filter(|source| exists(lookup_prefix(&join_rel(Path::new(context), source))))
+            .count()
+    };
+    let (here, root) = (score(&dir), score(""));
+    match (here, root) {
+        (0, 0) => None,
+        (here, root) if root > here => Some(String::new()),
+        _ => Some(dir),
+    }
+}
+
+/// The longest leading run of a target that can be looked up as a path.
+///
+/// A pattern cannot be stat-ed, but the directory it lives in can, and that is
+/// enough to tell `src/ad/gradlew*` (which probes `src/ad`) from
+/// `src/ad/src/ad/gradlew*` (which probes `src/ad/src`). A segment carrying a
+/// glob metacharacter or an unexpanded build argument ends the run, so
+/// `.build/${OS}-${ARCH}/node_exporter` probes `.build`. Returning `""` — the
+/// repository root, which always exists — means the very first segment was
+/// already a pattern, and there is nothing to check.
+fn lookup_prefix(target: &str) -> &str {
+    let mut end = 0;
+    let mut cursor = 0;
+    for segment in target.split('/') {
+        if segment.contains(['*', '?', '[', '$']) {
+            return &target[..end];
+        }
+        cursor += segment.len();
+        end = cursor;
+        cursor += 1; // the `/` that follows it
+    }
+    target
 }
 
 /// Terminators opened by `<<EOF`, `<<-EOF`, `<<"EOF"` on one logical line.
@@ -1601,9 +1759,8 @@ fn push_docker_copy(
     line: usize,
     instruction: &str,
     rest: &str,
-    out: &mut ManifestRoots,
+    out: &mut Vec<DockerRoot>,
 ) -> ManifestResult<()> {
-    let dir = manifest_dir(manifest);
     let args = if rest.starts_with('[') {
         docker_exec_form(manifest, line, rest)?
     } else {
@@ -1633,14 +1790,34 @@ fn push_docker_copy(
     let key = format!("{}@{line}", instruction.to_ascii_lowercase());
     // The last operand is the destination inside the image.
     for (index, source) in operands[..operands.len() - 1].iter().enumerate() {
-        out.push(
-            RootKind::PackagedFile,
-            manifest,
-            key_index(&key, index),
-            rel_glob(dir, source),
-        );
+        // A remote source is fetched over the network at build time. It is not
+        // a file in this repository, and rebasing it produced targets spelled
+        // `src/ad/https:/github.com/…`.
+        if is_remote_source(source) {
+            continue;
+        }
+        out.push(DockerRoot::Source {
+            key: key_index(&key, index),
+            source: source.clone(),
+        });
     }
     Ok(())
+}
+
+/// Whether an `ADD` source is a URL rather than a path in the build context.
+///
+/// Docker accepts `http://`, `https://` and Git remotes here. The test is for
+/// any `scheme://` prefix, because what matters is that it is not a local path,
+/// not which protocol fetches it.
+fn is_remote_source(source: &str) -> bool {
+    let Some(scheme) = source.split_once("://").map(|(scheme, _)| scheme) else {
+        return false;
+    };
+    !scheme.is_empty()
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 fn docker_command(manifest: &Path, line: usize, rest: &str) -> ManifestResult<String> {
@@ -2053,6 +2230,11 @@ const IMPLICIT_PYTHON_ROOTS: [(&str, &str, RootKind, Tier); 6] = [
 /// root set missing exactly the entry points of the one package we could not
 /// read — the most dangerous possible answer, and the one §6.20 warns presents
 /// as clean output.
+///
+/// **Every target is resolved against the tree before it is returned.** The
+/// parsers say what a manifest declares; only a scan can say whether the
+/// declaration names anything, and [`resolve_against_tree`] is where the two
+/// meet.
 pub fn scan(repo_root: &Path) -> ManifestResult<ManifestRoots> {
     let mut files = Vec::new();
     walk(repo_root, Path::new(""), &mut files)?;
@@ -2071,18 +2253,25 @@ pub fn scan(repo_root: &Path) -> ManifestResult<ManifestRoots> {
             "setup.cfg" => Some(parse_setup_cfg as fn(&Path, &str) -> _),
             "Cargo.toml" => Some(parse_cargo_toml as fn(&Path, &str) -> _),
             "go.mod" => Some(parse_go_mod as fn(&Path, &str) -> _),
-            _ if is_dockerfile(name) => Some(parse_dockerfile as fn(&Path, &str) -> _),
             _ if is_workflow(rel) => Some(parse_github_workflow as fn(&Path, &str) -> _),
             _ if name.ends_with(".go") => Some(parse_go_source as fn(&Path, &str) -> _),
             _ => None,
         };
+        let read = || {
+            std::fs::read_to_string(&absolute).map_err(|source| ManifestError::Read {
+                path: rel.clone(),
+                source,
+            })
+        };
         if let Some(parse) = parsed {
-            let content =
-                std::fs::read_to_string(&absolute).map_err(|source| ManifestError::Read {
-                    path: rel.clone(),
-                    source,
-                })?;
-            out.merge(parse(rel, &content)?);
+            out.merge(parse(rel, &read()?)?);
+        } else if is_dockerfile(name) {
+            // The only parser that needs the tree while it parses: which
+            // directory a `COPY` source is relative to is a question about the
+            // repository, not about the Dockerfile.
+            out.merge(parse_dockerfile_in(rel, &read()?, &|path| {
+                present(repo_root, Path::new(path))
+            })?);
         }
 
         if let Some((_, key, kind, tier)) = IMPLICIT_PYTHON_ROOTS
@@ -2107,7 +2296,90 @@ pub fn scan(repo_root: &Path) -> ManifestResult<ManifestRoots> {
             out.push(kind, rel, key.to_string(), RootTarget::Path(rel.clone()));
         }
     }
+    resolve_against_tree(repo_root, &mut out);
     Ok(out)
+}
+
+/// Whether a repo-relative path names something in this repository.
+///
+/// `symlink_metadata` rather than `exists`, so that a symlink counts as present
+/// without being followed — following one can leave the repository, which is
+/// the same reason [`walk`] refuses to descend through them.
+///
+/// A path made only of `.` (or of nothing) is the repository root, which is
+/// present by construction. A path carrying `..`, a leading separator or a
+/// Windows prefix has left the repository, and whatever sits outside it is not
+/// this repository's root — the question is not even asked of the filesystem,
+/// so that `repo_root.join(..)` can never be made to stat somewhere else.
+fn present(repo_root: &Path, rel: &Path) -> bool {
+    let mut names_something = false;
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(_) => names_something = true,
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return false,
+        }
+    }
+    if !names_something {
+        return true;
+    }
+    std::fs::symlink_metadata(repo_root.join(rel)).is_ok()
+}
+
+/// Settle every target against the tree that was just walked.
+///
+/// A manifest declares; only the repository can confirm. The corpus found 99
+/// Tier A roots naming paths that do not exist, spelled indistinguishably from
+/// the ones that do (§4.3) — so this is where the three outcomes are separated,
+/// and it is deliberately the *only* place, so that no parser has to be trusted
+/// to have got it right:
+///
+/// - **[`RootTarget::Path`]** — the target names something in the tree. This is
+///   the only shape that reaches a caller as a resolved path.
+/// - **[`RootTarget::Glob`]** — the target is a pattern, and the directory it
+///   would be matched in exists. It is still not expanded: which files a
+///   pattern selects is a question with a different answer on every checkout.
+/// - **[`RootTarget::Unresolved`]** — everything else. The declaration is kept
+///   verbatim; the claim that it points at a file is dropped.
+///
+/// A pattern whose parent directory *is* present stays a pattern rather than
+/// becoming a path, and a plain path that is present becomes one even if a
+/// parser recorded it as a glob: `COPY ./pb/` is matched by Docker as a pattern
+/// and names exactly one directory, and reporting `pb` as a path a caller can
+/// open is more useful than reporting it as a pattern nobody will expand.
+///
+/// [`RootTarget::Command`] and [`RootTarget::Reference`] are left alone. A
+/// command line is not a path and a module path is not a path, and stat-ing
+/// either is how a cleaner "resolves" `npm run build` to a file called `npm`.
+fn resolve_against_tree(repo_root: &Path, out: &mut ManifestRoots) {
+    for root in &mut out.roots {
+        match &root.target {
+            // Checked as a path rather than as text, so that a filename this
+            // platform allows but UTF-8 does not is answered about accurately
+            // instead of being demoted by a lossy conversion.
+            RootTarget::Path(path) => {
+                if !present(repo_root, path) {
+                    root.target = RootTarget::Unresolved(path.to_string_lossy().into_owned());
+                }
+            }
+            RootTarget::Glob(glob) => {
+                let glob = glob.clone();
+                let prefix = lookup_prefix(&glob);
+                if prefix == glob {
+                    // Not a pattern at all, whatever the parser called it.
+                    root.target = match present(repo_root, Path::new(&glob)) {
+                        true => RootTarget::Path(PathBuf::from(glob)),
+                        false => RootTarget::Unresolved(glob),
+                    };
+                } else if !present(repo_root, Path::new(prefix)) {
+                    root.target = RootTarget::Unresolved(glob);
+                }
+            }
+            RootTarget::Command(_) | RootTarget::Reference(_) | RootTarget::Unresolved(_) => {}
+        }
+    }
 }
 
 fn walk(repo_root: &Path, rel_dir: &Path, files: &mut Vec<PathBuf>) -> ManifestResult<()> {

@@ -1,9 +1,12 @@
 //! `judged` — the command-line entry point.
 //!
-//! Two subcommands, in the order §0.5 demands they be built: `judged ratchet`
-//! (§9.14) baselines a repository and fails CI only on new findings, and
-//! `judged mutants` (§10 E2) runs the mutation-injection suite that gates
-//! whether an auto-act tier may exist at all.
+//! Four subcommands. Two are the ones §0.5 demands be built first: `judged
+//! ratchet` (§9.14) baselines a repository and fails CI only on new findings,
+//! and `judged mutants` (§10 E2) runs the mutation-injection suite that gates
+//! whether an auto-act tier may exist at all. The other two are §9.13's human
+//! interface: `judged show-roots` is ProGuard's `-printseeds`, and `judged
+//! explain <path>` is the gate trace — what Gate 0g says could restore a
+//! candidate, and which of §9.3's sixteen Gate 1 classes refuse it.
 //!
 //! There is deliberately no `judged clean`, no `judged reap`, and no `--fix`
 //! (§9.13 invariant 1). Neither subcommand opens the working tree for writing;
@@ -19,6 +22,7 @@
 
 mod args;
 mod clock;
+mod explain_cmd;
 mod mutants_cmd;
 mod ratchet_cmd;
 mod roots_cmd;
@@ -33,6 +37,7 @@ fn main() {
         Ok(Invocation::Ratchet(args)) => ratchet_cmd::run(&args),
         Ok(Invocation::Mutants(args)) => mutants_cmd::run(&args),
         Ok(Invocation::ShowRoots(args)) => roots_cmd::run(&args),
+        Ok(Invocation::Explain(args)) => explain_cmd::run(&args),
         // A command line that could not be understood analyzed nothing, so it
         // takes the same exit as a refusal rather than the exit of a clean run.
         Err(error) => (format!("{}\n\n{}", error.message, args::USAGE), 2),

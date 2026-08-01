@@ -56,6 +56,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use aho_corasick::AhoCorasick;
+use saphyr_parser::{Event, Parser, ScanError};
 
 /// Constructs that enumerate a directory at runtime, from §6.12's list plus the
 /// ecosystem-specific spellings §5.2 names.
@@ -555,16 +556,19 @@ impl Scan {
     /// roots. A YAML file that does not load has told us nothing about what it
     /// references, so it is an incomplete read, not an empty one.
     fn yaml(&mut self, relative: &Path, text: &str) {
-        if let Some(defect) = yaml_defect(text) {
-            self.incomplete_read(relative, format!("YAML did not parse: {defect}"));
-            return;
-        }
+        let values = match yaml_values(text) {
+            Ok(values) => values,
+            Err(defect) => {
+                self.incomplete_read(relative, format!("YAML did not parse: {defect}"));
+                return;
+            }
+        };
 
-        for (key, value) in yaml_values(text) {
+        for (key, value) in values {
             match key {
                 YamlKey::Path => {
                     for scalar in scalars(&value) {
-                        self.root_pattern(&scalar, relative);
+                        self.root_pattern(scalar, relative);
                     }
                 }
                 YamlKey::Command => {
@@ -951,37 +955,14 @@ fn path_tokens(text: &str) -> Vec<String> {
     out
 }
 
-/// Scalars out of a collected YAML value: one per line for a block sequence,
-/// comma-separated for a flow sequence, the value itself when it is inline.
-fn scalars(value: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in value.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let line = line.strip_prefix("- ").unwrap_or(line);
-        // The block scalar indicator that opened this value (`|`, `>-`, `|2`)
-        // is syntax, not a path.
-        if line.starts_with(['|', '>'])
-            && line
-                .chars()
-                .all(|c| matches!(c, '|' | '>' | '-' | '+') || c.is_ascii_digit())
-        {
-            continue;
-        }
-        if line.starts_with('[') {
-            for element in line.trim_matches(|c| c == '[' || c == ']').split(',') {
-                let element = element.trim();
-                if !element.is_empty() {
-                    out.push(element.to_string());
-                }
-            }
-            continue;
-        }
-        out.push(line.to_string());
-    }
-    out
+/// The paths inside one collected `path:` value.
+///
+/// Usually exactly one, because the parser has already split a block or flow
+/// sequence into its elements. The exception is a block scalar — `path: |`
+/// followed by one path per line is what every cache step in the wild writes —
+/// which reaches us as a single scalar with newlines still in it.
+fn scalars(value: &str) -> impl Iterator<Item = &str> {
+    value.lines().map(str::trim).filter(|line| !line.is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1010,49 +991,169 @@ const COMMAND_KEYS: [&str; 9] = [
     "cmd",
 ];
 
-/// Collect every interesting key's value, including block scalars and nested
-/// sequences. Line-oriented on purpose: this runs only after [`yaml_defect`]
-/// has established the document is structurally readable.
-fn yaml_values(text: &str) -> Vec<(YamlKey, String)> {
-    let lines: Vec<&str> = text.lines().collect();
+// The reading is done by `saphyr-parser`, the same YAML 1.2 parser §5's root
+// set uses: pure Rust, no `unsafe`, and the maintained line of descent from
+// `yaml-rust`. It is consumed as an event stream rather than through a value
+// tree because nothing here wants YAML's type resolution — every value this
+// module looks at is a path or a command line, transcribed as written.
+//
+// What stood here was a second hand-written scanner for the subset of YAML that
+// CI manifests were assumed to use: a line-oriented `key: value` split with its
+// own structural check standing in for a parser. It read a trailing comment as
+// part of the path it followed, so `- dist/  # the tarball` rooted a directory
+// that does not exist and left the real one unrooted; it could not see into a
+// flow mapping at all; and it rooted comment *lines* inside a `paths:` block as
+// though they were directories. The first copy of that defect rejected valid
+// manifests in seven of the nine repositories in the out-of-sample corpus,
+// which is why there is not a third.
+//
+// A YAML file that does not load is still an incomplete read and still vetoes
+// everything (§6.20) — that rule is unchanged, and the swap only widens the set
+// of defects that trip it, because a real parser rejects more than a structural
+// guess could.
+
+/// One open collection, and what it expects next.
+enum Frame {
+    /// A sequence. Every element is read under the key that opened it, which is
+    /// how `paths:` followed by a block sequence names one path per element.
+    Sequence(Option<YamlKey>),
+    /// A mapping: the key kind it sits under, which its own values inherit when
+    /// their key is not one this module knows, and the slot to fill next.
+    Mapping {
+        inherited: Option<YamlKey>,
+        expects: Expects,
+    },
+}
+
+/// What the node about to arrive is. Doubles as the answer to "what does the
+/// node I am holding mean", since a key names nothing and only a value does.
+#[derive(Clone, Copy)]
+enum Expects {
+    /// A mapping key.
+    Key,
+    /// A value, to be collected under this key kind when there is one.
+    Value(Option<YamlKey>),
+}
+
+/// Every interesting key's value, in document order.
+///
+/// `Err` is a document that did not load, which is an incomplete read: a file
+/// we could not parse has told us nothing about what it references, and reading
+/// that as "references nothing" is the §6.20 inversion this module exists to
+/// refuse.
+fn yaml_values(text: &str) -> Result<Vec<(YamlKey, String)>, String> {
     let mut out = Vec::new();
-    let mut index = 0;
+    let mut stack: Vec<Frame> = Vec::new();
 
-    while index < lines.len() {
-        let line = lines[index];
-        let indent = indentation(line);
-        let content = line.trim();
-        let content = content.strip_prefix("- ").unwrap_or(content);
+    for event in Parser::new_from_str(text) {
+        let (event, span) = event.map_err(|error| yaml_defect(&error))?;
+        let line = span.start.line();
 
-        let Some((key, rest)) = split_key(content) else {
-            index += 1;
-            continue;
-        };
-        let Some(kind) = key_kind(&key) else {
-            index += 1;
-            continue;
-        };
+        match event {
+            // A stream may hold several documents; each is read the same way,
+            // because a Kubernetes manifest separated by `---` names paths in
+            // every one of them.
+            Event::Nothing
+            | Event::StreamStart
+            | Event::StreamEnd
+            | Event::DocumentStart(_)
+            | Event::DocumentEnd => {}
 
-        let mut value = rest.trim().to_string();
-        let mut next = index + 1;
-        while next < lines.len() {
-            let candidate = lines[next];
-            if candidate.trim().is_empty() {
-                next += 1;
-                continue;
+            Event::Scalar(value, ..) => match expected(&stack) {
+                Expects::Key => {
+                    let kind = key_kind(&value.to_ascii_lowercase()).or(inherited(&stack));
+                    consumed(&mut stack, Expects::Value(kind));
+                }
+                Expects::Value(kind) => {
+                    if let Some(kind) = kind {
+                        out.push((kind, value.into_owned()));
+                    }
+                    consumed(&mut stack, Expects::Key);
+                }
+            },
+
+            Event::SequenceStart(..) | Event::MappingStart(..) => {
+                let Expects::Value(kind) = expected(&stack) else {
+                    return Err(format!(
+                        "line {line}: a mapping key that is not a scalar is not modelled"
+                    ));
+                };
+                consumed(&mut stack, Expects::Key);
+                stack.push(match event {
+                    Event::SequenceStart(..) => Frame::Sequence(kind),
+                    _ => Frame::Mapping {
+                        inherited: kind,
+                        expects: Expects::Key,
+                    },
+                });
             }
-            if indentation(candidate) <= indent {
-                break;
+
+            // A well-formed event stream never closes a collection that is not
+            // open, or closes a sequence with a mapping's end. Checking anyway
+            // costs nothing and is the difference between a wrong answer and a
+            // refusal if the parser ever surprises us — and in this module a
+            // wrong answer is silent, where a refusal vetoes.
+            Event::SequenceEnd | Event::MappingEnd => {
+                let closed = matches!(
+                    (stack.pop(), &event),
+                    (Some(Frame::Sequence(_)), Event::SequenceEnd)
+                        | (Some(Frame::Mapping { .. }), Event::MappingEnd)
+                );
+                if !closed {
+                    return Err(format!(
+                        "line {line}: a collection ended where none like it was open"
+                    ));
+                }
             }
-            value.push('\n');
-            value.push_str(candidate.trim());
-            next += 1;
+
+            // An alias is a reference to content written elsewhere in the same
+            // document, and that elsewhere is visited in its own right — so an
+            // alias in a position this module ignores costs nothing. One
+            // standing where a path or a command belongs is different: the
+            // value is real and we did not read it, which is exactly an
+            // incomplete read.
+            Event::Alias(_) => match expected(&stack) {
+                Expects::Value(None) => consumed(&mut stack, Expects::Key),
+                Expects::Value(Some(_)) | Expects::Key => {
+                    return Err(format!(
+                        "line {line}: an alias stands where a path or a command was expected, \
+                         and this module does not resolve anchors"
+                    ))
+                }
+            },
         }
-
-        out.push((kind, value));
-        index = next;
     }
-    out
+
+    Ok(out)
+}
+
+/// What the next node to arrive will be. A node at the top of the stream is a
+/// value — the document itself — under no key at all.
+fn expected(stack: &[Frame]) -> Expects {
+    match stack.last() {
+        None => Expects::Value(None),
+        Some(Frame::Sequence(kind)) => Expects::Value(*kind),
+        Some(Frame::Mapping { expects, .. }) => *expects,
+    }
+}
+
+/// The key kind a mapping's values inherit when their own key is not one this
+/// module knows, so everything under `paths:` is read as a path however deeply
+/// it is nested.
+fn inherited(stack: &[Frame]) -> Option<YamlKey> {
+    match stack.last() {
+        Some(Frame::Mapping { inherited, .. }) => *inherited,
+        _ => None,
+    }
+}
+
+/// Record that the node the innermost mapping was waiting for has arrived, and
+/// say what it expects instead. A sequence expects the same thing forever, so
+/// for one this is a no-op.
+fn consumed(stack: &mut [Frame], next: Expects) {
+    if let Some(Frame::Mapping { expects, .. }) = stack.last_mut() {
+        *expects = next;
+    }
 }
 
 fn key_kind(key: &str) -> Option<YamlKey> {
@@ -1065,126 +1166,12 @@ fn key_kind(key: &str) -> Option<YamlKey> {
     }
 }
 
-/// Split `key: value`, returning the lowercased key. Rejects anything that is
-/// not a plain scalar key, so `https://example.com` is not read as one.
-fn split_key(content: &str) -> Option<(String, &str)> {
-    let colon = content.find(':')?;
-    let (key, rest) = content.split_at(colon);
-    let rest = &rest[1..];
-    if !rest.is_empty() && !rest.starts_with(' ') {
-        return None;
-    }
-    let key = key.trim().trim_matches(|c| c == '"' || c == '\'');
-    if key.is_empty()
-        || !key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-    {
-        return None;
-    }
-    Some((key.to_ascii_lowercase(), rest))
-}
-
-fn indentation(line: &str) -> usize {
-    line.len() - line.trim_start().len()
-}
-
-/// A cheap structural check for the YAML shapes this module reads line by line.
-///
-/// Not a parser, and not trying to be: it looks for the defects that make a
-/// line-oriented reading meaningless — a tab in the indentation (which YAML
-/// forbids outright), an unterminated quoted scalar, an unbalanced flow
-/// collection. Any of them means the document has not told us what it
-/// references, which is an incomplete read and therefore a veto.
-fn yaml_defect(text: &str) -> Option<String> {
-    let mut flow_depth: i32 = 0;
-    let mut block_scalar: Option<usize> = None;
-
-    for (number, line) in text.lines().enumerate() {
-        let number = number + 1;
-
-        if let Some(owner) = block_scalar {
-            if line.trim().is_empty() || indentation(line) > owner {
-                continue;
-            }
-            block_scalar = None;
-        }
-
-        if line[..indentation(line)].contains('\t') {
-            return Some(format!(
-                "line {number}: a tab in the indentation, which YAML forbids"
-            ));
-        }
-
-        let characters: Vec<char> = line.chars().collect();
-        let mut index = 0;
-        let mut quote: Option<char> = None;
-        // True where a quote would open a quoted scalar rather than sit inside
-        // a plain one, so `name: don't` is not read as an unterminated string.
-        let mut at_value_start = true;
-        let mut previous = ' ';
-
-        while index < characters.len() {
-            let current = characters[index];
-            index += 1;
-
-            if let Some(open) = quote {
-                if open == '"' && current == '\\' {
-                    index += 1;
-                    continue;
-                }
-                if current == open {
-                    quote = None;
-                }
-                continue;
-            }
-
-            match current {
-                '#' if previous.is_whitespace() => break,
-                '\'' | '"' if at_value_start => {
-                    quote = Some(current);
-                    at_value_start = false;
-                }
-                '[' | '{' => {
-                    flow_depth += 1;
-                    at_value_start = true;
-                }
-                ']' | '}' => {
-                    flow_depth -= 1;
-                    if flow_depth < 0 {
-                        return Some(format!("line {number}: a flow collection closes twice"));
-                    }
-                    at_value_start = false;
-                }
-                ':' | ',' => at_value_start = true,
-                '-' => {}
-                other if other.is_whitespace() => {}
-                _ => at_value_start = false,
-            }
-            previous = current;
-        }
-
-        if quote.is_some() {
-            return Some(format!("line {number}: an unterminated quoted scalar"));
-        }
-        if opens_block_scalar(line) {
-            block_scalar = Some(indentation(line));
-        }
-    }
-
-    if flow_depth != 0 {
-        return Some("a flow collection is never closed".to_string());
-    }
-    None
-}
-
-/// Does this line end with a block scalar indicator (`|`, `>`, `|-`, `>2`)?
-/// Everything more indented below it is literal text, not structure.
-fn opens_block_scalar(line: &str) -> bool {
-    let code = line
-        .trim_end()
-        .trim_end_matches(|c: char| c == '-' || c == '+' || c.is_ascii_digit());
-    code.ends_with('|') || code.ends_with('>')
+/// What the parser refused, with the line it refused on. §6.20 asks for a
+/// message a human can act on, and the scanner's own wording is already that:
+/// "tabs disallowed within this context", "while parsing a flow sequence,
+/// expected ',' or ']'".
+fn yaml_defect(error: &ScanError) -> String {
+    format!("line {}: {}", error.marker().line(), error.info())
 }
 
 /// Dockerfile instructions with line continuations joined and comments

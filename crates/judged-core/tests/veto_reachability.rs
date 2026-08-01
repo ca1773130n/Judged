@@ -489,6 +489,87 @@ fn m08_both_decoys_get_no_veto() {
     cleared(&scanned, "deploy/unused_nginx.conf");
 }
 
+/// A workflow that writes `with:` as a flow mapping says exactly what the
+/// three-line spelling says, and GitHub reads the two identically. A reading
+/// that only understands `key:` at the start of a line sees the whole brace as
+/// one opaque value of `with`, never looks inside it, and reports the artifact
+/// as reachable by nothing — a miss, which is the direction that costs an
+/// incident (§1.3). This is the defect that rejected five of the nine
+/// out-of-sample repositories the first time a YAML subset was hand-written.
+#[test]
+fn a_flow_mapping_names_a_path_exactly_as_the_block_spelling_does() {
+    let (_dir, scanned) = scan(&[
+        (
+            ".github/workflows/report.yml",
+            "jobs:\n  r:\n    steps:\n      - {uses: actions/upload-artifact@v4, \
+             with: {name: coverage, path: reports/coverage.xml}}\n",
+        ),
+        ("reports/coverage.xml", "<coverage/>\n"),
+        ("reports-old/coverage.xml", "<coverage/>\n"),
+    ]);
+
+    let reason = vetoed(&scanned, "reports/coverage.xml");
+    let (named_by, rooted) = manifest(&reason);
+    assert_eq!(named_by, Path::new(".github/workflows/report.yml"));
+    assert_eq!(rooted, Path::new("reports/coverage.xml"));
+
+    cleared(&scanned, "reports-old/coverage.xml");
+}
+
+/// A trailing comment is not part of the value. Reading it as one does not
+/// merely add noise: `dist/` and `dist/  # the tarball` are different strings,
+/// so the directory that was actually named is never rooted and the artifact
+/// under it is reported as dead.
+#[test]
+fn a_trailing_comment_is_not_part_of_the_path_it_follows() {
+    let (_dir, scanned) = scan(&[
+        (
+            ".gitlab-ci.yml",
+            "build:\n  script:\n    - make\n  artifacts:\n    paths:\n      \
+             - dist/  # everything the release job uploads\n",
+        ),
+        ("dist/app.tar", "tar\n"),
+        ("tmp/app.tar", "tar\n"),
+    ]);
+
+    let reason = vetoed(&scanned, "dist/app.tar");
+    let (named_by, rooted) = manifest(&reason);
+    assert_eq!(named_by, Path::new(".gitlab-ci.yml"));
+    assert_eq!(rooted, Path::new("dist"));
+
+    cleared(&scanned, "tmp/app.tar");
+}
+
+/// A comment *line* inside a `paths:` block is not a path either. It rescues
+/// nothing — no candidate is ever named `# the build output` — but it lands in
+/// the evidence a human has to audit, and §6.20's whole complaint is that a
+/// veto layer nobody reads is a veto layer nobody trusts.
+#[test]
+fn a_comment_line_inside_a_paths_block_is_not_rooted_as_a_directory() {
+    let (_dir, scanned) = scan(&[
+        (
+            ".gitlab-ci.yml",
+            "build:\n  artifacts:\n    paths:\n      # the build output, uploaded by \
+             the release job\n      - dist/\n",
+        ),
+        ("dist/app.tar", "tar\n"),
+    ]);
+
+    let reason = vetoed(&scanned, "dist/app.tar");
+    let (_, rooted) = manifest(&reason);
+    assert_eq!(rooted, Path::new("dist"));
+
+    let junk: Vec<String> = scanned
+        .roots()
+        .map(|(path, _)| path.display().to_string())
+        .filter(|path| path.contains('#') || path.contains("build output"))
+        .collect();
+    assert!(
+        junk.is_empty(),
+        "a comment was rooted as though it were a directory: {junk:?}"
+    );
+}
+
 /// A `path:` block scalar is the shape every cache step in the wild uses, and
 /// most of what it lists is not a repository path at all. Measured against this
 /// repository, the naive reading rooted `|` and `~/.cargo/registry` alongside
@@ -667,6 +748,21 @@ fn a_workflow_that_does_not_parse_vetoes_every_candidate() {
             "an unclosed flow sequence",
             "on:\n  push:\n    branches: [main\n",
         ),
+        // The three above are the defects a hand-written structural check can
+        // see. These are the ones only a parser can: each is a real YAML error,
+        // and each was silently readable as "this file names nothing".
+        (
+            "a mapping value where none may appear",
+            "jobs:\n  release:\n    runs-on: ubuntu-latest: extra\n",
+        ),
+        (
+            "a dedent onto a column no line opened",
+            "jobs:\n  release:\n      name: verify\n    runs-on: ubuntu-latest\n",
+        ),
+        (
+            "a flow sequence closed by the wrong bracket",
+            "on:\n  push:\n    branches: [main}\n",
+        ),
     ];
 
     for (label, body) in malformed {
@@ -739,6 +835,72 @@ fn a_binary_file_that_is_not_valid_utf8_vetoes_nothing() {
         "a binary is scanned as bytes, completely; it is not an incomplete read"
     );
     cleared(&scanned, "scripts/old_benchmark.sh");
+}
+
+/// The one recall cost this module's YAML reading carries, pinned here so it
+/// cannot be lost.
+///
+/// A multi-line flow sequence whose closing `]` sits at or before the column of
+/// the key that opened it is accepted by PyYAML and by ruamel, and is what
+/// pip's `.pre-commit-config.yaml` and the OpenTelemetry demo's `compose.yaml`
+/// both write. YAML 1.2 rule 137 requires flow content in a block context to be
+/// indented past its parent, and `saphyr-parser` enforces that, so both files
+/// are refused. Measured over the nine-repository out-of-sample corpus that is
+/// two files, and it takes those two repositories with it: an incomplete read
+/// vetoes everything.
+///
+/// It stays a veto anyway. The alternative is to guess at what an unreadable
+/// manifest names, which is §6.20's inversion and the reason this module exists
+/// — and the veto is at least loud, naming the file and the line, where a guess
+/// would be silent. If the parser is ever bumped past this strictness, this
+/// test fails, and that failure is the prompt to delete it and take the recall
+/// back.
+#[test]
+fn a_flow_sequence_closing_at_its_parents_column_is_refused_and_that_is_the_documented_cost() {
+    let (_dir, scanned) = scan(&[
+        (
+            ".pre-commit-config.yaml",
+            "repos:\n- repo: local\n  hooks:\n  - id: mypy\n    \
+             additional_dependencies: [\n      'nox==2024.03.02',\n    ]\n",
+        ),
+        ("noxfile.py", "import nox\n"),
+    ]);
+
+    let reason = vetoed(&scanned, "noxfile.py");
+    let (path, detail) = incomplete(&reason);
+    assert_eq!(path, Path::new(".pre-commit-config.yaml"));
+    assert!(
+        detail.contains("line 7"),
+        "a refusal a human cannot locate is a refusal they will read as a bug; \
+         the detail must name the line, got {detail:?}"
+    );
+}
+
+/// An anchor's content is written once and referenced by an alias, and this
+/// module does not resolve them. Where an alias stands somewhere the module
+/// would have ignored anyway, nothing is lost — the anchor's own definition is
+/// visited in its own right. Where it stands as the value of `paths:` it is
+/// §6.20 exactly: the value is real, we did not read it, and reporting the
+/// artifact underneath as reachable by nothing would be a search that did not
+/// look, dressed up as a search that found nothing.
+#[test]
+fn an_alias_where_a_path_belongs_is_an_incomplete_read_not_an_empty_one() {
+    let (_dir, scanned) = scan(&[
+        (
+            ".gitlab-ci.yml",
+            ".artifact_paths: &artifact_paths\n  - dist/\n\nbuild:\n  script:\n    - make\n  \
+             artifacts:\n    paths: *artifact_paths\n",
+        ),
+        ("dist/app.tar", "tar\n"),
+    ]);
+
+    let reason = vetoed(&scanned, "dist/app.tar");
+    let (path, detail) = incomplete(&reason);
+    assert_eq!(path, Path::new(".gitlab-ci.yml"));
+    assert!(
+        detail.contains("alias"),
+        "the veto must say what it could not resolve, got {detail:?}"
+    );
 }
 
 /// `package.json` is parsed as JSON rather than scraped, so a syntax error is a

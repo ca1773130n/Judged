@@ -22,13 +22,46 @@ Judged deletes nothing. Not by default, not behind a flag. There is no `--fix`,
 and passing one is refused before the subcommand is even parsed. The ratchet's
 only power is to fail a build; the mutant suite writes exclusively to throwaway
 directories. That is the design (§9.14: the ratchet has zero deletion risk), not
-a milestone that hasn't landed yet. Whether an auto-act tier is ever allowed to
-exist is the single highest-risk open question in the research (§11 R1), and the
-suite below is the experiment that decides it, with the answer pre-committed: if
-no signal combination clears the catalogue at zero false removals, the tier is
-deleted from the design rather than tuned.
+a milestone that hasn't landed yet.
 
-## The three commands
+## Status: there is no auto-act tier, and none is assumed to be coming
+
+Read this before the feature list, because it decides what the features are for.
+
+**Judged reports. It does not act.** Whether an auto-act tier — anything allowed
+to delete a byte without a human in the loop — may exist at all is the single
+highest-risk open question in the research (§11 R1), and the answer is
+pre-committed in both directions: if no signal combination clears the mutation
+catalogue at zero false removals, the tier is **deleted from the design rather
+than tuned**, and the honest product is report and quarantine.
+
+That question is **not yet testable**, so the pre-commitment is **not triggered**
+and the tier is **presumed absent until proven otherwise**. Best measured
+configuration to date — four real analyzers behind all three rescue layers that
+exist — still calls **5 live artifacts dead, across 3 of the 19 classes**. But
+the reason the question is untestable is more basic than that number: §9.5 makes
+an auto-act tier formally unreachable without a signal that observes execution,
+and **nothing in this project observes execution**. Every signal here reads
+repository text. None of the configurations measured so far could have produced
+an auto-act decision even at zero false removals.
+
+So the posture is the one that costs nothing if the tier eventually clears and
+everything if it does not. Nothing ships that auto-acts. Nothing downstream gets
+built assuming the tier arrives. §11 R1 budgets for exactly this outcome and
+calls report+quarantine the honest product, not a shortfall.
+
+To be exact about what "today" means: **Judged today is report only.** The
+quarantine half of report+quarantine is not built either — no ledger, no
+stability window, no reaping — and §11 R1 names those as the downstream that
+"assumes the answer is yes". They should be written to survive the tier's
+deletion.
+
+The full determination — every number with the command that produced it,
+inference labelled as inference, and the specific evidence that would reverse the
+call in either direction — is
+[`docs/decisions/2026-08-02-r1-determination.md`](docs/decisions/2026-08-02-r1-determination.md).
+
+## The commands
 
 ### `judged ratchet` — baseline today's findings, fail CI only on new ones
 
@@ -196,6 +229,35 @@ document is also where the layer's current defects are recorded, and they are no
 small — 99 of those roots name a path that does not exist. Read it before
 trusting the output.
 
+### `judged explain` — why one path is or is not eligible, gate by gate
+
+```sh
+judged explain [--json] <path>
+```
+
+§9.13 asks for this alongside `show-roots`. It prints the gates in the order
+§9.3 evaluates them: recoverability first (Gate 0g — what git could give back,
+and at which rung), then Gate 1, the never-touch inventory, with every class that
+refused the path and the rule that did it.
+
+The ordering is the point rather than a convention. Usefulness is irrelevant
+until recoverability is known, because the cost of being wrong is set by the rung
+and not by the tier. A Gate 1 refusal is **absorbing and justified by
+irreversibility, not by uselessness** — no later evidence that a file is unused
+moves it, and equally, a refusal is not a claim that the file is used.
+
+The command never says a path is safe to delete, and it ends by naming the gates
+it did *not* run (0a–0f, 2, 3). §6.20 applies to its own output: a trace that
+silently omits a gate is indistinguishable from one in which that gate abstained.
+
+What Gate 1 protects, and how often it is wrong, is measured on 3,751 files
+across nine real repositories in
+[`docs/evals/2026-08-02-gate1-corpus.md`](docs/evals/2026-08-02-gate1-corpus.md).
+Read it before trusting this output too: Gate 1 currently refuses **28.4%** of
+tracked files against §6.17's 3.6% baseline for "explicitly irreplaceable", and a
+47-row hand check found **17 wrong**, all from one sub-rule that reads an SPDX
+header as making its whole file a compliance artifact.
+
 ## The headline result
 
 Both systems under test are controls that ship with the suite. The summary lines
@@ -358,22 +420,83 @@ nothing. It survived a full review because `--veto --json` printed only where a
 string was found and not where it was declared, so a genuine cross-file rescue and
 a tautology looked identical. Both fields are emitted now.
 
-None of this discharges §11 R1 — it points the other way. Six false removals
-remain across four classes, no measured combination clears the **18 of 19 classes
-any analyzer here can read** (m13 is PHP and nothing reads it), and the
-pre-committed reading of that is that this combination is not an auto-act tier.
-> **Read every number below as an upper bound.** The evaluation is **in-sample**: Gate 2's rescue vocabulary and the 19 classes
-come from the same research document, so it is graded on the exam it studied for
-and every prevention figure is an upper bound.
+### The full stack: Gate 1, Gate 2 and the root set together
+
+Three rescue layers now exist, and each composes independently so all eight
+combinations are measurable. `--gate1` runs §9.3's Gate 1, the never-touch
+inventory, ahead of everything else. Four analyzers, aggregated:
+
+| Configuration | False removals | Classes failing | Decoys |
+| --- | ---: | ---: | --- |
+| bare | **10** | 7 | 26/33 |
+| `--gate1` | 9 | 6 | 25/33 |
+| `--veto` | 6 | 4 | 19/33 |
+| `--roots` | 9 | 6 | 26/33 |
+| `--veto --roots` | **5** | 3 | 19/33 |
+| `--gate1 --veto --roots` | **5** | 3 | 19/33 |
+
+**Gate 1's marginal contribution is exactly zero** — the last two rows are
+identical in every column, and per analyzer the counterfactual is 3→3, 1→1, 1→1,
+0→0. That is the expected result and not a defect. Gate 1 refuses on
+**irreversibility**, not on usefulness: it makes a wrong answer cheaper, it does
+not make the answer more correct, so it cannot clear a class that a reference
+analyzer gets wrong. §10 E2's nineteen classes exercise *reference* mechanisms,
+which is Gate 2's domain; the catalogue contains no `.env`, no
+`terraform.tfstate` and no analyst's `.RData`, so it cannot measure the layer
+that exists for them.
+
+Where Gate 1 *did* move something, the reason matters more than the number. Run
+alone it clears knip's m14 — and the trace shows why that is not a result:
+
+```
+  m14  FAIL  typescript  0 false  1/2 decoys  committed build output whose only consumer is a CDN path
+       gate1 rescued live: dist/widget.7f3a91c.js   [§10 E2 class 14]
+       the stack also rescued 1 genuinely-dead decoy file(s) — the price
+       [gate1/1j] rescued path dist/widget.0c9e142.js — 1j vendored, generated, submodule or LFS-tracked: matches GitHub Linguist vendor.yml `(^|/)dist/`, so it is not this repository's code
+       [gate1/1j] rescued path dist/widget.7f3a91c.js — 1j vendored, generated, submodule or LFS-tracked: matches GitHub Linguist vendor.yml `(^|/)dist/`, so it is not this repository's code
+```
+
+`…7f3a91c.js` is the live asset; `…0c9e142.js` is the planted decoy, genuinely
+dead. The justification is byte-identical. What makes the live one live is a
+`<script src=…>` in `public/index.html`, which Gate 1 never read — it matched a
+directory pattern and refused both. One false removal prevented, one decoy
+destroyed, 1:1, and the layer cannot tell you which it just did. **A rescue like
+that is a coincidence of shape, not evidence that anything got better at
+identifying dead code.** The fixture predicted it: *"a tool that roots all of
+`dist/` is safe and scores zero decoy recall."* Gate 2 clears m14 too, by finding
+the filename in the HTML — a rescue that *is* connected to the liveness.
+
+**Five false removals survive, in three classes, and Gate 1 fired on none of
+them:** m02's runtime-computed module specifier (knip), m11's three reflectively
+enumerated model fields (vulture), m12's `//go:linkname` alias (deadcode). All
+sixteen Gate 1 classes were asked about all three and none refused a single
+claim.
+
+> **Read every number here as an upper bound.** The evaluation is **in-sample**:
+> the rescue vocabulary of all three layers and the 19 classes come from the same
+> research document, so it is graded on the exam it studied for.
+
+None of this discharges §11 R1 — it points the other way, and Gate 1's arrival
+did not change that in either direction. Five false removals remain across three
+classes; no measured combination clears the **18 of 19 classes any analyzer here
+can read** (m13 is PHP and nothing reads it); and every signal in the stack reads
+repository text, so §9.5's two-family quorum is unsatisfiable and Tier 0 is
+formally unreachable regardless of the count. The determination, with what would
+reverse it, is
+[`docs/decisions/2026-08-02-r1-determination.md`](docs/decisions/2026-08-02-r1-determination.md).
+Gate 1 measured on its own terms — 3,751 files across nine real repositories,
+where it protects 28.4% of them and a hand check finds 17 of 47 protections wrong
+— is
+[`docs/evals/2026-08-02-gate1-corpus.md`](docs/evals/2026-08-02-gate1-corpus.md).
 
 ## Layout
 
 | Crate | What it holds |
 | --- | --- |
-| `judged-core` | The SARIF 2.1.0 subset adapters are held to, content-derived fingerprints, git recoverability classification, Gate 2's vetoes, and the Tier A/B/C root readers under `roots/` |
+| `judged-core` | The SARIF 2.1.0 subset adapters are held to, content-derived fingerprints, git recoverability classification, Gate 1's sixteen never-touch classes under `gate1/`, Gate 2's vetoes, and the Tier A/B/C root readers under `roots/` |
 | `judged-ratchet` | Baseline, diff, rot detection |
 | `judged-mutants` | The 19-class catalogue, the SUT contract, the runner, and the root-set materializer that assembles the three tiers |
-| `judged-cli` | The `judged` binary: `ratchet`, `mutants`, `show-roots` |
+| `judged-cli` | The `judged` binary: `ratchet`, `mutants`, `show-roots`, `explain` |
 
 The root readers under `judged-core/src/roots/` parse other people's file
 formats, so they use those ecosystems' own parsers — `toml` (toml-rs, what Cargo

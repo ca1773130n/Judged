@@ -1710,13 +1710,15 @@ fn the_binary_has_no_flag_that_deletes() {
 }
 
 #[test]
-fn there_are_two_subcommands_and_the_help_says_so() {
+fn every_subcommand_is_in_the_help_and_nothing_else_is() {
     let repo = scratch("help");
 
     let run = judged(repo.path(), &["--help"]);
     run.expect_code(0, "help was asked for, not provoked")
         .expect_says("judged ratchet")
-        .expect_says("judged mutants");
+        .expect_says("judged mutants")
+        .expect_says("judged show-roots")
+        .expect_says("judged explain");
 
     judged(repo.path(), &["clean"])
         .expect_code(2, "there is no `judged clean`")
@@ -2639,4 +2641,369 @@ fn help_documents_roots_as_a_layer_of_its_own() {
         .expect_code(0, "help is requested, not provoked")
         .expect_says("--roots")
         .expect_says("may only rescue");
+}
+
+// ---------------------------------------------------------------------------
+// judged explain — the gate trace §9.13 asks for by name
+//
+// §9.13's second invariant lists three commands together: `--why-alive`,
+// `show-roots`, and `--explain <path>` — *"the full gate trace: which gate
+// vetoed, which .gitignore line matched, which magic bytes"*. This is the
+// command that makes the never-touch inventory legible to a human instead of an
+// internal predicate.
+//
+// Every one of these tests asserts on the RECOVERABILITY line as well as on the
+// gate verdict, and that is not padding. §8.1 is the single most consequential
+// finding in the research and §9.3 puts Gate 0g first for the reason it states:
+// usefulness is irrelevant until recoverability is known, because the cost of
+// being wrong is set by the rung, not the tier. A trace that omits the rung has
+// published the cheap half.
+// ---------------------------------------------------------------------------
+
+/// A working tree holding one file of each interesting shape.
+fn repo_for_explaining(label: &str) -> TempDir {
+    let scratch = scratch(label);
+    let root = scratch.path();
+    let repo = Repo::init(root).expect("scratch must be a git working tree");
+
+    write(root, "src/billing.py", "def charge():\n    return 1\n");
+    // §6.17's headline: 15 canonical templates ignore `.env`, it has no magic
+    // bytes, and it is routinely the only copy of a working credential.
+    // `build/*` rather than `build/`, and the difference is the classic
+    // gitignore gotcha rather than a detail: git cannot re-include a file whose
+    // parent DIRECTORY is excluded, so under `build/` the negation on line 4 is
+    // dead text and `check-ignore` names line 3 as the deciding rule. Under
+    // `build/*` the negation decides, which is the §9.3 class 1m case this
+    // fixture exists to produce.
+    write(
+        root,
+        ".gitignore",
+        "*.log\n.env\nbuild/*\n!build/keep.txt\n",
+    );
+    write(root, ".env", "STRIPE_SECRET_KEY=sk_live_notreal\n");
+    write(root, "build/keep.txt", "kept on purpose\n");
+    // A real SQLite header, so the magic-byte sniff has something to find.
+    std::fs::write(
+        root.join("dev.sqlite3"),
+        b"SQLite format 3\0\x10\x00\x01\x01\x00@  \x00\x00\x00\x01",
+    )
+    .expect("write the database fixture");
+    repo.add_all().expect("stage the fixture");
+    repo.commit("fixture").expect("commit the fixture");
+    // Written after the commit, so it is genuinely untracked rather than merely
+    // modified: §8.1's point is that a never-added file leaves NOTHING behind.
+    write(root, "scratch-notes", "handover notes, never committed\n");
+    scratch
+}
+
+#[test]
+fn explain_leads_with_the_recoverability_class_and_the_rung_it_implies() {
+    let repo = repo_for_explaining("explain-rung");
+
+    let run = judged(repo.path(), &["explain", "scratch-notes"]);
+
+    run.expect_code(0, "explaining a path is a report, not a gate")
+        .expect_says("UNTRACKED")
+        .expect_says("R9");
+
+    // Gate 0g comes before every usefulness question, and the report has to be
+    // ordered the way the pipeline is or it teaches the wrong model.
+    assert!(
+        run.offset_of("RECOVERABILITY") < run.offset_of("GATE 1"),
+        "Gate 0g is computed BEFORE any usefulness question (§9.3), and the trace \
+         must read in that order. Report was:\n{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn explain_distinguishes_a_tracked_file_from_an_untracked_one() {
+    let repo = repo_for_explaining("explain-tracked");
+
+    let tracked = judged(repo.path(), &["explain", "src/billing.py"]);
+    tracked
+        .expect_code(0, "a tracked file explains fine")
+        .expect_says("TRACKED_UNPUSHED")
+        .expect_says("R4");
+
+    // The inversion §8.1 exists to state: the file that is safe to CLASSIFY is
+    // the one that is unsafe to DELETE, and vice versa. If both printed the same
+    // rung the command would be teaching the intuitive ordering, which is
+    // backwards.
+    let untracked = judged(repo.path(), &["explain", "scratch-notes"]);
+    assert_ne!(
+        tracked.stdout, untracked.stdout,
+        "a tracked file and an untracked one must not produce the same trace"
+    );
+}
+
+#[test]
+fn explain_names_the_gate_one_class_that_refused_and_quotes_the_rule() {
+    let repo = repo_for_explaining("explain-secret");
+
+    let run = judged(repo.path(), &["explain", ".env"]);
+
+    run.expect_code(0, "explaining a path is a report, not a gate")
+        // 1b — secrets and identity. §9.3: escalate for rotation, never delete.
+        .expect_says("1b")
+        .expect_says("INELIGIBLE")
+        // An ignored, never-tracked credential is the §6.17 case exactly.
+        .expect_says("IGNORED")
+        .expect_says("R9");
+}
+
+#[test]
+fn explain_names_the_magic_bytes_that_fired() {
+    let repo = repo_for_explaining("explain-magic");
+
+    let run = judged(repo.path(), &["explain", "dev.sqlite3"]);
+
+    run.expect_code(0, "explaining a path is a report, not a gate")
+        // §2.1's perfect-portability veto: it reads the file rather than
+        // believing its name.
+        .expect_says("SQLite")
+        .expect_says("1d");
+}
+
+#[test]
+fn explain_quotes_the_ignore_rule_that_matched_and_the_line_it_lives_on() {
+    let repo = repo_for_explaining("explain-ignore");
+
+    // A file re-included by a `!` negation: §9.3 class 1m, and §6.17 measured
+    // 246 such patterns across 41 canonical templates. The negation is the
+    // repository saying explicitly that it wants this file.
+    let run = judged(repo.path(), &["explain", "build/keep.txt"]);
+
+    run.expect_code(0, "explaining a path is a report, not a gate")
+        .expect_says("!build/keep.txt")
+        .expect_says(".gitignore:4")
+        .expect_says("1m");
+}
+
+#[test]
+fn explain_says_no_objection_without_ever_saying_safe_to_delete() {
+    let repo = repo_for_explaining("explain-clean");
+
+    let run = judged(repo.path(), &["explain", "src/billing.py"]);
+
+    run.expect_code(0, "explaining a path is a report, not a gate")
+        .expect_says("NO OBJECTION")
+        // §9.1: Gate 1 refuses, it does not accuse. An absence of objection from
+        // sixteen classes is not a deletion verdict, and a command that let a
+        // reader take it as one would be the most dangerous line in the tool.
+        .expect_silent_about("safe to delete");
+}
+
+#[test]
+fn explain_names_the_gates_it_did_not_run() {
+    let repo = repo_for_explaining("explain-scope");
+
+    let run = judged(repo.path(), &["explain", "src/billing.py"]);
+
+    // §6.20, applied to this command's own output: a trace that silently omits a
+    // gate is indistinguishable from a trace in which that gate abstained.
+    run.expect_says("NOT RUN");
+}
+
+#[test]
+fn explain_refuses_a_path_outside_the_repository() {
+    let repo = repo_for_explaining("explain-outside");
+
+    let run = judged(repo.path(), &["explain", "../elsewhere/thing.py"]);
+
+    run.expect_code(
+        2,
+        "a path outside the working tree cannot be classified, and answering \
+         anyway would invent a verdict",
+    )
+    .expect_says("REFUSED");
+}
+
+#[test]
+fn explain_json_carries_the_class_the_rung_and_every_finding() {
+    let repo = repo_for_explaining("explain-json");
+
+    let run = judged(repo.path(), &["explain", "--json", ".env"]);
+    let report: Value = serde_json::from_str(run.stdout.trim()).expect("--json emits JSON");
+
+    assert_eq!(report["path"], ".env");
+    assert_eq!(report["recoverability"]["class"], "IGNORED");
+    assert!(
+        report["recoverability"]["rung"]
+            .as_str()
+            .expect("the rung is a string")
+            .contains("R9"),
+        "Gate 0g's class without its rung is the cheap half: {report}"
+    );
+    assert_eq!(report["gate1"]["disposition"], "INELIGIBLE");
+    let classes: Vec<&str> = report["gate1"]["findings"]
+        .as_array()
+        .expect("findings is an array")
+        .iter()
+        .map(|finding| finding["class"].as_str().expect("a class code"))
+        .collect();
+    assert!(
+        classes.contains(&"1b"),
+        "a checked-in credential is §9.3 class 1b: {report}"
+    );
+}
+
+#[test]
+fn help_documents_explain_as_the_gate_trace() {
+    let repo = scratch("explain-help");
+
+    judged(repo.path(), &["--help"])
+        .expect_code(0, "help is requested, not provoked")
+        .expect_says("explain")
+        .expect_says("gate trace");
+}
+
+// ---------------------------------------------------------------------------
+// judged mutants --gate1 — the never-touch inventory as a measurable layer
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gate_one_is_its_own_layer_and_runs_before_the_veto() {
+    let repo = scratch("mutants-gate1");
+
+    let run = judged(
+        repo.path(),
+        &["mutants", "--sut", "naive", "--gate1", "--veto", "--json"],
+    );
+    let report: Value = serde_json::from_str(run.stdout.trim()).expect("--json emits JSON");
+
+    // The name records the composition, and the composition IS §9.3's ordering:
+    // Gate 1 wraps the analyzer, everything else wraps Gate 1.
+    assert_eq!(
+        report["sut"], "naive+gate1+veto",
+        "the measured system is the stack, and the name has to say in which order"
+    );
+
+    let layers = report["rescue"]["layers"]
+        .as_array()
+        .expect("the rescue summary lists its layers");
+    let names: Vec<&str> = layers
+        .iter()
+        .map(|layer| layer["name"].as_str().expect("a layer name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["gate1", "veto"],
+        "the layer list is ordered by the order the layers RAN, and Gate 1 runs \
+         first (§9.3): {report}"
+    );
+
+    // Gate 1 must have been handed the whole claim set and Gate 2 only what
+    // survived. That is the absorbing property, visible in the arithmetic.
+    let gate1 = &layers[0];
+    let veto = &layers[1];
+    assert!(
+        gate1["claims_judged"].as_u64().unwrap() >= veto["claims_judged"].as_u64().unwrap(),
+        "Gate 2 cannot have been handed more claims than Gate 1 was: {report}"
+    );
+}
+
+#[test]
+fn help_documents_gate1_as_running_first() {
+    let repo = scratch("mutants-gate1-help");
+
+    judged(repo.path(), &["--help"])
+        .expect_code(0, "help is requested, not provoked")
+        .expect_says("--gate1")
+        .expect_says("irreversibility");
+}
+
+/// **Found by measurement, not by review.** Every test above runs `judged
+/// explain` from inside the repository with a repo-relative path, and the whole
+/// suite passed while the command mis-resolved every other spelling: a path
+/// given as `corpus/requests/LICENSE` from a directory above the working tree
+/// was joined onto the discovered root a second time, so the gates were asked
+/// about `<root>/corpus/requests/LICENSE`, which does not exist.
+///
+/// The failure mode is the dangerous direction. A path that does not exist is
+/// not tracked, so Gate 0g answered UNTRACKED — R9, the most alarming rung — for
+/// a file that is committed and pushed, and 1d refused it on "the head of this
+/// file could not be read". Both lines are confident, both are wrong, and
+/// nothing in the report said the file it was describing was not the file it was
+/// asked about.
+#[test]
+fn explain_resolves_a_path_given_from_outside_the_working_tree() {
+    let repo = repo_for_explaining("explain-outside-cwd");
+    let outside = repo.path().parent().expect("the scratch dir has a parent");
+    let inside = repo
+        .path()
+        .file_name()
+        .expect("the scratch dir has a name")
+        .to_string_lossy()
+        .into_owned();
+
+    let run = judged(outside, &["explain", &format!("{inside}/src/billing.py")]);
+
+    run.expect_code(0, "the file exists and is inside a working tree")
+        .expect_says("TRACKED_UNPUSHED")
+        // The bug's signature: a path resolved against the wrong base does not
+        // exist, and a file that does not exist reads as untracked.
+        .expect_silent_about("UNTRACKED\n")
+        .expect_silent_about("could not be read");
+}
+
+/// §9.13's conflict list, for Gate 1 specifically.
+///
+/// The layer summary can say Gate 1 rescued two claims and prevented one false
+/// removal, and a reader who cannot see **which** claim, and under which of the
+/// sixteen classes, has been handed a score with more decimal places. The veto
+/// and the root set each publish a per-class conflict list; a layer that reports
+/// only its totals is the thing §7.3 says the best-validated prior art in the
+/// whole research does not do — IntelliJ's Safe Delete shows the usage list.
+#[test]
+fn gate_one_publishes_which_claim_it_refused_and_under_which_class() {
+    let repo = scratch("mutants-gate1-conflicts");
+
+    let run = judged(
+        repo.path(),
+        &["mutants", "--sut", "naive", "--gate1", "--json"],
+    );
+    let report: Value = serde_json::from_str(run.stdout.trim()).expect("--json emits JSON");
+
+    let mut refusals = 0usize;
+    for class in report["mutants"].as_array().expect("a mutants array") {
+        let Some(gate1) = class["gate1"].as_object() else {
+            continue;
+        };
+        let claims = gate1["refused_claims"]
+            .as_array()
+            .expect("gate1 publishes its conflict list");
+        for claim in claims {
+            refusals += 1;
+            assert_eq!(claim["layer"], "gate1");
+            let code = claim["class"]
+                .as_str()
+                .expect("every refusal names the §9.3 class that fired");
+            assert!(
+                code.len() == 2 && code.starts_with('1'),
+                "`{code}` is not a Gate 1 class code: {claim}"
+            );
+            assert!(
+                !claim["detail"]
+                    .as_str()
+                    .expect("a detail sentence")
+                    .is_empty(),
+                "a refusal with no reason is a score: {claim}"
+            );
+        }
+        // The arithmetic has to close, per class, or a claim vanished between
+        // the layer and the report.
+        assert_eq!(
+            gate1["claims_judged"].as_u64().unwrap(),
+            gate1["claims_survived"].as_u64().unwrap() + claims.len() as u64,
+            "judged must equal survived plus refused: {gate1:?}"
+        );
+    }
+
+    assert!(
+        refusals > 0,
+        "Gate 1 published no conflict list anywhere in the catalogue, so this test \
+         asserted nothing. Report was:\n{}",
+        run.stdout
+    );
 }

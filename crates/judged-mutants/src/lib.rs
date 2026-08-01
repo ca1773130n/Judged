@@ -13,6 +13,7 @@
 
 pub mod adapters;
 pub mod fixtures;
+pub mod gate1;
 pub mod mutant;
 pub mod roots;
 pub mod runner;

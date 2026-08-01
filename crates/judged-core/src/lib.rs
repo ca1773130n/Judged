@@ -15,6 +15,7 @@
 
 pub mod error;
 pub mod fingerprint;
+pub mod gate1;
 pub mod git;
 pub mod roots;
 pub mod sarif;

@@ -54,6 +54,8 @@ pub enum Invocation {
     Mutants(MutantsArgs),
     /// §5, §9.13 — materialize the root set and show it.
     ShowRoots(ShowRootsArgs),
+    /// §9.3, §9.13 — the full gate trace for one path.
+    Explain(ExplainArgs),
     /// Usage text, requested rather than provoked. Exits 0.
     Help,
 }
@@ -67,6 +69,22 @@ pub enum Invocation {
 pub struct ShowRootsArgs {
     /// The repository to read. Defaults to the current directory, because that
     /// is the repository somebody standing in it means.
+    pub path: PathBuf,
+    /// Emit the report as JSON instead of as text.
+    pub json: bool,
+}
+
+/// `judged explain [--json] <path>`.
+///
+/// §9.13's second invariant names three commands together — `--why-alive`,
+/// `show-roots` and `--explain <path>` — and describes this one as *"the full
+/// gate trace: which gate vetoed, which `.gitignore` line matched, which magic
+/// bytes"*. It is what makes the never-touch inventory legible to a human
+/// instead of an internal predicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainArgs {
+    /// The path to trace. Required, and positional: a trace is *about* a path,
+    /// and there is no useful default.
     pub path: PathBuf,
     /// Emit the report as JSON instead of as text.
     pub json: bool,
@@ -129,6 +147,16 @@ pub struct MutantsArgs {
     /// they were. That is a limit of the axis, and stating it is the difference
     /// between a sweep and a table.
     pub needles: NeedleStrategy,
+    /// Run §9.3's Gate 1 — the never-touch inventory — over every claim, and
+    /// report the trade.
+    ///
+    /// Its own flag, and it runs **first**, because it answers a different
+    /// question from either of the others. Gate 2 and the root set both reason
+    /// about usefulness; Gate 1 reasons about the cost of being wrong, and §9.3
+    /// says its refusals are justified by irreversibility rather than by
+    /// uselessness. A `.env`, a `terraform.tfstate` and an analyst's `.RData`
+    /// are all genuinely useless to the build, and all irreplaceable.
+    pub gate1: bool,
     /// Materialize the root set (§5) and let it rescue, alongside Gate 2.
     ///
     /// A separate flag from `--veto`, and that is the point rather than an
@@ -396,9 +424,12 @@ judged — evidence about what a repository is still using.
 USAGE:
     judged ratchet --sarif <path>... [--baseline <path>] [--update]
                                      [--expected-targets <n>]
-    judged mutants [--sut <sut>] [--veto [--needles <strategy>]] [--roots] [--json]
-    judged mutants --sut command [--veto] [--roots] [--json] -- <analyzer> [args...]
+    judged mutants [--sut <sut>] [--gate1] [--veto [--needles <strategy>]] [--roots]
+                   [--json]
+    judged mutants --sut command [--gate1] [--veto] [--roots] [--json]
+                   -- <analyzer> [args...]
     judged show-roots [--json] [<path>]
+    judged explain [--json] <path>
 
 RATCHET (§9.14) — baseline today's findings, fail CI only on new ones.
     --sarif <path>             A SARIF 2.1.0 log to judge. Repeatable, required.
@@ -428,6 +459,22 @@ MUTANTS (§10 E2) — inject 19 known-live artifacts and see what gets called de
                                the repository path appended as the last argument,
                                and must exit 0. Its stdout is parsed as vulture's
                                format, the only format the escape hatch reads.
+    --gate1                    Run §9.3's Gate 1 — the never-touch inventory —
+                               over every claim, BEFORE the reference veto, and
+                               report the trade. Gate 2 and --roots both reason
+                               about usefulness; Gate 1 reasons about the cost of
+                               being wrong, and its refusals are justified by
+                               irreversibility rather than by uselessness. A .env,
+                               a terraform.tfstate and an analyst's .RData are all
+                               genuinely useless to the build and all
+                               irreplaceable. Ordering is structural: Gate 1 wraps
+                               the analyzer and every other layer wraps Gate 1, so
+                               a claim it refuses is never handed to a later gate
+                               — which is what makes the refusal absorbing.
+                               Class 1p, `the unknown defaults to keep`, refuses
+                               every file whose type cannot be named, so this is
+                               the widest layer in the tool and the report prints
+                               its flag rate beside its rescues.
     --veto                     Run §9.3's Gate 2 over every claim the SUT makes,
                                and report the trade. Composable with every --sut.
                                A veto can only RESCUE, never nominate, so this can
@@ -504,6 +551,35 @@ SHOW-ROOTS (§5, §9.13) — ProGuard `-printseeds` for this repository.
 
     Exit 0 when a root set was materialized; 2 when nothing could be read.
 
+EXPLAIN (§9.3, §9.13) — the full gate trace for one path.
+    <path>                     The candidate to trace. Required.
+    --json                     Machine-readable report, same content.
+
+    §9.13 asks for this command by name, alongside --why-alive and show-roots.
+    It answers, for one candidate, in the order the pipeline asks:
+
+        RECOVERABILITY (Gate 0g)   what git could give back after we delete it,
+                                   and the §8.1 ladder rung that implies. This
+                                   comes FIRST because §9.3 says it does:
+                                   usefulness is irrelevant until recoverability
+                                   is known, since the cost of being wrong is set
+                                   by the rung, not the tier. TRACKED_PUSHED is
+                                   R2-R4; UNTRACKED and IGNORED are R9 by
+                                   default — zero recovery path — and those are
+                                   the classes a repository cleaner's highest-
+                                   volume targets live in.
+        GATE 1                     which of the sixteen §9.3 classes refuse it,
+                                   each quoting the rule that fired: the ignore
+                                   rule and the line it lives on, the magic-byte
+                                   signature, the Linguist pattern, the platform
+                                   contract and what reads it.
+
+    NO OBJECTION is not permission to delete. Gate 1 refuses, it does not accuse
+    (§9.1), and the trace names the gates it did NOT run — a trace that silently
+    omits a gate is indistinguishable from one in which that gate abstained.
+
+    Exit 0 when a trace was produced; 2 when the path could not be classified.
+
 Judged runs an analyzer to READ it. Adapters are read-only (§9.2), so a
 deletion-shaped flag is refused wherever it appears — including inside the argv
 after `--`, which judged would otherwise hand to a tool and let it edit the
@@ -577,12 +653,24 @@ where
             }
             parse_show_roots(rest).map(Invocation::ShowRoots)
         }
+        Some("explain") => {
+            if tail.is_some() {
+                return Err(usage(
+                    "`--` is only meaningful for `judged mutants --sut command`, which runs the \
+                     words after it as an analyzer. `judged explain` reads one path off disk and \
+                     starts no subprocess but git."
+                        .to_string(),
+                ));
+            }
+            parse_explain(rest).map(Invocation::Explain)
+        }
         Some(unknown) => Err(usage(format!(
-            "`{unknown}` is not a judged subcommand. There are three: `ratchet`, `mutants` and \
-             `show-roots`."
+            "`{unknown}` is not a judged subcommand. There are four: `ratchet`, `mutants`, \
+             `show-roots` and `explain`."
         ))),
         None => Err(usage(
-            "no subcommand. There are three: `ratchet`, `mutants` and `show-roots`.".to_string(),
+            "no subcommand. There are four: `ratchet`, `mutants`, `show-roots` and `explain`."
+                .to_string(),
         )),
     }
 }
@@ -712,6 +800,11 @@ fn parse_mutants<'a>(
     // Likewise off by default: the layer is a measurement, and the number the
     // suite has always reported is what the analyzer does unprotected.
     let mut roots = false;
+    // And likewise off by default. Gate 1 is the layer with the widest reach —
+    // §9.3's 1p rule alone refuses every file whose type it cannot name — so a
+    // run with it silently on would not be comparable to any number this suite
+    // has published.
+    let mut gate1 = false;
     let mut needles: Option<&str> = None;
 
     while let Some(word) = rest.next() {
@@ -719,6 +812,7 @@ fn parse_mutants<'a>(
             "--sut" => sut = value("--sut", &mut rest)?,
             "--json" => json = true,
             "--veto" => veto = true,
+            "--gate1" => gate1 = true,
             "--roots" => roots = true,
             "--needles" => needles = Some(value("--needles", &mut rest)?),
             other => return Err(usage(format!("`{other}` is not a `judged mutants` flag."))),
@@ -784,10 +878,60 @@ fn parse_mutants<'a>(
     Ok(MutantsArgs {
         sut,
         veto,
+        gate1,
         roots,
         needles,
         json,
     })
+}
+
+/// `judged explain [--json] <path>`.
+///
+/// The path is positional and required. A second path is refused rather than
+/// taking the last one, for the same reason `show-roots` refuses a second
+/// repository: one trace assembled from two paths would have no column saying
+/// which path each line was about, and a gate trace whose subject cannot be
+/// checked is the thing the command exists to prevent.
+fn parse_explain<'a>(rest: impl Iterator<Item = &'a str>) -> Result<ExplainArgs, UsageError> {
+    let mut json = false;
+    let mut path: Option<PathBuf> = None;
+
+    for word in rest {
+        match word {
+            "--json" => json = true,
+            other if other.starts_with("--") => {
+                return Err(usage(format!(
+                    "`{other}` is not a `judged explain` flag. It takes `--json` and one path."
+                )))
+            }
+            other => {
+                if let Some(first) = &path {
+                    return Err(usage(format!(
+                        "`judged explain` traces one path, and it was given two: `{}` and \
+                         `{other}`. One trace assembled from two paths could not say which \
+                         path each line was about.",
+                        first.display()
+                    )));
+                }
+                path = Some(PathBuf::from(other));
+            }
+        }
+    }
+
+    // Refused rather than defaulted to the working directory. `show-roots`
+    // defaults because a repository is what somebody standing in one means; a
+    // trace is about a candidate, and there is no candidate a bare `explain`
+    // could sensibly be about.
+    let path = path.ok_or_else(|| {
+        usage(
+            "`judged explain` needs a path to trace. It answers, for one candidate: what \
+             could restore it (Gate 0g), which §9.3 Gate 1 class refuses it, which ignore \
+             rule matched and which magic bytes fired."
+                .to_string(),
+        )
+    })?;
+
+    Ok(ExplainArgs { path, json })
 }
 
 /// A SUT that takes no command line of its own, having checked it was not given

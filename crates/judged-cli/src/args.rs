@@ -52,8 +52,24 @@ pub enum Invocation {
     Ratchet(RatchetArgs),
     /// §10 E2 — the mutation-injection suite.
     Mutants(MutantsArgs),
+    /// §5, §9.13 — materialize the root set and show it.
+    ShowRoots(ShowRootsArgs),
     /// Usage text, requested rather than provoked. Exits 0.
     Help,
+}
+
+/// `judged show-roots [--json] [<path>]`.
+///
+/// ProGuard's `-printseeds`, which §9.13 asks for by name, and Nix's
+/// `--print-roots`: show a human every root that went into the set, and where it
+/// came from, **before** anything acts on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowRootsArgs {
+    /// The repository to read. Defaults to the current directory, because that
+    /// is the repository somebody standing in it means.
+    pub path: PathBuf,
+    /// Emit the report as JSON instead of as text.
+    pub json: bool,
 }
 
 /// `judged ratchet --sarif <path>... [--baseline <path>] [--update]`.
@@ -113,6 +129,18 @@ pub struct MutantsArgs {
     /// they were. That is a limit of the axis, and stating it is the difference
     /// between a sweep and a table.
     pub needles: NeedleStrategy,
+    /// Materialize the root set (§5) and let it rescue, alongside Gate 2.
+    ///
+    /// A separate flag from `--veto`, and that is the point rather than an
+    /// oversight. The two layers answer different questions — *does anything in
+    /// this repository name the candidate* against *was this candidate declared
+    /// an entry point* — and §10 E2's two hardest classes are exactly where the
+    /// first cannot help: `ReportingConfig` occurs in `apps.py` and in no other
+    /// file, so no tuning of Gate 2a's needles reaches it. Four configurations
+    /// are therefore measurable — bare, `--veto`, `--roots`, both — and a
+    /// combined-only flag would report a rescue without saying which layer
+    /// earned it.
+    pub roots: bool,
     /// Emit the report as JSON instead of as text.
     pub json: bool,
 }
@@ -368,8 +396,9 @@ judged — evidence about what a repository is still using.
 USAGE:
     judged ratchet --sarif <path>... [--baseline <path>] [--update]
                                      [--expected-targets <n>]
-    judged mutants [--sut <sut>] [--veto [--needles <strategy>]] [--json]
-    judged mutants --sut command [--veto] [--json] -- <analyzer> [args...]
+    judged mutants [--sut <sut>] [--veto [--needles <strategy>]] [--roots] [--json]
+    judged mutants --sut command [--veto] [--roots] [--json] -- <analyzer> [args...]
+    judged show-roots [--json] [<path>]
 
 RATCHET (§9.14) — baseline today's findings, fail CI only on new ones.
     --sarif <path>             A SARIF 2.1.0 log to judge. Repeatable, required.
@@ -426,9 +455,20 @@ MUTANTS (§10 E2) — inject 19 known-live artifacts and see what gets called de
                                command that produced it name one configuration.
                                A SYMBOL claim is judged by a fixed strategy this
                                flag does not reach.
+    --roots                    Materialize the root set (§5) and let it rescue,
+                               alongside Gate 2. A candidate that IS a declared or
+                               discovered root must never be claimed dead. Same
+                               absorbing semantics as the veto: it may only rescue,
+                               never nominate. Independent of --veto on purpose —
+                               bare, --veto, --roots and both are four measurable
+                               configurations, and a combined-only flag would hide
+                               which layer earned a rescue.
     --json                     Machine-readable report. Under --veto it also
                                carries the conflict list: for every blocked claim,
                                which needle fired and in which file (§9.13, §7.3).
+                               Under --roots it carries the rescue list: for every
+                               rescued claim, its §5.1 tier and the file and key
+                               that declared it.
 
     Exit 0 only when the false-removal count is zero; 2 if the suite could not
     be run at all — including when the selected analyzer is not installed. An
@@ -438,6 +478,31 @@ MUTANTS (§10 E2) — inject 19 known-live artifacts and see what gets called de
     The four named analyzers each read one ecosystem. Classes outside it are
     marked [NOT READ by this SUT] and subtracted from the denominator, because a
     tool that opened no file in a language has not passed there — it was absent.
+
+SHOW-ROOTS (§5, §9.13) — ProGuard `-printseeds` for this repository.
+    <path>                     Repository to read. Default: the current directory.
+    --json                     Machine-readable report, same content.
+
+    Materializes the root set and prints it grouped by the §5.1 tier that earned
+    each root, with the exact file and key it came from:
+        A  machine-declared    a build system already reads this file for roots
+        B  convention-inferable a framework's layout makes it an entry point;
+                               correct only if the framework AND its version were
+                               detected correctly — a guess, and labelled as one
+        C  undiscoverable      solicited from a human, committed in
+                               .judged/roots.toml
+
+    It also prints what it could NOT resolve: a detected framework with no
+    plugin, a manifest that failed to parse, a declared entry that matched
+    nothing. A root list showing only successes hides exactly the gaps a reader
+    needs — a framework whose roots are all missing looks identical to one that
+    has none (§6.20).
+
+    This decides nothing. §1.2: you cannot infer the closed world, you can only
+    have it declared. It shows what WAS declared, so the classification can be
+    audited before anything acts on it.
+
+    Exit 0 when a root set was materialized; 2 when nothing could be read.
 
 Judged runs an analyzer to READ it. Adapters are read-only (§9.2), so a
 deletion-shaped flag is refused wherever it appears — including inside the argv
@@ -501,11 +566,23 @@ where
             parse_ratchet(rest).map(Invocation::Ratchet)
         }
         Some("mutants") => parse_mutants(rest, tail).map(Invocation::Mutants),
+        Some("show-roots") => {
+            if tail.is_some() {
+                return Err(usage(
+                    "`--` is only meaningful for `judged mutants --sut command`, which runs the \
+                     words after it as an analyzer. `judged show-roots` reads manifests off disk \
+                     and starts no subprocess."
+                        .to_string(),
+                ));
+            }
+            parse_show_roots(rest).map(Invocation::ShowRoots)
+        }
         Some(unknown) => Err(usage(format!(
-            "`{unknown}` is not a judged subcommand. There are two: `ratchet` and `mutants`."
+            "`{unknown}` is not a judged subcommand. There are three: `ratchet`, `mutants` and \
+             `show-roots`."
         ))),
         None => Err(usage(
-            "no subcommand. There are two: `ratchet` and `mutants`.".to_string(),
+            "no subcommand. There are three: `ratchet`, `mutants` and `show-roots`.".to_string(),
         )),
     }
 }
@@ -578,6 +655,48 @@ fn parse_ratchet<'a>(mut rest: impl Iterator<Item = &'a str>) -> Result<RatchetA
     })
 }
 
+/// `show-roots` takes one optional positional path, and one flag.
+///
+/// The path is positional rather than a `--directory` flag because it is the
+/// only argument this command has that is not a rendering choice, and because a
+/// reader who types `judged show-roots ../other-repo` has said everything there
+/// is to say. A second path is refused rather than taking the last one: two
+/// repositories would produce one root set with no column saying which
+/// repository each root came from, and a root whose provenance cannot be checked
+/// is the thing this whole command exists to prevent.
+fn parse_show_roots<'a>(rest: impl Iterator<Item = &'a str>) -> Result<ShowRootsArgs, UsageError> {
+    let mut json = false;
+    let mut path: Option<PathBuf> = None;
+
+    for word in rest {
+        match word {
+            "--json" => json = true,
+            other if other.starts_with('-') => {
+                return Err(usage(format!(
+                    "`{other}` is not a `judged show-roots` flag. It takes `--json` and an \
+                     optional path."
+                )))
+            }
+            other => {
+                if let Some(first) = &path {
+                    return Err(usage(format!(
+                        "`judged show-roots` reads one repository, and it was given two: \
+                         `{}` and `{other}`. One root set assembled from two repositories \
+                         could not say which one each root came from.",
+                        first.display()
+                    )));
+                }
+                path = Some(PathBuf::from(other));
+            }
+        }
+    }
+
+    Ok(ShowRootsArgs {
+        path: path.unwrap_or_else(|| PathBuf::from(".")),
+        json,
+    })
+}
+
 fn parse_mutants<'a>(
     mut rest: impl Iterator<Item = &'a str>,
     tail: Option<&[String]>,
@@ -590,6 +709,9 @@ fn parse_mutants<'a>(
     // Off by default, so that the number the suite has always reported keeps
     // meaning what it meant: what the analyzer does unprotected.
     let mut veto = false;
+    // Likewise off by default: the layer is a measurement, and the number the
+    // suite has always reported is what the analyzer does unprotected.
+    let mut roots = false;
     let mut needles: Option<&str> = None;
 
     while let Some(word) = rest.next() {
@@ -597,6 +719,7 @@ fn parse_mutants<'a>(
             "--sut" => sut = value("--sut", &mut rest)?,
             "--json" => json = true,
             "--veto" => veto = true,
+            "--roots" => roots = true,
             "--needles" => needles = Some(value("--needles", &mut rest)?),
             other => return Err(usage(format!("`{other}` is not a `judged mutants` flag."))),
         }
@@ -661,6 +784,7 @@ fn parse_mutants<'a>(
     Ok(MutantsArgs {
         sut,
         veto,
+        roots,
         needles,
         json,
     })

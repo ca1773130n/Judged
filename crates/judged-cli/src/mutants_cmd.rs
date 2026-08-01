@@ -34,14 +34,16 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use judged_core::veto::literal::{NeedleKind, NeedleStrategy};
 use judged_mutants::adapters::{deadcode, knip, shear, vulture};
 use judged_mutants::fixtures;
 use judged_mutants::mutant::{Ecosystem, Mutant};
+use judged_mutants::roots::{RescuedClaim, RootedSut};
 use judged_mutants::runner::{reads_mutant, run_suite, Grade, MutantReport, SuiteReport};
 use judged_mutants::sut::{
-    BlockedClaim, CommandSut, GateSet, NaiveSut, RefusingSut, Sut, SutVerdict, VetoRun, VetoedSut,
+    BlockedClaim, CommandSut, GateSet, NaiveSut, RefusingSut, Sut, SutVerdict, VetoedSut,
 };
 use serde_json::{json, Value};
 
@@ -208,24 +210,44 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
         }
     };
 
-    // Without `--veto` the run is over: `report` is what the bare accuser did,
-    // which is the number this suite has always published.
+    // Without a rescue layer the run is over: `report` is what the bare accuser
+    // did, which is the number this suite has always published.
     //
-    // With it, the suite is run a **second** time with §9.3's Gate 2 wrapped
+    // With one, the suite is run a **second** time with the layers wrapped
     // around the same analyzer, and the report becomes the difference between
     // the two. Two runs rather than one, and the extra analyzer time is the
-    // price: "how many false removals did the veto prevent" is a question about
-    // a pair of runs, and deriving it from one of them would mean assuming the
-    // answer.
-    let (report, veto) = if args.veto {
-        let gated_sut = VetoedSut::new(build_sut(&args.sut)).with_needles(args.needles);
-        let gated = match run_suite(&gated_sut, &mutants) {
+    // price: "how many false removals did this layer prevent" is a question
+    // about a pair of runs, and deriving it from one of them would mean assuming
+    // the answer.
+    //
+    // The layers are stacked **root set first**, and the order is an argument
+    // rather than a convenience: a candidate that IS a declared entry point is
+    // not a candidate at all, so there is nothing left for a reference veto to
+    // weigh. Each layer keeps its own per-claim record, which is what lets the
+    // report say which layer earned a rescue instead of publishing one combined
+    // number.
+    let (report, rescue) = if args.veto || args.roots {
+        let mut stacked: Box<dyn Sut> = build_sut(&args.sut);
+        let mut rooted: Option<Rc<RootedSut>> = None;
+        let mut vetoed: Option<Rc<VetoedSut>> = None;
+        if args.roots {
+            let layer = Rc::new(RootedSut::new(stacked));
+            stacked = Box::new(Rc::clone(&layer));
+            rooted = Some(layer);
+        }
+        if args.veto {
+            let layer = Rc::new(VetoedSut::new(stacked).with_needles(args.needles));
+            stacked = Box::new(Rc::clone(&layer));
+            vetoed = Some(layer);
+        }
+
+        let gated = match run_suite(stacked.as_ref(), &mutants) {
             Ok(gated) => gated,
             Err(error) => {
                 return (
                     render_refusal(
                         &Refusal {
-                            headline: "the veto-gated E2 suite did not complete".to_string(),
+                            headline: "the rescued E2 suite did not complete".to_string(),
                             detail: error.to_string(),
                             remedy: foreign_ecosystem_hint(sut.as_ref(), &mutants),
                         },
@@ -236,7 +258,21 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
                 )
             }
         };
-        match compare(&report, &gated, &gated_sut) {
+
+        let mut layers: Vec<Layer> = Vec::new();
+        if let Some(layer) = &rooted {
+            layers.push(roots_layer(layer));
+        }
+        if let Some(layer) = &vetoed {
+            layers.push(veto_layer(layer));
+        }
+        match compare(
+            &report,
+            &gated,
+            &layers,
+            vetoed.as_ref().map(|layer| layer.gates()),
+            args.needles,
+        ) {
             Ok(summary) => (gated, Some(summary)),
             Err(refusal) => return (render_refusal(&refusal, &args.sut, args.json), 2),
         }
@@ -257,44 +293,227 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
     };
 
     let rendered = if args.json {
-        render_json(&report, &catalogue, &args.sut, veto.as_ref())
+        render_json(&report, &catalogue, &args.sut, rescue.as_ref())
     } else {
-        render_text(&report, &catalogue, &args.sut, veto.as_ref())
+        render_text(&report, &catalogue, &args.sut, rescue.as_ref())
     };
     (rendered, code)
+}
+
+/// The root-set layer's accounting, normalized.
+///
+/// The gaps ride into the layer's `config` string rather than being dropped: a
+/// rescue count printed beside an unreported gap is the §6.20 shape — a layer
+/// that materialized five roots and missed a whole framework's convention set
+/// looks exactly like one that materialized five roots.
+fn roots_layer(layer: &RootedSut) -> Layer {
+    let runs = layer.runs();
+    let gaps: usize = runs.iter().map(|run| run.gaps.len()).sum();
+    let materialized: usize = runs.iter().map(|run| run.roots_materialized).sum();
+    Layer {
+        name: ROOTS,
+        config: format!(
+            "tiers A+B+C, {materialized} root(s) materialized across the catalogue, \
+             {gaps} unresolved"
+        ),
+        runs: runs
+            .iter()
+            .map(|run| LayerRun {
+                claimed: run.claimed,
+                survived: run.survived,
+                dropped: run.rescued.iter().map(Dropped::from_rescued).collect(),
+            })
+            .collect(),
+    }
+}
+
+/// Gate 2's accounting, normalized.
+fn veto_layer(layer: &VetoedSut) -> Layer {
+    Layer {
+        name: VETO,
+        config: format!(
+            "gates {}, needles {}",
+            layer
+                .gates()
+                .gates()
+                .into_iter()
+                .map(|gate| gate.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            describe_needles(layer.needles())
+        ),
+        runs: layer
+            .runs()
+            .iter()
+            .map(|run| LayerRun {
+                claimed: run.claimed,
+                survived: run.survived,
+                dropped: run.blocked.iter().map(Dropped::from_blocked).collect(),
+            })
+            .collect(),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // The trade
 // ---------------------------------------------------------------------------
 
-/// What Gate 2 changed on one class.
+/// One claim a rescue layer dropped, normalized across layers.
+///
+/// The two layers answer different questions and carry different evidence — a
+/// veto names the needle that fired and the file it fired in, a root names the
+/// §5.1 tier and the file and key that declared it — so the union of their
+/// fields is nullable in both directions. What is never null is `layer`: a
+/// report that cannot say **which layer earned a rescue** publishes a combined
+/// number, and §11 R1's question is about which signals earn their place.
+#[derive(Debug, Clone)]
+struct Dropped {
+    /// `roots` or `veto`.
+    layer: &'static str,
+    /// The claim, spelled exactly as the analyzer spelled it.
+    claim: String,
+    kind: &'static str,
+    /// Which sub-gate or which convention fired: `literal`, `django/appconfig`.
+    rule: String,
+    /// The veto's sub-gate, kept under its own key for a consumer that reads it.
+    /// `None` for a root-set rescue, which has no gate.
+    gate: Option<&'static str>,
+    /// The §5.1 tier a root came from. `None` for a veto rescue, which is not a
+    /// statement about entry points at all.
+    tier: Option<&'static str>,
+    /// The file and key that declared a root. `None` for a veto rescue.
+    origin: Option<String>,
+    needle: Option<String>,
+    needle_kind: Option<String>,
+    found_in: Option<PathBuf>,
+    declared_in: Option<PathBuf>,
+    detail: String,
+}
+
+impl Dropped {
+    fn from_blocked(record: &BlockedClaim) -> Dropped {
+        Dropped {
+            layer: VETO,
+            claim: record.claim.clone(),
+            kind: record.kind.as_str(),
+            rule: record.gate.as_str().to_string(),
+            gate: Some(record.gate.as_str()),
+            tier: None,
+            origin: None,
+            needle: record.needle.clone(),
+            needle_kind: record.needle_kind.clone(),
+            found_in: record.found_in.clone(),
+            declared_in: record.declared_in.clone(),
+            detail: record.detail.clone(),
+        }
+    }
+
+    fn from_rescued(record: &RescuedClaim) -> Dropped {
+        Dropped {
+            layer: ROOTS,
+            claim: record.claim.clone(),
+            kind: record.kind.as_str(),
+            rule: record.rule.clone(),
+            gate: None,
+            tier: Some(record.tier.label()),
+            origin: Some(record.origin.clone()),
+            needle: None,
+            needle_kind: None,
+            // The file the declaration lives in is the file a reader opens to
+            // check the rescue — the same role `found_in` plays for a veto.
+            found_in: record.origin_file.clone(),
+            declared_in: None,
+            detail: record.detail.clone(),
+        }
+    }
+}
+
+/// One rescue layer's accounting for one class.
+#[derive(Debug, Clone)]
+struct LayerRun {
+    /// Claims this layer was handed. For the inner-most layer that is what the
+    /// analyzer produced; for an outer one it is what the layer below passed
+    /// through.
+    claimed: usize,
+    survived: usize,
+    dropped: Vec<Dropped>,
+}
+
+/// One rescue layer, and everything it recorded across the run.
+#[derive(Debug, Clone)]
+struct Layer {
+    /// `roots` or `veto`.
+    name: &'static str,
+    /// The configuration that produced these numbers. A number obtained under
+    /// one configuration is not the number obtained under another (§11 R8).
+    config: String,
+    /// One entry per graded class, in run order.
+    runs: Vec<LayerRun>,
+}
+
+/// The `layer` tags, spelled once. They appear in JSON keys, in report lines and
+/// in the SUT name, and three spellings of the same layer is how a consumer ends
+/// up matching on the one this build does not emit.
+const ROOTS: &str = "roots";
+const VETO: &str = "veto";
+
+/// What one layer earned, over the whole run.
 #[derive(Debug)]
-struct VetoClass {
-    /// Live artifacts the bare run claimed and the gated run did not.
-    prevented: Vec<String>,
-    /// Genuinely-dead decoys the bare run found and the gated run did not.
+struct LayerLine {
+    name: &'static str,
+    config: String,
+    /// False removals **attributed to this layer**: the live artifacts that
+    /// stopped being claimed because *this* layer dropped the claim naming them.
+    prevented: usize,
+    /// §11 R8's flag rate, both halves, for this layer. Exact rather than
+    /// attributed — a layer knows what it was handed and what it dropped.
+    claims_judged: usize,
+    claims_dropped: usize,
+}
+
+/// What the rescue stack changed on one class.
+#[derive(Debug)]
+struct RescueClass {
+    /// Live artifacts the bare run claimed and the rescued run did not, each
+    /// with the layer that earned it — `None` when no layer's record names it,
+    /// which is a defect rather than a category and is counted as such.
+    prevented: Vec<(String, Option<&'static str>)>,
+    /// Genuinely-dead decoys the bare run found and the rescued run did not.
+    ///
+    /// Stack-level, and it cannot be otherwise: decoy recall is a **count** and
+    /// not a set, so there is no artifact name to attribute a loss to. Stated
+    /// rather than split with a guess.
     decoys_lost: usize,
-    /// How many claims Gate 2 was handed here — the denominator of §11 R8's flag
-    /// rate, whose numerator is [`Self::blocked`].
+    /// How many claims the **accuser** made here — the denominator of §11 R8's
+    /// flag rate, whose numerator is [`Self::blocked`].
     ///
     /// Published because R8's two requirements are *block on any hit* and *a
     /// tolerable flag rate*, and a rate cannot be checked against a report that
-    /// carries only the claims that fired. Taken from Gate 2's own accounting,
-    /// which [`compare_runs`] refuses to publish unless `survived + blocked`
-    /// equals it.
+    /// carries only the claims that fired. Taken from the inner-most layer's own
+    /// accounting, which [`compare_runs`] refuses to publish unless
+    /// `survived + dropped` equals it.
     claims_judged: usize,
-    /// Every claim Gate 2 dropped on this class, with its evidence.
-    blocked: Vec<BlockedClaim>,
+    /// Every claim any layer dropped on this class, with its evidence, each
+    /// tagged with the layer that dropped it.
+    blocked: Vec<Dropped>,
 }
 
 /// The whole trade, per class and in total.
 #[derive(Debug)]
-struct VetoSummary {
+struct RescueSummary {
+    /// The layers in force, inner-most first, each with what it earned.
+    layers: Vec<LayerLine>,
     /// Which sub-gates ran, and which needles Gate 2a derived. A number produced
     /// under one configuration is not the number produced under another (§11 R8).
+    /// Empty when the veto was not in the stack.
     gates: String,
     needles: String,
+    /// Prevented false removals no layer's record accounts for. Zero in a
+    /// healthy run: every artifact that stopped being claimed stopped because
+    /// some layer dropped the claim naming it. Published rather than folded into
+    /// the total, because a number nobody can attribute is exactly the combined
+    /// number this build exists to avoid.
+    unattributed: usize,
     /// Live artifacts rescued, and live artifacts still removed after the veto.
     prevented: usize,
     remaining: usize,
@@ -315,35 +534,31 @@ struct VetoSummary {
     claims_judged: usize,
     claims_blocked: usize,
     /// Keyed by mutant id, in catalogue order.
-    classes: Vec<(String, VetoClass)>,
+    classes: Vec<(String, RescueClass)>,
 }
 
-/// Diff a bare run against its veto-gated twin, and refuse to publish a
-/// comparison that violates the one property the layer has.
+/// Diff a bare run against its rescued twin, and refuse to publish a comparison
+/// that violates the one property every layer in the stack has.
 ///
-/// **Vetoing can only ever remove claims.** That is asserted in
-/// `judged-mutants/tests/veto_gate.rs` on the claim sets themselves; this is the
-/// same property re-checked on the graded output at the moment a report is
-/// about to be printed, because the report is what somebody acts on. A gate that
-/// added a false removal, or found a decoy the bare run missed, would mean the
-/// layer nominated rather than rescued — and there is no rendering of that which
-/// is safe to publish.
+/// **A rescue layer can only ever remove claims.** That is asserted in
+/// `judged-mutants/tests/veto_gate.rs` and `tests/roots_gate.rs` on the claim
+/// sets themselves; this is the same property re-checked on the graded output at
+/// the moment a report is about to be printed, because the report is what
+/// somebody acts on. A layer that added a false removal, or found a decoy the
+/// bare run missed, would mean it nominated rather than rescued — and there is
+/// no rendering of that which is safe to publish.
 ///
 /// The subset check is on the false-removal **sets**, never on their sizes: two
 /// runs can remove the same number of live artifacts without removing the same
 /// ones, and the sets are what carry the meaning.
 fn compare(
     bare: &SuiteReport,
-    gated: &SuiteReport,
-    gated_sut: &VetoedSut,
-) -> Result<VetoSummary, Refusal> {
-    compare_runs(
-        bare,
-        gated,
-        &gated_sut.runs(),
-        gated_sut.gates(),
-        gated_sut.needles(),
-    )
+    rescued: &SuiteReport,
+    layers: &[Layer],
+    gates: Option<GateSet>,
+    needles: NeedleStrategy,
+) -> Result<RescueSummary, Refusal> {
+    compare_runs(bare, rescued, layers, gates, needles)
 }
 
 /// [`compare`] over the values it reads, so the refusals above can be provoked
@@ -355,16 +570,16 @@ fn compare(
 fn compare_runs(
     bare: &SuiteReport,
     gated: &SuiteReport,
-    runs: &[VetoRun],
-    gates: GateSet,
+    layers: &[Layer],
+    gates: Option<GateSet>,
     needles: NeedleStrategy,
-) -> Result<VetoSummary, Refusal> {
+) -> Result<RescueSummary, Refusal> {
     let violation = |detail: String| Refusal {
-        headline: "the veto layer did not behave as a veto".to_string(),
+        headline: "a rescue layer did not behave as a veto".to_string(),
         detail,
         remedy: Some(
-            "This is a defect in Gate 2 or in the wrapper around it, not a \
-             finding about the analyzer. Nothing about this run may be reported \
+            "This is a defect in a rescue layer or in the wrapper around it, not \
+             a finding about the analyzer. Nothing about this run may be reported \
              until it is fixed."
                 .to_string(),
         ),
@@ -378,7 +593,7 @@ fn compare_runs(
         )));
     }
 
-    // Blocked claims are attributed to classes by run order: `run_suite` calls
+    // Dropped claims are attributed to classes by run order: `run_suite` calls
     // the SUT exactly once per graded class, in catalogue order, and skips the
     // rest before it materializes anything. If those two sequences ever stop
     // agreeing, the evidence would be printed beside the wrong class — so the
@@ -388,31 +603,57 @@ fn compare_runs(
         .iter()
         .filter(|row| row.grade != Grade::NotRead)
         .collect();
-    if runs.len() != graded.len() {
-        return Err(violation(format!(
-            "Gate 2 recorded {} runs but the report grades {} classes, so a \
-             blocked claim cannot be attributed to the class it came from",
-            runs.len(),
-            graded.len()
-        )));
-    }
-    // Keyed by class: how many claims Gate 2 was handed, and which of them it
-    // dropped. Both halves, because §11 R8's flag rate is a ratio and a report
-    // that carries only the numerator publishes a number nobody can check.
-    let mut blocked_by_class: Vec<(String, usize, Vec<BlockedClaim>)> = Vec::new();
-    for (row, run) in graded.iter().zip(runs.iter()) {
-        if run.survived + run.blocked.len() != run.claimed {
+    for layer in layers {
+        if layer.runs.len() != graded.len() {
             return Err(violation(format!(
-                "{}: Gate 2 was handed {} claims and accounted for {} of them",
-                row.mutant_id,
-                run.claimed,
-                run.survived + run.blocked.len()
+                "the {} layer recorded {} runs but the report grades {} classes, so a \
+                 rescued claim cannot be attributed to the class it came from",
+                layer.name,
+                layer.runs.len(),
+                graded.len()
             )));
         }
-        blocked_by_class.push((row.mutant_id.clone(), run.claimed, run.blocked.clone()));
+    }
+    // Keyed by class: how many claims the accuser made, and which claims each
+    // layer dropped. Both halves, because §11 R8's flag rate is a ratio and a
+    // report that carries only the numerator publishes a number nobody can
+    // check.
+    let mut blocked_by_class: Vec<(String, usize, Vec<Dropped>)> = Vec::new();
+    for (index, row) in graded.iter().enumerate() {
+        let mut dropped: Vec<Dropped> = Vec::new();
+        let mut handed: Option<usize> = None;
+        for layer in layers {
+            let run = &layer.runs[index];
+            if run.survived + run.dropped.len() != run.claimed {
+                return Err(violation(format!(
+                    "{}: the {} layer was handed {} claims and accounted for {} of them",
+                    row.mutant_id,
+                    layer.name,
+                    run.claimed,
+                    run.survived + run.dropped.len()
+                )));
+            }
+            // The stack has to compose: what one layer passed through is what
+            // the next was handed. If those disagree, the layers did not see the
+            // same claim set and no per-layer attribution below means anything.
+            if let Some(passed) = handed {
+                if passed != run.claimed {
+                    return Err(violation(format!(
+                        "{}: the {} layer was handed {} claims but the layer below it passed \
+                         {passed} through",
+                        row.mutant_id, layer.name, run.claimed
+                    )));
+                }
+            }
+            handed = Some(run.survived);
+            dropped.extend(run.dropped.iter().cloned());
+        }
+        // The accuser's own count: what the inner-most layer was handed.
+        let claimed = layers.first().map_or(0, |layer| layer.runs[index].claimed);
+        blocked_by_class.push((row.mutant_id.clone(), claimed, dropped));
     }
 
-    let mut classes: Vec<(String, VetoClass)> = Vec::new();
+    let mut classes: Vec<(String, RescueClass)> = Vec::new();
     for (before, after) in bare.reports.iter().zip(gated.reports.iter()) {
         if before.mutant_id != after.mutant_id {
             return Err(violation(format!(
@@ -454,10 +695,13 @@ fn compare_runs(
 
         classes.push((
             before.mutant_id.clone(),
-            VetoClass {
+            RescueClass {
+                // Attributed here rather than counted here: the layer that
+                // dropped the claim naming an artifact is the layer that earned
+                // it, and that is the whole answer §11 R1 asks for.
                 prevented: bare_removals
                     .difference(&gated_removals)
-                    .map(|name| (*name).to_string())
+                    .map(|name| ((*name).to_string(), attribute(name, &blocked)))
                     .collect(),
                 decoys_lost: before.decoys_found - after.decoys_found,
                 claims_judged,
@@ -468,32 +712,91 @@ fn compare_runs(
 
     let decoys_bare: usize = bare.reports.iter().map(|row| row.decoys_found).sum();
     let decoys_gated: usize = gated.reports.iter().map(|row| row.decoys_found).sum();
-    Ok(VetoSummary {
+    let prevented: Vec<(&String, Option<&'static str>)> = classes
+        .iter()
+        .flat_map(|(_, class)| class.prevented.iter().map(|(name, layer)| (name, *layer)))
+        .collect();
+    Ok(RescueSummary {
+        layers: layers
+            .iter()
+            .map(|layer| LayerLine {
+                name: layer.name,
+                config: layer.config.clone(),
+                prevented: prevented
+                    .iter()
+                    .filter(|(_, earned)| *earned == Some(layer.name))
+                    .count(),
+                // Over every run this layer made, not over the rows that
+                // survived into the report. See the field.
+                claims_judged: layer.runs.iter().map(|run| run.claimed).sum(),
+                claims_dropped: layer.runs.iter().map(|run| run.dropped.len()).sum(),
+            })
+            .collect(),
         gates: gates
-            .gates()
-            .into_iter()
-            .map(|gate| gate.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
-        needles: describe_needles(needles),
-        prevented: classes.iter().map(|(_, class)| class.prevented.len()).sum(),
+            .map(|gates| {
+                gates
+                    .gates()
+                    .into_iter()
+                    .map(|gate| gate.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default(),
+        needles: gates.map_or_else(String::new, |_| describe_needles(needles)),
+        unattributed: prevented
+            .iter()
+            .filter(|(_, earned)| earned.is_none())
+            .count(),
+        prevented: prevented.len(),
         remaining: gated.false_removal_count,
         decoys_bare,
         decoys_gated,
         decoys_lost: decoys_bare - decoys_gated,
         decoys_total: gated.reports.iter().map(|row| row.decoys_total).sum(),
-        // Over every run Gate 2 made, not over the rows that survived into the
-        // report. See the field.
-        claims_judged: runs.iter().map(|run| run.claimed).sum(),
-        claims_blocked: runs.iter().map(|run| run.blocked.len()).sum(),
+        claims_judged: layers
+            .first()
+            .map(|layer| layer.runs.iter().map(|run| run.claimed).sum())
+            .unwrap_or_default(),
+        claims_blocked: layers
+            .iter()
+            .flat_map(|layer| layer.runs.iter())
+            .map(|run| run.dropped.len())
+            .sum(),
         classes,
     })
 }
 
-impl VetoSummary {
-    /// What Gate 2 changed on one class, or `None` when it changed nothing and
-    /// the class has no row of its own.
-    fn class(&self, mutant_id: &str) -> Option<&VetoClass> {
+/// Which layer's rescue explains a live artifact that stopped being claimed.
+///
+/// Ground truth spells an artifact bare — a repo-relative path, or an unqualified
+/// symbol — and an analyzer spells its claim however its ecosystem does. The same
+/// trailing-segment rule [`judged_mutants::runner`] grades with is what joins the
+/// two, for the same reason: matching on equality alone would leave a rescue
+/// unattributed on a spelling difference, and an unattributed rescue is the
+/// combined number this report exists to avoid.
+///
+/// A claim dropped by one layer never reaches the next, so no single claim can
+/// be attributed twice. What can happen is two *different* claims naming one
+/// artifact — an analyzer claiming both `reporting/apps.py` and the symbol in it
+/// — with a different layer dropping each. The inner-most layer is credited
+/// then, which is the same order the stack ran in and is why the layer list is
+/// ordered rather than a set.
+fn attribute(artifact: &str, dropped: &[Dropped]) -> Option<&'static str> {
+    dropped
+        .iter()
+        .find(|record| {
+            record.claim == artifact
+                || ["::", ".", "/", "#"]
+                    .iter()
+                    .any(|sep| record.claim.ends_with(&format!("{sep}{artifact}")))
+        })
+        .map(|record| record.layer)
+}
+
+impl RescueSummary {
+    /// What the stack changed on one class, or `None` when it changed nothing
+    /// and the class has no row of its own.
+    fn class(&self, mutant_id: &str) -> Option<&RescueClass> {
         self.classes
             .iter()
             .find(|(id, _)| id == mutant_id)
@@ -501,6 +804,19 @@ impl VetoSummary {
             .filter(|class| {
                 !class.prevented.is_empty() || class.decoys_lost > 0 || !class.blocked.is_empty()
             })
+    }
+
+    /// What to call the stack in a summary line: the layer's own name when there
+    /// is one layer, and `rescue` when there are two.
+    ///
+    /// A single-layer run says `veto prevented:` because that is what prevented
+    /// it. A two-layer run must not, because it would be naming one layer for
+    /// the other's work.
+    fn stack_label(&self) -> &str {
+        match self.layers.as_slice() {
+            [only] => only.name,
+            _ => "rescue",
+        }
     }
 }
 
@@ -942,17 +1258,53 @@ fn disclosure(choice: &SutChoice) -> Option<Disclosure> {
 /// `null` means the analyzer named no file, so nothing was excluded and the
 /// rescue is unchecked in exactly that way; it is `null` rather than absent for
 /// the same reason as the fields above.
-fn blocked_json(record: &BlockedClaim) -> Value {
+/// `layer`, `tier` and `origin` are the root set's half of the same contract.
+/// A Tier B rescue is a guess about a framework, and a record that did not say
+/// so would present it with a manifest's confidence — which `judged_core::roots`
+/// names as worse than emitting no root at all.
+fn blocked_json(record: &Dropped) -> Value {
     json!({
+        "layer": record.layer,
         "claim": record.claim,
-        "kind": record.kind.as_str(),
-        "gate": record.gate.as_str(),
+        "kind": record.kind,
+        "rule": record.rule,
+        "gate": record.gate,
+        "tier": record.tier,
+        "origin": record.origin,
         "needle": record.needle,
         "needle_kind": record.needle_kind,
         "found_in": record.found_in.as_ref().map(|path| path.display().to_string()),
         "declared_in": record.declared_in.as_ref().map(|path| path.display().to_string()),
         "detail": record.detail,
     })
+}
+
+/// One layer's share of the stack's prevented false removals.
+fn layer_share(rescue: &RescueSummary, name: &str) -> usize {
+    rescue
+        .layers
+        .iter()
+        .find(|layer| layer.name == name)
+        .map_or(0, |layer| layer.prevented)
+}
+
+/// One layer's flag rate, both halves: claims handed to it, claims it dropped.
+fn layer_claims(rescue: &RescueSummary, name: &str) -> (usize, usize) {
+    rescue
+        .layers
+        .iter()
+        .find(|layer| layer.name == name)
+        .map_or((0, 0), |layer| (layer.claims_judged, layer.claims_dropped))
+}
+
+/// One layer's configuration, as the report states it back.
+fn layer_config(rescue: &RescueSummary, name: &str) -> String {
+    rescue
+        .layers
+        .iter()
+        .find(|layer| layer.name == name)
+        .map(|layer| layer.config.clone())
+        .unwrap_or_default()
 }
 
 /// The JSON spelling of a grade. Lower-case and stable, because a consumer will
@@ -1012,16 +1364,21 @@ fn totals(report: &SuiteReport) -> (usize, usize, usize) {
 
 /// What the report calls the system it measured.
 ///
-/// Under `--veto` the measured system is the analyzer **and** Gate 2, and the
-/// label says so. A gated run publishes a smaller false-removal count than the
-/// same analyzer bare, and two runs that reported the same `sut` would be
-/// compared as if the tool had improved.
-fn sut_label(choice: &SutChoice, veto: bool) -> String {
-    if veto {
-        format!("{}+veto", choice.label())
-    } else {
-        choice.label()
+/// Under a rescue layer the measured system is the analyzer **and** that layer,
+/// and the label says so, inner-most layer first — `naive+roots+veto`. A rescued
+/// run publishes a smaller false-removal count than the same analyzer bare, and
+/// two runs that reported the same `sut` would be compared as if the tool had
+/// improved.
+///
+/// Built from the summary's own layer list rather than from the flags, so the
+/// name and the numbers cannot disagree about which layers were in force.
+fn sut_label(choice: &SutChoice, rescue: Option<&RescueSummary>) -> String {
+    let mut label = choice.label();
+    for layer in rescue.map(|rescue| rescue.layers.as_slice()).unwrap_or(&[]) {
+        label.push('+');
+        label.push_str(layer.name);
     }
+    label
 }
 
 /// How many blocked claims a class shows in the text rendering before it stops
@@ -1037,7 +1394,7 @@ fn render_text(
     report: &SuiteReport,
     catalogue: &[(String, String, String)],
     choice: &SutChoice,
-    veto: Option<&VetoSummary>,
+    rescue: Option<&RescueSummary>,
 ) -> String {
     let classes = report.reports.len();
     let (passed, decoys_found, decoys_total) = totals(report);
@@ -1047,16 +1404,28 @@ fn render_text(
          \x20 Any \"dead\" verdict on an injected live artifact is a hard failure, not a tuning\n\
          \x20 opportunity (§10 E2). Decoys are genuinely-dead files planted beside them, so that\n\
          \x20 a tool which refuses to answer cannot score a perfect run.\n\n",
-        sut_label(choice, veto.is_some())
+        sut_label(choice, rescue)
     );
 
-    if let Some(veto) = veto {
-        out.push_str(&format!(
-            "Gate 2 (§9.3) ran on every claim this analyzer made: gates {}, needles {}.\n\
-             A veto can only RESCUE, never nominate, so the gated claim set is a subset of the\n\
-             bare one. Both halves of the trade are below: what it prevented, and what it cost.\n\n",
-            veto.gates, veto.needles
-        ));
+    if let Some(rescue) = rescue {
+        for layer in &rescue.layers {
+            out.push_str(&match layer.name {
+                ROOTS => format!(
+                    "The root set (§5) was materialized for every fixture and ran on every claim:\n\
+                     {}.\nA candidate that IS a declared or discovered root is never claimed \
+                     dead. Every rescue\ncarries the §5.1 tier it came from, because a Tier B \
+                     root is a guess about a framework.\n\n",
+                    layer.config
+                ),
+                _ => format!(
+                    "Gate 2 (§9.3) ran on every claim this analyzer made: {}.\n\
+                     A veto can only RESCUE, never nominate, so the gated claim set is a subset \
+                     of the\nbare one. Both halves of the trade are below: what it prevented, and \
+                     what it cost.\n\n",
+                    layer.config
+                ),
+            });
+        }
     }
 
     // Printed above the table rather than below the summary. §9.13 budgets a
@@ -1080,15 +1449,20 @@ fn render_text(
             // documented incident class it came from.
             out.push_str(&format!("       removed live: {removed}   [{research}]\n"));
         }
-        if let Some(class) = veto.and_then(|veto| veto.class(&row.mutant_id)) {
-            for rescued in &class.prevented {
+        if let Some(class) = rescue.and_then(|rescue| rescue.class(&row.mutant_id)) {
+            for (rescued, layer) in &class.prevented {
+                // The layer leads the line. Which layer earned a rescue is the
+                // finding — m10 is rescued by a Tier B convention and by nothing
+                // else, and a line that only said "rescued" would lose exactly
+                // that.
                 out.push_str(&format!(
-                    "       veto rescued live: {rescued}   [{research}]\n"
+                    "       {} rescued live: {rescued}   [{research}]\n",
+                    layer.unwrap_or("unattributed")
                 ));
             }
             if class.decoys_lost > 0 {
                 out.push_str(&format!(
-                    "       veto also rescued {} genuinely-dead decoy file(s) — the price\n",
+                    "       the stack also rescued {} genuinely-dead decoy file(s) — the price\n",
                     class.decoys_lost
                 ));
             }
@@ -1111,16 +1485,17 @@ fn render_text(
                     None => String::new(),
                 };
                 out.push_str(&format!(
-                    "       [{gate}] blocked {kind} {claim}{declared} — {detail}\n",
-                    gate = record.gate,
-                    kind = record.kind.as_str(),
+                    "       [{layer}/{rule}] rescued {kind} {claim}{declared} — {detail}\n",
+                    layer = record.layer,
+                    rule = record.rule,
+                    kind = record.kind,
                     claim = record.claim,
                     detail = record.detail,
                 ));
             }
             if class.blocked.len() > BLOCKED_SHOWN {
                 out.push_str(&format!(
-                    "       … and {} more blocked claim(s) on this class; --json lists every one\n",
+                    "       … and {} more rescued claim(s) on this class; --json lists every one\n",
                     class.blocked.len() - BLOCKED_SHOWN
                 ));
             }
@@ -1169,22 +1544,41 @@ fn render_text(
     // Printed together on purpose: a report showing only what the veto prevented
     // would be selling it, and §9.13 invariant 3 forbids presenting the flattering
     // number without the one that pays for it.
-    if let Some(veto) = veto {
+    if let Some(rescue) = rescue {
+        // One `prevented` line per layer, so a two-layer run cannot report one
+        // layer's rescues under the other's name. With a single layer this is
+        // the line it has always been.
+        for layer in &rescue.layers {
+            out.push_str(&format!(
+                "{} prevented: {} false removal(s) — {} bare, {} still removed after {}\n",
+                layer.name,
+                layer.prevented,
+                rescue.prevented + rescue.remaining,
+                rescue.remaining,
+                rescue.stack_label(),
+            ));
+        }
+        if rescue.unattributed > 0 {
+            // Never folded into a layer's column. An artifact that stopped being
+            // claimed with no layer's record naming it means the attribution
+            // join is broken, and a report that hid that would publish exactly
+            // the combined number this build exists to avoid.
+            out.push_str(&format!(
+                "unattributed: {} prevented false removal(s) no layer's record accounts for — \
+                 this is a defect in the report, not a property of the analyzer\n",
+                rescue.unattributed
+            ));
+        }
         out.push_str(&format!(
-            "veto prevented: {} false removal(s) — {} bare, {} still removed after Gate 2\n",
-            veto.prevented,
-            veto.prevented + veto.remaining,
-            veto.remaining,
+            "{} cost: {} decoy(s) lost — {} of {} found bare, {} of {} found after the stack\n",
+            rescue.stack_label(),
+            rescue.decoys_lost,
+            rescue.decoys_bare,
+            rescue.decoys_total,
+            rescue.decoys_gated,
+            rescue.decoys_total,
         ));
-        out.push_str(&format!(
-            "veto cost: {} decoy(s) lost — {} of {} found bare, {} of {} found gated\n",
-            veto.decoys_lost,
-            veto.decoys_bare,
-            veto.decoys_total,
-            veto.decoys_gated,
-            veto.decoys_total,
-        ));
-        if veto.decoys_gated == 0 && veto.decoys_bare > 0 {
+        if rescue.decoys_gated == 0 && rescue.decoys_bare > 0 {
             out.push_str(
                 "note: the gated combination found no genuinely-dead file at all. It reached this \
                  false-removal count the way a tool that refuses to answer reaches it, and §11 R1 \
@@ -1250,36 +1644,74 @@ fn render_json(
     report: &SuiteReport,
     catalogue: &[(String, String, String)],
     choice: &SutChoice,
-    veto: Option<&VetoSummary>,
+    rescue: Option<&RescueSummary>,
 ) -> String {
     let (passed, decoys_found, decoys_total) = totals(report);
+    let layer_names: Vec<&'static str> = rescue
+        .map(|rescue| rescue.layers.iter().map(|layer| layer.name).collect())
+        .unwrap_or_default();
 
     let mutants: Vec<Value> = report
         .reports
         .iter()
         .map(|row| {
             let (mechanism, research) = lookup(catalogue, &row.mutant_id);
-            let veto_row = veto
-                .and_then(|veto| veto.class(&row.mutant_id))
-                .map(|class| {
-                    json!({
-                        "prevented_false_removals": class.prevented,
-                        "decoys_lost": class.decoys_lost,
-                        // The flag rate's denominator (§11 R8), beside the
-                        // numerator below. Without it a published fire rate
-                        // cannot be re-derived from this report.
-                        "claims_judged": class.claims_judged,
-                        // Every one, uncapped. The text rendering shows the first
-                        // few; a machine gets the whole conflict list, because
-                        // §9.13 asks for a list somebody can check rather than a
-                        // score they have to believe.
-                        "blocked_claims": class
+            // One object per layer that ran, each carrying only that layer's own
+            // records. A reader asking "what did the root set earn here" must not
+            // have to filter a merged list, and a merged list is how a Tier B
+            // guess ends up counted as a reference the veto found.
+            let class = rescue.and_then(|rescue| rescue.class(&row.mutant_id));
+            // The key holding the claim list differs by layer, and deliberately:
+            // a veto BLOCKS a claim on evidence it went looking for, and a root
+            // set RESCUES one because the artifact was declared an entry point.
+            // Naming both "blocked" would flatten that back into one signal.
+            let layer_row = |name: &'static str, claims_key: &'static str| {
+                class.map(|class| {
+                    let mut object = serde_json::Map::new();
+                    object.insert(
+                        "prevented_false_removals".to_string(),
+                        json!(class
+                            .prevented
+                            .iter()
+                            .filter(|(_, earned)| *earned == Some(name))
+                            .map(|(artifact, _)| artifact.clone())
+                            .collect::<Vec<String>>()),
+                    );
+                    // Stack-level, and the key says so: decoy recall is a count
+                    // and not a set, so a lost decoy cannot be attributed to one
+                    // layer.
+                    object.insert(
+                        "decoys_lost_by_the_stack".to_string(),
+                        json!(class.decoys_lost),
+                    );
+                    // The flag rate's denominator (§11 R8), beside the numerator
+                    // below. Without it a published fire rate cannot be
+                    // re-derived from this report.
+                    object.insert("claims_judged".to_string(), json!(class.claims_judged));
+                    // Every one, uncapped. The text rendering shows the first
+                    // few; a machine gets the whole conflict list, because §9.13
+                    // asks for a list somebody can check rather than a score they
+                    // have to believe.
+                    object.insert(
+                        claims_key.to_string(),
+                        json!(class
                             .blocked
                             .iter()
+                            .filter(|record| record.layer == name)
                             .map(blocked_json)
-                            .collect::<Vec<Value>>(),
-                    })
-                });
+                            .collect::<Vec<Value>>()),
+                    );
+                    Value::Object(object)
+                })
+            };
+            let veto_row = layer_names
+                .contains(&VETO)
+                .then(|| layer_row(VETO, "blocked_claims"))
+                .flatten();
+            let roots_row = layer_names
+                .contains(&ROOTS)
+                .then(|| layer_row(ROOTS, "rescued_claims"))
+                .flatten();
             json!({
                 "id": row.mutant_id,
                 "ecosystem": ecosystem(row.ecosystem),
@@ -1298,6 +1730,7 @@ fn render_json(
                 "decoys_found": row.decoys_found,
                 "decoys_total": row.decoys_total,
                 "veto": veto_row,
+                "roots": roots_row,
             })
         })
         .collect();
@@ -1306,7 +1739,7 @@ fn render_json(
         // `vulture+veto`, not `vulture`, when Gate 2 ran. The measured system is
         // the pair, and a consumer comparing two runs under the same name would
         // read the veto's rescues as the analyzer having improved.
-        "sut": sut_label(choice, veto.is_some()),
+        "sut": sut_label(choice, rescue),
         // Absent for the two in-process controls, present for anything that
         // went through an adapter. A consumer that records `false_removal_count`
         // without it has recorded a number stripped of what bounds it.
@@ -1328,25 +1761,68 @@ fn render_json(
         "decoys_found": decoys_found,
         "decoys_total": decoys_total,
         "classes_with_false_removals": failing_classes(report),
-        // Absent without `--veto`, so a consumer can tell a gated report from a
-        // bare one by the presence of a key rather than by parsing a name.
-        "veto": veto.map(|veto| json!({
+        // Absent without a rescue layer, so a consumer can tell a rescued report
+        // from a bare one by the presence of a key rather than by parsing a
+        // name. The stack's view, and the one place where every number is
+        // consistent: `prevented + remaining == bare` always holds here, whereas
+        // a layer's own `false_removals_prevented` is that layer's SHARE.
+        "rescue": rescue.map(|rescue| json!({
+            "layers": rescue.layers.iter().map(|layer| json!({
+                "name": layer.name,
+                "config": layer.config,
+                "false_removals_prevented": layer.prevented,
+                "claims_judged": layer.claims_judged,
+                "claims_rescued": layer.claims_dropped,
+            })).collect::<Vec<Value>>(),
+            "false_removals_prevented": rescue.prevented,
+            // Zero in a healthy run. Published rather than folded into a layer's
+            // column, because a rescue nobody can attribute is the combined
+            // number this report exists to avoid.
+            "false_removals_prevented_unattributed": rescue.unattributed,
+            "false_removals_remaining": rescue.remaining,
+            "false_removals_bare": rescue.prevented + rescue.remaining,
+            "decoys_lost": rescue.decoys_lost,
+            "decoys_found_bare": rescue.decoys_bare,
+            "decoys_found_rescued": rescue.decoys_gated,
+            "decoys_total": rescue.decoys_total,
+            "claims_judged": rescue.claims_judged,
+            "claims_rescued": rescue.claims_blocked,
+        })),
+        // Absent without `--veto`. Its `false_removals_prevented` is Gate 2's
+        // OWN share of the stack's rescues; everything else in it is the stack's
+        // (a decoy loss cannot be attributed to one layer, see `RescueClass`).
+        "veto": layer_names.contains(&VETO).then_some(()).and(rescue).map(|rescue| json!({
             "enabled": true,
-            "gates": veto.gates,
-            "needles": veto.needles,
+            "gates": rescue.gates,
+            "needles": rescue.needles,
             // Both columns, always, and neither is derivable from the other.
-            "false_removals_prevented": veto.prevented,
-            "false_removals_remaining": veto.remaining,
-            "false_removals_bare": veto.prevented + veto.remaining,
-            "decoys_lost": veto.decoys_lost,
-            "decoys_found_bare": veto.decoys_bare,
-            "decoys_found_gated": veto.decoys_gated,
-            "decoys_total": veto.decoys_total,
+            "false_removals_prevented": layer_share(rescue, VETO),
+            "false_removals_remaining": rescue.remaining,
+            "false_removals_bare": rescue.prevented + rescue.remaining,
+            "decoys_lost": rescue.decoys_lost,
+            "decoys_found_bare": rescue.decoys_bare,
+            "decoys_found_gated": rescue.decoys_gated,
+            "decoys_total": rescue.decoys_total,
             // §11 R8's flag rate, both halves, over every claim Gate 2 saw.
             // Not summable from the per-class rows: a class where nothing
             // fired has no row and still had its claims judged.
-            "claims_judged": veto.claims_judged,
-            "claims_blocked": veto.claims_blocked,
+            "claims_judged": layer_claims(rescue, VETO).0,
+            "claims_blocked": layer_claims(rescue, VETO).1,
+        })),
+        // Absent without `--roots`, and shaped like the veto's so the two can be
+        // read side by side in a sweep.
+        "roots": layer_names.contains(&ROOTS).then_some(()).and(rescue).map(|rescue| json!({
+            "enabled": true,
+            "tiers": layer_config(rescue, ROOTS),
+            "false_removals_prevented": layer_share(rescue, ROOTS),
+            "false_removals_remaining": rescue.remaining,
+            "false_removals_bare": rescue.prevented + rescue.remaining,
+            "decoys_lost": rescue.decoys_lost,
+            "decoys_found_bare": rescue.decoys_bare,
+            "decoys_found_rescued": rescue.decoys_gated,
+            "decoys_total": rescue.decoys_total,
+            "claims_judged": layer_claims(rescue, ROOTS).0,
+            "claims_rescued": layer_claims(rescue, ROOTS).1,
         })),
         "mutants": mutants,
     });
@@ -1410,13 +1886,48 @@ mod tests {
     }
 
     /// One Gate 2 run over one class, blocking `blocked` of `claimed` claims.
-    fn veto_run(claimed: usize, blocked: Vec<BlockedClaim>) -> VetoRun {
-        VetoRun {
-            repo: PathBuf::from("/tmp/judged-e2-test"),
+    fn veto_run(claimed: usize, blocked: Vec<BlockedClaim>) -> LayerRun {
+        LayerRun {
             claimed,
             survived: claimed - blocked.len(),
-            blocked,
+            dropped: blocked.iter().map(Dropped::from_blocked).collect(),
         }
+    }
+
+    /// One root-set run over one class, rescuing `rescued` of `claimed` claims.
+    fn roots_run(claimed: usize, rescued: Vec<RescuedClaim>) -> LayerRun {
+        LayerRun {
+            claimed,
+            survived: claimed - rescued.len(),
+            dropped: rescued.iter().map(Dropped::from_rescued).collect(),
+        }
+    }
+
+    /// A Tier B convention root that rescued a claim — m10's shape, reduced.
+    fn rescued_by_convention(
+        claim: &str,
+        kind: judged_mutants::sut::ClaimKind,
+        rule: &str,
+    ) -> RescuedClaim {
+        RescuedClaim {
+            claim: claim.to_string(),
+            kind,
+            tier: judged_mutants::roots::Tier::B,
+            rule: rule.to_string(),
+            origin: "pyproject.toml#django in [project] dependencies".to_string(),
+            origin_file: Some(PathBuf::from("pyproject.toml")),
+            target: claim.to_string(),
+            detail: format!("django >=4.2 loads it by convention ({rule})"),
+        }
+    }
+
+    /// The layer list `run` builds, for a run with Gate 2 only.
+    fn veto_layer_of(runs: &[LayerRun]) -> Vec<Layer> {
+        vec![Layer {
+            name: VETO,
+            config: "gates literal, reachability, needles basename+stem".to_string(),
+            runs: runs.to_vec(),
+        }]
     }
 
     fn blocked_path(claim: &str, needle: &str, found_in: &str) -> BlockedClaim {
@@ -1448,12 +1959,12 @@ mod tests {
     }
 
     /// The bare/gated pair the CLI diffs, compared the way `run` compares it.
-    fn summary(bare: &SuiteReport, gated: &SuiteReport, runs: &[VetoRun]) -> VetoSummary {
+    fn summary(bare: &SuiteReport, gated: &SuiteReport, runs: &[LayerRun]) -> RescueSummary {
         compare_runs(
             bare,
             gated,
-            runs,
-            GateSet::default(),
+            &veto_layer_of(runs),
+            Some(GateSet::default()),
             judged_mutants::sut::DEFAULT_NEEDLES,
         )
         .expect("the fixture pair satisfies the invariant")
@@ -1981,8 +2492,8 @@ mod tests {
         let refusal = compare_runs(
             &bare,
             &gated,
-            &[veto_run(1, Vec::new())],
-            GateSet::default(),
+            &veto_layer_of(&[veto_run(1, Vec::new())]),
+            Some(GateSet::default()),
             judged_mutants::sut::DEFAULT_NEEDLES,
         )
         .expect_err("a gated run with a new false removal must not be reported");
@@ -2004,14 +2515,178 @@ mod tests {
         let refusal = compare_runs(
             &bare,
             &gated,
-            &[veto_run(0, Vec::new())],
-            GateSet::default(),
+            &veto_layer_of(&[veto_run(0, Vec::new())]),
+            Some(GateSet::default()),
             judged_mutants::sut::DEFAULT_NEEDLES,
         )
         .expect_err("a gated run cannot find more decoys than the bare run");
         assert!(
             refusal.detail.contains("cannot nominate"),
             "got {}",
+            refusal.detail
+        );
+    }
+
+    /// **Two layers, and every rescue attributed to the one that made it.**
+    ///
+    /// This is the whole reason `--roots` is a separate flag from `--veto`. m10
+    /// is the shape reduced here: a symbol nothing in the repository names, which
+    /// only a Tier B convention can rescue, beside a path a literal search
+    /// rescues the ordinary way. A report that summed the two would say "the
+    /// stack prevented 2" and answer none of §11 R1's question.
+    #[test]
+    fn each_rescue_is_attributed_to_the_layer_that_made_it() {
+        let bare = suite(
+            vec![
+                "reporting/apps.py".to_string(),
+                "ReportingConfig".to_string(),
+            ],
+            1,
+            1,
+        );
+        let rescued = suite(Vec::new(), 1, 1);
+
+        // The root set is handed both claims and rescues the AppConfig symbol;
+        // the veto is handed what survived and rescues the path.
+        let layers = vec![
+            Layer {
+                name: ROOTS,
+                config: "tiers A+B+C, 4 root(s) materialized, 0 unresolved".to_string(),
+                runs: vec![roots_run(
+                    2,
+                    vec![rescued_by_convention(
+                        "ReportingConfig",
+                        judged_mutants::sut::ClaimKind::Symbol,
+                        "django/appconfig",
+                    )],
+                )],
+            },
+            Layer {
+                name: VETO,
+                config: "gates literal, needles basename+stem".to_string(),
+                runs: vec![veto_run(
+                    1,
+                    vec![blocked_path(
+                        "reporting/apps.py",
+                        "apps",
+                        "billing/settings.py",
+                    )],
+                )],
+            },
+        ];
+
+        let summary = compare_runs(
+            &bare,
+            &rescued,
+            &layers,
+            Some(GateSet::default()),
+            judged_mutants::sut::DEFAULT_NEEDLES,
+        )
+        .expect("both layers only rescued");
+
+        assert_eq!(summary.prevented, 2);
+        assert_eq!(
+            summary.unattributed, 0,
+            "every prevented false removal has a layer's record naming it"
+        );
+        let by_layer: Vec<(&str, usize)> = summary
+            .layers
+            .iter()
+            .map(|layer| (layer.name, layer.prevented))
+            .collect();
+        assert_eq!(
+            by_layer,
+            vec![(ROOTS, 1), (VETO, 1)],
+            "one each, and the root set first: it is consulted before the veto"
+        );
+
+        let text = render_text(&rescued, &catalogue(), &SutChoice::Naive, Some(&summary));
+        for expected in ["roots prevented: 1", "veto prevented: 1", "rescue cost: "] {
+            assert!(
+                text.lines().any(|line| line.starts_with(expected)),
+                "no line starts with `{expected}`; got {text}"
+            );
+        }
+        // And the per-class line names the layer, because "rescued" alone loses
+        // the only thing this measurement is for.
+        assert!(
+            text.contains("roots rescued live: ReportingConfig"),
+            "got {text}"
+        );
+
+        let json: Value = serde_json::from_str(&render_json(
+            &rescued,
+            &catalogue(),
+            &SutChoice::Naive,
+            Some(&summary),
+        ))
+        .expect("the report is JSON");
+        assert_eq!(json["sut"], "naive+roots+veto");
+        assert_eq!(json["roots"]["false_removals_prevented"], 1);
+        assert_eq!(json["veto"]["false_removals_prevented"], 1);
+        assert_eq!(json["rescue"]["false_removals_prevented"], 2);
+        let record = &json["mutants"][0]["roots"]["rescued_claims"][0];
+        assert_eq!(record["layer"], ROOTS);
+        assert_eq!(record["tier"], "B");
+        assert_eq!(record["rule"], "django/appconfig");
+        assert_eq!(
+            record["origin"],
+            "pyproject.toml#django in [project] dependencies"
+        );
+        // The veto's own list holds only the veto's record. A merged list is how
+        // a guess about a framework ends up counted as a reference somebody
+        // found.
+        let blocked = json["mutants"][0]["veto"]["blocked_claims"]
+            .as_array()
+            .expect("the veto's list is present");
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0]["claim"], "reporting/apps.py");
+    }
+
+    /// The layers have to compose, and a report may not assume they did.
+    ///
+    /// What one layer passes through is what the next is handed. If those
+    /// disagree the two layers did not see the same claim set, and every
+    /// per-layer number below is measured against a denominator that does not
+    /// exist.
+    #[test]
+    fn layers_that_did_not_see_the_same_claim_set_are_refused() {
+        let bare = suite(vec!["x".to_string()], 1, 1);
+        let rescued = suite(Vec::new(), 1, 1);
+
+        let layers = vec![
+            Layer {
+                name: ROOTS,
+                config: "tiers A+B+C".to_string(),
+                // Rescues one of two, so it hands one claim through.
+                runs: vec![roots_run(
+                    2,
+                    vec![rescued_by_convention(
+                        "ReportingConfig",
+                        judged_mutants::sut::ClaimKind::Symbol,
+                        "django/appconfig",
+                    )],
+                )],
+            },
+            Layer {
+                name: VETO,
+                config: "gates literal".to_string(),
+                // ...and is handed two.
+                runs: vec![veto_run(2, vec![])],
+            },
+        ];
+
+        let refusal = compare_runs(
+            &bare,
+            &rescued,
+            &layers,
+            Some(GateSet::default()),
+            judged_mutants::sut::DEFAULT_NEEDLES,
+        )
+        .expect_err("a stack that did not compose is not reportable");
+        assert!(
+            refusal.detail.contains("passed"),
+            "the refusal has to name the disagreement; got {}",
             refusal.detail
         );
     }
@@ -2028,8 +2703,8 @@ mod tests {
             &bare,
             &gated,
             // One graded class, two recorded runs.
-            &[veto_run(1, Vec::new()), veto_run(1, Vec::new())],
-            GateSet::default(),
+            &veto_layer_of(&[veto_run(1, Vec::new()), veto_run(1, Vec::new())]),
+            Some(GateSet::default()),
             judged_mutants::sut::DEFAULT_NEEDLES,
         )
         .expect_err("a run count that disagrees with the report is not reportable");

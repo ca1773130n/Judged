@@ -21,6 +21,7 @@ mod args;
 mod clock;
 mod mutants_cmd;
 mod ratchet_cmd;
+mod roots_cmd;
 
 use std::io::Write;
 
@@ -31,6 +32,7 @@ fn main() {
         Ok(Invocation::Help) => (args::USAGE.to_string(), 0),
         Ok(Invocation::Ratchet(args)) => ratchet_cmd::run(&args),
         Ok(Invocation::Mutants(args)) => mutants_cmd::run(&args),
+        Ok(Invocation::ShowRoots(args)) => roots_cmd::run(&args),
         // A command line that could not be understood analyzed nothing, so it
         // takes the same exit as a refusal rather than the exit of a clean run.
         Err(error) => (format!("{}\n\n{}", error.message, args::USAGE), 2),

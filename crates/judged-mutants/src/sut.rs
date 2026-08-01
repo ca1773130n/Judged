@@ -258,6 +258,37 @@ pub trait Sut {
     }
 }
 
+/// A shared SUT is a SUT.
+///
+/// Rescue layers compose by **ownership**: [`VetoedSut`] takes a
+/// `Box<dyn Sut>`, and so does [`crate::roots::RootedSut`]. Stacking two of them
+/// therefore hands the inner layer away, and the inner layer is exactly what a
+/// report has to interrogate afterwards — each layer records which claims *it*
+/// dropped and why, and a report that cannot attribute a rescue to the layer
+/// that made it publishes a combined number §11 R1 cannot use.
+///
+/// So a caller keeps an [`std::rc::Rc`] and hands a clone on. `Rc` rather than
+/// `Arc` because the whole path is single-threaded by construction:
+/// [`crate::runner::run_suite`] drives one mutant at a time, which is the same
+/// reason the layers record their runs in a `RefCell`.
+impl<T: Sut + ?Sized> Sut for std::rc::Rc<T> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+
+    fn run(&self, repo: &Path) -> Result<SutVerdict> {
+        (**self).run(repo)
+    }
+
+    fn cannot_emit(&self) -> Vec<String> {
+        (**self).cannot_emit()
+    }
+
+    fn reads(&self) -> Option<&[Ecosystem]> {
+        (**self).reads()
+    }
+}
+
 /// Turns a tool's stdout into claims, or fails loudly.
 ///
 /// A plain `fn` pointer rather than a boxed closure, because this is the seam

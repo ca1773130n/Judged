@@ -14,6 +14,7 @@
 pub mod adapters;
 pub mod fixtures;
 pub mod mutant;
+pub mod roots;
 pub mod runner;
 pub mod sut;
 

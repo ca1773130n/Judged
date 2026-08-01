@@ -2201,3 +2201,442 @@ fn an_analyzer_that_fails_inside_its_own_language_still_stops_the_run() {
         .expect_says("13 of 19");
     expect_no_gate_result(&run);
 }
+
+// ---------------------------------------------------------------------------
+// judged show-roots — ProGuard `-printseeds`, which §9.13 asks for by name
+//
+// The root set does not decide what is reachable. §1.2: you cannot infer the
+// closed world, you can only have it declared. So what these tests hold the
+// command to is not a count but an audit: every root says which §5.1 tier it
+// came from and which file and key declared it, and everything the materializer
+// could NOT resolve is printed beside the successes. A root list showing only
+// what worked hides exactly the gaps a reader needs.
+// ---------------------------------------------------------------------------
+
+/// A repository with one root of each tier, and one gap.
+///
+/// - **A** — `package.json` declares a `bin`, which npm already reads to find an
+///   entry point.
+/// - **B** — a Django app: `INSTALLED_APPS` names the package, and the
+///   `AppConfig` subclass in `apps.py` is named nowhere but its own declaration.
+/// - **C** — `.judged/roots.toml` says a human knows something the repository
+///   cannot show.
+/// - the gap — `flask` is recognized and has no plugin, so its conventions are
+///   all missing.
+fn repo_with_roots_of_every_tier(label: &str) -> TempDir {
+    let scratch = scratch(label);
+    let root = scratch.path();
+    Repo::init(root).expect("scratch must be a git working tree");
+
+    write(
+        root,
+        "package.json",
+        r#"{
+  "name": "billing-web",
+  "version": "0.1.0",
+  "bin": { "billing": "bin/billing.js" }
+}
+"#,
+    );
+    write(root, "bin/billing.js", "#!/usr/bin/env node\n");
+    write(
+        root,
+        "pyproject.toml",
+        "[project]\nname = \"billing\"\nversion = \"0.1.0\"\n\
+         dependencies = [\"django>=4.2\", \"flask>=3\"]\n",
+    );
+    write(
+        root,
+        "billing/settings.py",
+        "INSTALLED_APPS = [\n    \"reporting\",\n]\n",
+    );
+    write(root, "reporting/__init__.py", "");
+    write(
+        root,
+        "reporting/apps.py",
+        "from django.apps import AppConfig\n\n\n\
+         class ReportingConfig(AppConfig):\n    name = \"reporting\"\n",
+    );
+    write(root, "ops/restore.sh", "#!/bin/sh\necho restore\n");
+    write(
+        root,
+        ".judged/roots.toml",
+        "[[root]]\npath = \"ops/restore.sh\"\n\
+         reason = \"run by hand during an incident; no caller exists in this repo\"\n\
+         kind = \"external\"\nstatus = \"accepted\"\n",
+    );
+    scratch
+}
+
+#[test]
+fn show_roots_prints_every_tier_with_the_file_and_key_that_declared_it() {
+    let repo = repo_with_roots_of_every_tier("show-roots");
+
+    let run = judged(repo.path(), &["show-roots"]);
+
+    run.expect_code(0, "materializing a root set is a report, not a gate")
+        // Tier A: npm already reads this key to find the entry point.
+        .expect_says("package.json#bin.billing")
+        // Tier B: the convention, named per RULE rather than per framework, so
+        // the report says *why* the file is a root (§11 R2 wants each rule's
+        // fire rate measurable rather than guessed).
+        .expect_says("django/appconfig")
+        .expect_says("reporting/apps.py")
+        // Tier C: the line in the committed file a reader goes to in order to
+        // argue with the declaration.
+        .expect_says(".judged/roots.toml:1")
+        .expect_says("ops/restore.sh");
+
+    // Grouped by tier, in decreasing order of confidence, each group labelled
+    // with the caveat that applies to it. A root that does not say which tier it
+    // came from is worse than no root.
+    assert!(
+        run.offset_of("# tier A") < run.offset_of("# tier B")
+            && run.offset_of("# tier B") < run.offset_of("# tier C"),
+        "roots must be grouped A, B, C — the tiers do not deserve equal trust:\n{}",
+        run.stdout
+    );
+    run.expect_says("correct only if the framework AND its version were detected correctly");
+}
+
+#[test]
+fn show_roots_prints_what_it_could_not_resolve() {
+    let repo = repo_with_roots_of_every_tier("show-roots-gaps");
+
+    let run = judged(repo.path(), &["show-roots"]);
+
+    // §6.20: "no data" must be a distinct state from "zero". Flask is
+    // recognized and uncovered, so every convention root it would have
+    // contributed is missing — and a report that showed only the roots it did
+    // find would be indistinguishable from one where flask has no roots.
+    run.expect_code(0, "a reported gap is not a refusal")
+        .expect_says("could not resolve")
+        .expect_says("framework-without-plugin")
+        .expect_says("flask");
+}
+
+#[test]
+fn show_roots_reports_a_declared_entry_that_matched_nothing() {
+    let repo = scratch("show-roots-rot");
+    Repo::init(repo.path()).expect("scratch must be a git working tree");
+    write(repo.path(), "src/main.py", "print('hi')\n");
+    write(
+        repo.path(),
+        ".judged/roots.toml",
+        "[[root]]\npath = \"tools/gone.py\"\n\
+         reason = \"kept for a migration that finished last year\"\n\
+         kind = \"external\"\nstatus = \"accepted\"\n",
+    );
+
+    let run = judged(repo.path(), &["show-roots"]);
+
+    // §5.3's rot detection: a suppression list without it is the off switch.
+    // The entry names an exact path that is not there, so it can never match
+    // again — the strongest statement available, and a pattern protecting
+    // nothing is a blind spot nobody is watching.
+    run.expect_code(0, "rot is reported, not refused")
+        .expect_says("declared-root-rot")
+        .expect_says("tools/gone.py");
+}
+
+#[test]
+fn show_roots_malformed_declarations_are_a_loud_gap_not_a_shorter_list() {
+    let repo = scratch("show-roots-malformed");
+    Repo::init(repo.path()).expect("scratch must be a git working tree");
+    write(repo.path(), "src/main.py", "print('hi')\n");
+    // No `reason`, which §5.3 makes mandatory: an entry without one is
+    // unreviewable.
+    write(
+        repo.path(),
+        ".judged/roots.toml",
+        "[[root]]\npath = \"src/main.py\"\nkind = \"external\"\n",
+    );
+
+    let run = judged(repo.path(), &["show-roots"]);
+
+    run.expect_says("declared-roots-malformed")
+        .expect_says("Every Tier C root is missing");
+}
+
+#[test]
+fn show_roots_json_carries_the_tier_and_the_origin_of_every_root() {
+    let repo = repo_with_roots_of_every_tier("show-roots-json");
+
+    let run = judged(repo.path(), &["show-roots", "--json"]);
+    run.expect_code(0, "the JSON rendering is the same report");
+
+    let report: Value =
+        serde_json::from_str(run.stdout.trim()).expect("--json emits a JSON document");
+
+    let roots = report["roots"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the report carries a roots array: {report}"));
+    assert!(!roots.is_empty(), "the fixture declares roots: {report}");
+
+    let mut tiers: Vec<&str> = Vec::new();
+    for root in roots {
+        let tier = root["tier"]
+            .as_str()
+            .unwrap_or_else(|| panic!("every root states its §5.1 tier: {root}"));
+        assert!(
+            ["A", "B", "C"].contains(&tier),
+            "a root that does not say which tier it came from is worse than no \
+             root: {root}"
+        );
+        assert!(
+            root["origin"].as_str().is_some_and(|o| !o.is_empty()),
+            "every root names the exact file and key it came from: {root}"
+        );
+        assert!(
+            root["rule"].as_str().is_some_and(|r| !r.is_empty()),
+            "every root says which rule produced it: {root}"
+        );
+        tiers.push(tier);
+    }
+    for tier in ["A", "B", "C"] {
+        assert!(
+            tiers.contains(&tier),
+            "the fixture declares a tier {tier} root and the report has none: {report}"
+        );
+    }
+
+    // The gaps are a first-class key, not prose. A consumer that reads
+    // `roots` without `gaps` has read a list of successes.
+    let gaps = report["gaps"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the report carries a gaps array: {report}"));
+    assert!(
+        gaps.iter()
+            .any(|gap| gap["kind"] == json!("framework-without-plugin")),
+        "flask is recognized and uncovered: {report}"
+    );
+    assert_eq!(
+        report["gap_count"],
+        json!(gaps.len()),
+        "the count and the list must agree: {report}"
+    );
+}
+
+#[test]
+fn show_roots_refuses_a_directory_it_could_not_read() {
+    let repo = scratch("show-roots-missing");
+
+    let run = judged(repo.path(), &["show-roots", "nowhere-at-all"]);
+
+    // Zero roots over zero files read is the absence of a scan wearing the
+    // digits of an empty repository (§6.20). It is refused rather than printed
+    // as a clean, empty root set.
+    run.expect_code(2, "a scan that read nothing has not produced a root set")
+        .expect_says("REFUSED");
+}
+
+#[test]
+fn help_documents_show_roots_as_printseeds() {
+    let repo = scratch("show-roots-help");
+
+    judged(repo.path(), &["--help"])
+        .expect_code(0, "help is requested, not provoked")
+        .expect_says("show-roots")
+        .expect_says("printseeds");
+}
+
+// ---------------------------------------------------------------------------
+// judged mutants --roots — the layer Gate 2 structurally cannot be
+//
+// §11 R1 asks whether any signal COMBINATION clears the catalogue. The veto and
+// the root set answer different questions — "does anything name this" against
+// "was this declared an entry point" — so they are separate flags. Four
+// configurations, each measurable: bare, --veto, --roots, both. A combined-only
+// flag would hide which layer earned a rescue.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn roots_rescue_independently_of_the_veto_and_each_layer_is_named() {
+    let repo = scratch("mutants-roots");
+
+    let bare: Value = {
+        let run = judged(repo.path(), &["mutants", "--sut", "naive", "--json"]);
+        serde_json::from_str(run.stdout.trim()).expect("--json emits JSON")
+    };
+    let run = judged(
+        repo.path(),
+        &["mutants", "--sut", "naive", "--roots", "--json"],
+    );
+    let rooted: Value =
+        serde_json::from_str(run.stdout.trim()).expect("--json emits JSON under --roots too");
+
+    assert_eq!(
+        rooted["sut"], "naive+roots",
+        "the measured system is the pair, and the name says which layer was in it"
+    );
+    assert!(
+        bare["roots"].is_null(),
+        "a bare run carries no roots key, so the two are told apart by presence"
+    );
+    assert!(
+        bare["veto"].is_null() && rooted["veto"].is_null(),
+        "--roots must not turn the veto on: the whole point is to attribute a \
+         rescue to the layer that made it"
+    );
+
+    let roots = &rooted["roots"];
+    let prevented = roots["false_removals_prevented"]
+        .as_u64()
+        .expect("false_removals_prevented is a number");
+    assert!(
+        prevented > 0,
+        "the root set rescued nothing across 19 classes, which means it did not \
+         run: {roots}"
+    );
+    assert_eq!(
+        prevented + roots["false_removals_remaining"].as_u64().unwrap(),
+        bare["false_removal_count"].as_u64().unwrap(),
+        "prevented + remaining must reconstruct the bare count exactly"
+    );
+    assert!(
+        rooted["false_removal_count"].as_u64() <= bare["false_removal_count"].as_u64(),
+        "a root set may only rescue: {rooted} against {bare}"
+    );
+    assert!(
+        roots["decoys_found_rescued"].as_u64() <= roots["decoys_found_bare"].as_u64(),
+        "a rescue layer cannot find a decoy the accuser missed: {roots}"
+    );
+
+    // Every rescue names its §5.1 tier and the file and key that declared it. A
+    // root that does not say which tier it came from invites a caller to trust a
+    // guessed convention as though a manifest had declared it.
+    let mut checked = 0usize;
+    for class in rooted["mutants"].as_array().expect("mutants is an array") {
+        let Some(rescued) = class["roots"]["rescued_claims"].as_array() else {
+            continue;
+        };
+        for record in rescued {
+            assert_eq!(record["layer"], json!("roots"), "got {record}");
+            let tier = record["tier"]
+                .as_str()
+                .unwrap_or_else(|| panic!("every rescue states its tier: {record}"));
+            assert!(["A", "B", "C"].contains(&tier), "got {record}");
+            assert!(
+                record["origin"].as_str().is_some_and(|o| !o.is_empty()),
+                "every rescue names the file and key that declared it: {record}"
+            );
+            assert!(
+                record["rule"].as_str().is_some_and(|r| !r.is_empty()),
+                "every rescue says which rule fired: {record}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no class recorded a rescue: {rooted}");
+
+    // And the human rendering states the trade at column zero, in the same shape
+    // the veto states it.
+    let text = judged(repo.path(), &["mutants", "--sut", "naive", "--roots"]);
+    for expected in ["roots prevented: ", "roots cost: "] {
+        assert!(
+            text.stdout.lines().any(|line| line.starts_with(expected)),
+            "no line starts with `{expected}`; got {}",
+            text.stdout
+        );
+    }
+}
+
+/// m10 is the class this whole layer exists for.
+///
+/// `ReportingConfig` occurs in `reporting/apps.py` and in no other file, because
+/// Django finds it by scanning that file for an `AppConfig` subclass. No tuning
+/// of Gate 2a's needles reaches that — there is no second occurrence to find —
+/// so if m10 is rescued at all it is rescued here, by a Tier B convention.
+#[test]
+fn the_report_says_which_layer_rescued_m10() {
+    let repo = scratch("mutants-roots-m10");
+
+    let run = judged(
+        repo.path(),
+        &["mutants", "--sut", "naive", "--roots", "--json"],
+    );
+    let report: Value = serde_json::from_str(run.stdout.trim()).expect("--json emits JSON");
+
+    let m10 = report["mutants"]
+        .as_array()
+        .expect("mutants is an array")
+        .iter()
+        .find(|class| class["id"] == json!("m10"))
+        .expect("the catalogue contains m10");
+
+    let rescued = m10["roots"]["rescued_claims"]
+        .as_array()
+        .unwrap_or_else(|| panic!("m10 records what the root set rescued: {m10}"));
+    let appconfig = rescued
+        .iter()
+        .find(|record| record["claim"] == json!("ReportingConfig"))
+        .unwrap_or_else(|| {
+            panic!(
+                "m10's AppConfig subclass is a Tier B convention root and the \
+                 only layer that can rescue it is this one: {m10}"
+            )
+        });
+    assert_eq!(appconfig["tier"], json!("B"));
+    assert_eq!(appconfig["rule"], json!("django/appconfig"));
+}
+
+/// Both layers at once, with each rescue still attributed to the layer that made
+/// it. A combined number cannot answer §11 R1's question, which is about which
+/// signals earn their place.
+#[test]
+fn both_layers_compose_and_the_report_attributes_each_rescue() {
+    let repo = scratch("mutants-roots-veto");
+
+    let run = judged(
+        repo.path(),
+        &["mutants", "--sut", "naive", "--roots", "--veto", "--json"],
+    );
+    let report: Value = serde_json::from_str(run.stdout.trim()).expect("--json emits JSON");
+
+    assert_eq!(
+        report["sut"], "naive+roots+veto",
+        "the name states the whole stack, inner layer first"
+    );
+    let rescue = &report["rescue"];
+    let layers = rescue["layers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the stack names its layers: {rescue}"));
+    assert_eq!(
+        layers
+            .iter()
+            .map(|layer| layer["name"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["roots", "veto"],
+        "the root set is consulted first: a candidate that IS a root is not a \
+         candidate at all, so there is nothing for a reference veto to weigh"
+    );
+    // Each layer's share, and the two must add up to the stack's total.
+    let by_layer: u64 = layers
+        .iter()
+        .map(|layer| layer["false_removals_prevented"].as_u64().unwrap_or(0))
+        .sum();
+    assert_eq!(
+        by_layer
+            + rescue["false_removals_prevented_unattributed"]
+                .as_u64()
+                .unwrap_or(0),
+        rescue["false_removals_prevented"].as_u64().unwrap(),
+        "every prevented false removal is attributed to a layer, or counted as \
+         unattributed — never quietly folded into a total: {rescue}"
+    );
+    assert_eq!(
+        rescue["false_removals_prevented"].as_u64().unwrap()
+            + rescue["false_removals_remaining"].as_u64().unwrap(),
+        rescue["false_removals_bare"].as_u64().unwrap(),
+    );
+}
+
+#[test]
+fn help_documents_roots_as_a_layer_of_its_own() {
+    let repo = scratch("mutants-roots-help");
+
+    judged(repo.path(), &["--help"])
+        .expect_code(0, "help is requested, not provoked")
+        .expect_says("--roots")
+        .expect_says("may only rescue");
+}

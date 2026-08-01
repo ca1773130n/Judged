@@ -64,6 +64,11 @@ const VERSION_SCRIPT: &str = "exports.map";
 /// so cargo never compiles it and no consumer can ever have linked it.
 const DECOY: &str = "src/deprecated_rounding.rs";
 
+/// The decoy's only definition, so a symbol-level analyzer — which never claims
+/// a path — is asked a question it can answer (see
+/// `GroundTruth::decoy_dead_symbols`).
+const DECOY_SYMBOL: &str = "half_to_even";
+
 impl Mutant for AbiConsumerExport {
     fn id(&self) -> &str {
         "m19"
@@ -200,6 +205,7 @@ pub fn half_to_even(value: f64) -> f64 {
             live_paths: vec![LIVE_FILE.into()],
             live_symbols: vec![LIVE_SYMBOL.to_string()],
             decoy_dead_paths: vec![DECOY.into()],
+            decoy_dead_symbols: vec![DECOY_SYMBOL.to_string()],
         })
     }
 }

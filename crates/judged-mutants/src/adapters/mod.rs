@@ -24,4 +24,7 @@
 //! Vulture it is not — the gap is stated in the adapter's own documentation and
 //! surfaced in the report, never quietly closed.
 
+pub mod deadcode;
+pub mod knip;
+pub mod shear;
 pub mod vulture;

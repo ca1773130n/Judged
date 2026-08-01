@@ -174,6 +174,14 @@ echo 'gone';
 impl GitignoreNegation {
     /// Repo-relative paths of the genuinely-dead files planted here.
     const DECOYS: [&'static str; 2] = ["lib/OldShippingCalculator.php", "pub/legacy_dispatch.php"];
+
+    /// The symbol each decoy defines, index-aligned with [`Self::DECOYS`].
+    ///
+    /// The second is `""` on purpose: the dead front controller is a file that
+    /// `echo`s and declares nothing, so it has no symbol route at all. Adding
+    /// one to make the class score better would invent a route no tool can
+    /// take.
+    const DECOY_SYMBOLS: [&'static str; 2] = ["OldShippingCalculator", ""];
 }
 
 impl Mutant for GitignoreNegation {
@@ -217,6 +225,10 @@ impl Mutant for GitignoreNegation {
                 .iter()
                 .map(Path::new)
                 .map(Path::to_path_buf)
+                .collect(),
+            decoy_dead_symbols: Self::DECOY_SYMBOLS
+                .iter()
+                .map(|symbol| (*symbol).to_string())
                 .collect(),
         })
     }

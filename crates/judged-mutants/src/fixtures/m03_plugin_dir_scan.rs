@@ -127,6 +127,10 @@ def hang_indent(text, width=72):
             live_paths: vec!["pluginhost/plugins/tsvwriter.py".into()],
             live_symbols: vec!["pluginhost.plugins.tsvwriter".to_string()],
             decoy_dead_paths: vec!["pluginhost/textwrap_helper.py".into()],
+            // Index-aligned with the decoy above: a symbol-level analyzer never
+            // claims a path, so without this it is never asked a question it
+            // can answer (see `GroundTruth::decoy_dead_symbols`).
+            decoy_dead_symbols: vec!["hang_indent".to_string()],
         })
     }
 }

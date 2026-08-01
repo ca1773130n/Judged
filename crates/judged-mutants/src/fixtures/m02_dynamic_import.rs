@@ -208,6 +208,11 @@ export function trackPageView(page: string): void {
 impl DynamicImport {
     /// Repo-relative paths of the genuinely-dead files planted here.
     const DECOYS: [&'static str; 2] = ["app/legacy_report_dump.py", "src/unusedAnalytics.ts"];
+
+    /// The symbol each decoy defines, index-aligned with [`Self::DECOYS`].
+    /// Without these a symbol-level analyzer scores zero decoys here and reads
+    /// as having found nothing (see `GroundTruth::decoy_dead_symbols`).
+    const DECOY_SYMBOLS: [&'static str; 2] = ["dump", "trackPageView"];
 }
 
 impl Mutant for DynamicImport {
@@ -248,6 +253,10 @@ impl Mutant for DynamicImport {
                 .iter()
                 .map(Path::new)
                 .map(Path::to_path_buf)
+                .collect(),
+            decoy_dead_symbols: Self::DECOY_SYMBOLS
+                .iter()
+                .map(|symbol| (*symbol).to_string())
                 .collect(),
         })
     }

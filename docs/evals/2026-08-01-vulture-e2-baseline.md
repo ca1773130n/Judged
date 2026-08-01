@@ -1,3 +1,12 @@
+> **SUPERSEDED, same day, by
+> [`2026-08-01-four-analyzers-e2.md`](2026-08-01-four-analyzers-e2.md).** That document
+> grades vulture, knip, deadcode and cargo-shear against all 19 classes and is the one to
+> read. Two numbers below are now wrong: decoy recall is **11 of 31**, not 0 of 31 — the
+> decoys have since been given symbols, and vulture is a symbol-level tool — and the
+> catalogue split is **11 classes vulture can read against 8 it cannot**, not 12 against 7.
+> Vulture's false removals are unchanged: 6, on m01, m10, m11 and m16. This file is kept
+> because it is the record of the first run against a shipped analyzer.
+
 # Vulture against the E2 catalogue — first real measurement
 
 **Date:** 2026-08-01 · **Tool:** vulture 2.16 · **Result: GATE FAILED — 6 false removals across 4 of the 12 classes vulture can actually read** (7 of the 19 are Rust/Go/TypeScript, which it never opened).

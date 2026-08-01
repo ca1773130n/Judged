@@ -161,6 +161,18 @@ server {
 impl CiManifestRef {
     /// Repo-relative paths of the genuinely-dead files planted here.
     const DECOYS: [&'static str; 2] = ["scripts/old_benchmark.sh", "deploy/unused_nginx.conf"];
+
+    /// Neither decoy has a symbol route, and that is the honest declaration
+    /// rather than a gap.
+    ///
+    /// A bash script whose body is two commands and an nginx `server` block
+    /// define nothing any symbol-level analyzer names. Inventing a function
+    /// here so the class scored better would be inventing a route no tool can
+    /// take — §9.2's adapter rule ("not more careful than the tool, and not
+    /// less") applied to a fixture. So m08 stays reachable by path alone, and a
+    /// symbol-only tool scoring 0/2 here is a fact about the class, not about
+    /// the tool.
+    const DECOY_SYMBOLS: [&'static str; 2] = ["", ""];
 }
 
 impl Mutant for CiManifestRef {
@@ -201,6 +213,10 @@ impl Mutant for CiManifestRef {
                 .iter()
                 .map(Path::new)
                 .map(Path::to_path_buf)
+                .collect(),
+            decoy_dead_symbols: Self::DECOY_SYMBOLS
+                .iter()
+                .map(|symbol| (*symbol).to_string())
                 .collect(),
         })
     }

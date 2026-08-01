@@ -198,6 +198,11 @@ impl ReadmeExecutedBlock {
     /// Repo-relative paths of the genuinely-dead files planted here. Neither
     /// is declared with `mod`, so neither is even compiled.
     const DECOYS: [&'static str; 2] = ["src/orphan_sparkline.rs", "src/unused_palette.rs"];
+
+    /// The symbol each decoy defines, index-aligned with [`Self::DECOYS`].
+    /// Without these a symbol-level analyzer scores zero decoys here and reads
+    /// as having found nothing (see `GroundTruth::decoy_dead_symbols`).
+    const DECOY_SYMBOLS: [&'static str; 2] = ["spark", "BRAND"];
 }
 
 impl Mutant for ReadmeExecutedBlock {
@@ -235,6 +240,10 @@ impl Mutant for ReadmeExecutedBlock {
             live_paths: vec![PathBuf::from(LIVE)],
             live_symbols: vec![LIVE_SYMBOL.to_string()],
             decoy_dead_paths: Self::DECOYS.iter().copied().map(PathBuf::from).collect(),
+            decoy_dead_symbols: Self::DECOY_SYMBOLS
+                .iter()
+                .map(|symbol| (*symbol).to_string())
+                .collect(),
         })
     }
 }

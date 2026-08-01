@@ -64,6 +64,11 @@ const CONSUMER: &str = "src/lib.rs";
 /// migration above only looks dead.
 const DECOY: &str = "src/checksum_v1.rs";
 
+/// The decoy's only definition, so a symbol-level analyzer — which never claims
+/// a path — is asked a question it can answer (see
+/// `GroundTruth::decoy_dead_symbols`).
+const DECOY_SYMBOL: &str = "crc16";
+
 impl Mutant for LinkTimeRegistry {
     fn id(&self) -> &str {
         "m17"
@@ -203,6 +208,7 @@ pub fn crc16(bytes: &[u8]) -> u16 {
             live_paths: vec![LIVE_FILE.into()],
             live_symbols: vec![LIVE_SYMBOL.to_string()],
             decoy_dead_paths: vec![DECOY.into()],
+            decoy_dead_symbols: vec![DECOY_SYMBOL.to_string()],
         })
     }
 }

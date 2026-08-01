@@ -161,6 +161,10 @@ pub fn run() -> i32 {
             live_paths: vec!["src/rotate_signing_key.rs".into()],
             live_symbols: vec!["rotate_signing_key::run".to_string()],
             decoy_dead_paths: vec!["src/parse_semver.rs".into()],
+            // Index-aligned with the decoy above: a symbol-level analyzer never
+            // claims a path, so without this it is never asked a question it
+            // can answer (see `GroundTruth::decoy_dead_symbols`).
+            decoy_dead_symbols: vec!["major".to_string()],
         })
     }
 }

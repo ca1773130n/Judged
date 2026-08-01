@@ -233,6 +233,11 @@ impl LinknameAlias {
         "internal/sampler/legacy_histogram.go",
         "internal/collector/unused_percentile.go",
     ];
+
+    /// The symbol each decoy defines, index-aligned with [`Self::DECOYS`].
+    /// Without these a symbol-level analyzer scores zero decoys here and reads
+    /// as having found nothing (see `GroundTruth::decoy_dead_symbols`).
+    const DECOY_SYMBOLS: [&'static str; 2] = ["legacyHistogram", "unusedPercentile"];
 }
 
 impl Mutant for LinknameAlias {
@@ -274,6 +279,10 @@ impl Mutant for LinknameAlias {
             live_paths: vec![PathBuf::from(LIVE), PathBuf::from(LIVE_ABI)],
             live_symbols: vec![LIVE_SYMBOL.to_string(), ABI_SYMBOL.to_string()],
             decoy_dead_paths: Self::DECOYS.iter().copied().map(PathBuf::from).collect(),
+            decoy_dead_symbols: Self::DECOY_SYMBOLS
+                .iter()
+                .map(|symbol| (*symbol).to_string())
+                .collect(),
         })
     }
 }

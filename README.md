@@ -62,7 +62,7 @@ or knip output do not exist yet; the contract they will be held to does.
 ### `judged mutants` — inject known-live artifacts and see what gets called dead
 
 ```sh
-judged mutants --sut naive|refusing|vulture [--json]
+judged mutants --sut naive|refusing|vulture|knip|deadcode|shear [--json]
 judged mutants --sut command [--json] -- <analyzer> [args...]
 ```
 
@@ -82,14 +82,37 @@ could not be run.
 | `naive` | A deliberately bad cleaner, shipped with the suite. The default, and the positive control. |
 | `refusing` | Calls nothing dead. The negative control. |
 | `vulture` | The installed `vulture`, invoked at its own defaults. |
+| `knip` | `npx knip@6`, reporting SARIF. |
+| `deadcode` | `golang.org/x/tools/cmd/deadcode`, reporting JSON. |
+| `shear` | `cargo-shear`, reporting JSON. |
 | `command` | Whatever argv follows `--`. |
 
-The last two are how a real analyzer gets in. The analyzer is run once per
-fixture repository, from inside it, and its stdout is read — that is the entire
-interaction. Judged never passes it a `--fix` mode and never lets it write:
-adapters are read-only and the orchestrator owns every mutation, so a deletion-
-shaped flag is refused wherever it appears, including inside the argv after
-`--`. `--sut vulture` uses vulture's own defaults rather than a tuned
+Everything below `refusing` is how a real analyzer gets in: four by name, and
+`command` for anything else, so adding a tool needs no code change. The analyzer
+is run once per fixture repository, from inside it, and its stdout is read —
+that is the entire interaction.
+
+**Today only `--sut vulture` produces a graded result for the whole catalogue.**
+The suite runs all 19 classes as one unit, and knip, deadcode and cargo-shear
+exit non-zero when handed a repository in the wrong language — an exit code each
+of them shares with a genuine analysis failure, so it cannot be declared healthy
+without scoring a crashed run as a clean one. All three therefore exit 2 and
+grade nothing. Vulture finds no Python and exits 0, so its run completes and the
+classes it cannot read are marked *not measured* per row. Until the runner can
+skip a class its analyzer declares it cannot read, the per-class numbers for the
+other three come from driving `run_suite` one class at a time; the eval write-up
+says so and shows the cross-check.
+
+Judged never passes an analyzer a `--fix` mode: a deletion-shaped flag is
+refused wherever it appears, including inside the argv after `--`. That is a
+claim about what Judged does, and it holds. It is **not** a claim that the
+analyzer does not write, and one of the four breaks that: `cargo shear` begins
+by running `cargo metadata`, which resolves the dependency graph and writes
+`Cargo.lock` — observed, not inferred, and no flag combination avoids it
+(`--frozen` prevents the write but then refuses to run). §9.2 forbids invoking a
+tool's fix mode and assumes the read path is inert; an analyzer that mutates
+while merely reading is a category it does not name. Judged discloses it rather
+than claiming it away. `--sut vulture` uses vulture's own defaults rather than a tuned
 `--min-confidence`, because a score obtained after picking the threshold that
 suits our own fixtures would be comparable to nothing; tuning is spelled
 `--sut command -- vulture --min-confidence 100`, which is honest about being a
@@ -155,19 +178,37 @@ analyzers, so what has been measured is the harness: it catches both failure
 directions, the cleaner that over-deletes and the cleaner that never speaks, and
 its 19 classes are discriminating enough to separate them.
 
-**One third-party analyzer has now been graded.** Vulture 2.16, at its own
-defaults, run against all 19 classes: **GATE FAILED, 6 false removals across 4
-classes** (m01, m10, m11, m16). Full write-up, including the raw output and the
-reproduction steps, in
-[`docs/evals/2026-08-01-vulture-e2-baseline.md`](docs/evals/2026-08-01-vulture-e2-baseline.md).
+**Four third-party analyzers have now been graded**, spanning every ecosystem the
+catalogue injects into — vulture 2.16 (Python), knip 6.31.0 (JS/TS), `x/tools`
+deadcode v0.48.0 (Go) and cargo-shear 1.13.3 (Rust):
 
-Read that number with its denominator. Vulture is a Python AST tool, so 7 of the
-19 classes are Rust, Go or TypeScript and it opened no file in them — it was not
-measured there, and the report says so per row. "4 of 19" is the wrong reading;
-the right one is 4 of the 12 classes it could actually see. §4.1's prior figure
-on other corpora — 44 true positives against 644 false positives across 9
-projects, 59 of them on httpx, which contains no dead code at all — is a
-different experiment and is not this number.
+| Tool | Classes it completed on | False removals | Decoy recall |
+| --- | --- | --- | --- |
+| vulture 2.16 | 19 (11 in its languages) | **6** — m01, m10, m11, m16 | 11/31 |
+| knip 6.31.0 | 3 | **2** — m02, m14 | 4/6 |
+| deadcode v0.48.0 | 1 | **2** — m12 | 2/2 |
+| cargo-shear 1.13.3 | 6 | **0** | 9/9 |
+
+**Ten false removals across the four. Five classes — m01, m11, m12, m14, m16 —
+are false-removed by every tool that can read them.** Full write-up, with raw
+output, the configuration sweep and the limits, in
+[`docs/evals/2026-08-01-four-analyzers-e2.md`](docs/evals/2026-08-01-four-analyzers-e2.md).
+
+Read the zero with more suspicion than the sixes. cargo-shear clears every class
+it reads, and it clears them because it answers two questions — is a declared
+dependency unused, is a file unreachable by `mod` declaration — neither of which
+can produce the claim that would be wrong. On m17 and m19 it names the decoy
+correctly and stays silent about the live artifact, but the live artifact is
+`mod`-declared and cargo-shear never asks whether a symbol has callers. A tool
+scores zero on this catalogue either by being right about reachability or by
+never claiming anything about it, and the decoys do not separate those two.
+
+Read each row with its denominator. 55 of the 76 tool×class cells are not
+results: 47 runs never completed, and 8 more are vulture completing without
+opening a file. §4.1's prior figure for vulture on other corpora — 44 true
+positives against 644 false positives across 9 projects, 59 of them on httpx,
+which contains no dead code at all — is a different experiment and is not this
+number.
 
 A bad score is a result, not a bug to tune out. Nothing in the fixtures, the
 adapter or the grading was adjusted after seeing it, and §11 R1's consequence is

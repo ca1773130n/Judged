@@ -42,6 +42,46 @@ pub struct GroundTruth {
     /// Files that really are dead. A tool that finds none of these has told us
     /// nothing, however safe it looks.
     pub decoy_dead_paths: Vec<PathBuf>,
+    /// The symbol each decoy defines, **index-aligned with
+    /// [`decoy_dead_paths`](Self::decoy_dead_paths)**: entry `i` is a symbol
+    /// defined by decoy `i`, and `""` means that decoy has no symbol route at
+    /// all.
+    ///
+    /// # Why this exists
+    ///
+    /// Without it, decoy recall asks a question only a *file*-level tool can
+    /// answer. A symbol-level analyzer never claims a path, so it scored zero of
+    /// every decoy in the catalogue — which reads on the scoreboard as "found
+    /// nothing" when the truth is "was never asked a question it could answer".
+    /// That is §6.20's category error ("no data" must be a distinct state from
+    /// "zero executions") committed by the suite's own positive control, and it
+    /// would be repeated by every symbol-level analyzer added after it.
+    ///
+    /// # One symbol per decoy, and what that costs
+    ///
+    /// A decoy usually defines several names — a module with a constant and a
+    /// function, a Kotlin `object` with a property. Exactly one is declared: the
+    /// file's primary definition, chosen from what the file *is* and never from
+    /// what some tool happens to print. A tool that names a different symbol in
+    /// the same file therefore earns no credit, so the recorded recall is a
+    /// **floor** on the tool's real recall.
+    ///
+    /// That asymmetry is deliberate and it points the same way as
+    /// [`live_symbols`](Self::live_symbols) matching: understating recall makes
+    /// a working tool look more like one that refuses to answer, which pushes
+    /// §11 R1 toward *deleting* the auto-act tier. Overstating it would push
+    /// toward shipping one. Only the first error is survivable.
+    ///
+    /// # `""` is a route that does not exist, not a missing declaration
+    ///
+    /// Four of the catalogue's thirty-one decoys define nothing a symbol-level
+    /// analyzer could name: a bash script, an nginx config, a second PHP front
+    /// controller that only `echo`s, and a minified bundle whose only function
+    /// is a single letter inside an IIFE. Inventing a symbol for those would be
+    /// inventing a route no tool can take — the adapter rule of §9.2 ("not more
+    /// careful than the tool, and not less") applied to the fixtures. They are
+    /// declared `""` and are reachable by path alone.
+    pub decoy_dead_symbols: Vec<String>,
 }
 
 /// One injected liveness mechanism.

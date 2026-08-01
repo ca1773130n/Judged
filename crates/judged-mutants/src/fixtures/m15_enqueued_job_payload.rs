@@ -159,6 +159,10 @@ def test_app_is_configured():
             live_paths: vec!["worker/tasks.py".into()],
             live_symbols: vec!["RebuildInvoiceIndex".to_string()],
             decoy_dead_paths: vec!["worker/textwrap_helper.py".into()],
+            // Index-aligned with the decoy above: a symbol-level analyzer never
+            // claims a path, so without this it is never asked a question it
+            // can answer (see `GroundTruth::decoy_dead_symbols`).
+            decoy_dead_symbols: vec!["hang_indent".to_string()],
         })
     }
 }

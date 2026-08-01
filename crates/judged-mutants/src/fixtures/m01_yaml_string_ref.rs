@@ -170,6 +170,12 @@ impl YamlStringRef {
         "ledger/legacy_invoice_dump.py",
         "ledger/unused_currency_table.py",
     ];
+
+    /// The symbol each decoy defines, index-aligned with [`Self::DECOYS`], so a
+    /// symbol-level analyzer is asked a question it can answer. Without these a
+    /// tool that only ever names symbols scores zero decoys and reads as having
+    /// found nothing (see `GroundTruth::decoy_dead_symbols`).
+    const DECOY_SYMBOLS: [&'static str; 2] = ["dump_invoices", "RATES"];
 }
 
 impl Mutant for YamlStringRef {
@@ -210,6 +216,10 @@ impl Mutant for YamlStringRef {
                 .iter()
                 .map(Path::new)
                 .map(Path::to_path_buf)
+                .collect(),
+            decoy_dead_symbols: Self::DECOY_SYMBOLS
+                .iter()
+                .map(|symbol| (*symbol).to_string())
                 .collect(),
         })
     }

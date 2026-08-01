@@ -193,6 +193,11 @@ impl ConcurrencyHelper {
     /// Repo-relative paths of the genuinely-dead files planted here. Neither
     /// is declared with `mod`, so neither is even compiled.
     const DECOYS: [&'static str; 2] = ["src/orphan_backoff.rs", "src/unused_priority_lane.rs"];
+
+    /// The symbol each decoy defines, index-aligned with [`Self::DECOYS`].
+    /// Without these a symbol-level analyzer scores zero decoys here and reads
+    /// as having found nothing (see `GroundTruth::decoy_dead_symbols`).
+    const DECOY_SYMBOLS: [&'static str; 2] = ["delay_ms", "LANES"];
 }
 
 impl Mutant for ConcurrencyHelper {
@@ -230,6 +235,10 @@ impl Mutant for ConcurrencyHelper {
             live_paths: vec![PathBuf::from(LIVE)],
             live_symbols: vec![LIVE_SYMBOL.to_string()],
             decoy_dead_paths: Self::DECOYS.iter().map(PathBuf::from).collect(),
+            decoy_dead_symbols: Self::DECOY_SYMBOLS
+                .iter()
+                .map(|symbol| (*symbol).to_string())
+                .collect(),
         })
     }
 }

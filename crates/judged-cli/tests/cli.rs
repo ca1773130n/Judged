@@ -19,6 +19,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use judged_core::git::Repo;
+// The adapters' own disclosure constants, asserted verbatim rather than
+// paraphrased: a test that retyped the prose would keep passing after the
+// adapter reworded what the report actually prints.
+use judged_mutants::adapters::{deadcode, knip, shear};
 use judged_ratchet::baseline::BASELINE_PATH;
 use serde_json::{json, Value};
 use tempfile::{Builder, TempDir};
@@ -1413,9 +1417,17 @@ fn an_analyzer_argv_may_not_smuggle_in_a_deletion_flag() {
 fn an_unknown_sut_lists_every_one_that_exists() {
     let repo = scratch("sut-unknown");
 
-    let run = judged(repo.path(), &["mutants", "--sut", "knip"]);
+    // `periphery` rather than `knip`: knip used to stand in for "a tool judged
+    // has heard of but cannot run", and it is now one of the options. The
+    // stand-in has to be a tool that is genuinely not wired, or this test
+    // asserts nothing.
+    let run = judged(repo.path(), &["mutants", "--sut", "periphery"]);
     run.expect_code(2, "an unknown SUT is a usage error");
-    for known in ["naive", "refusing", "vulture", "command"] {
+    // The message is the discovery surface for this flag: an option missing
+    // from it is an option nobody finds.
+    for known in [
+        "naive", "refusing", "vulture", "knip", "deadcode", "shear", "command",
+    ] {
         run.expect_says(known);
     }
 }
@@ -1452,4 +1464,312 @@ fn there_are_two_subcommands_and_the_help_says_so() {
     judged(repo.path(), &["clean"])
         .expect_code(2, "there is no `judged clean`")
         .expect_says("ratchet");
+}
+
+// ---------------------------------------------------------------------------
+// The three ecosystem-specific analyzers: knip (JS/TS), deadcode (Go),
+// cargo-shear (Rust).
+//
+// §11 R1 — whether an auto-act tier may exist at all — is answered by E2, and
+// E2 answered against Vulture alone answers it for Python. These three are what
+// open the other seven classes. Every test below is about the *wiring*: that
+// the option exists, that an absent binary is refused rather than graded, and
+// that the language map counts the classes the tool never opened out of the
+// score.
+// ---------------------------------------------------------------------------
+
+/// The `PATH` a shim directory makes, with the machine's own `PATH` behind it.
+///
+/// The ambient tail matters for the shims: `/bin/sh` has to stay findable, and
+/// so does whatever a wrapper argv execs.
+fn path_with(dir: &Path) -> String {
+    format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// A shim standing in for knip, printing knip's real empty-result log.
+///
+/// Captured verbatim from `npx --yes knip@6 --reporter sarif --no-progress
+/// --directory <dir>` (knip 6.31.0) against a project with nothing unused. That
+/// run exits 0, and the log is a complete SARIF document with an empty
+/// `results` array — not an empty stream, which the adapter would reject.
+const KNIP_EMPTY_SARIF_SHIM: &str = concat!(
+    "#!/bin/sh\ncat <<'SARIF'\n",
+    r#"{"$schema":"https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"knip","version":"6.31.0","semanticVersion":"6.31.0","informationUri":"https://knip.dev","rules":[]}},"results":[]}]}"#,
+    "\nSARIF\nexit 0\n"
+);
+
+/// A shim standing in for deadcode, printing deadcode's real empty result.
+///
+/// Captured verbatim from `deadcode -json <dir>/...` against a Go module with
+/// nothing dead: the literal four bytes `null`, with no trailing newline,
+/// because Go marshals a nil slice as `null` rather than `[]`. Exit 0.
+const DEADCODE_EMPTY_SHIM: &str = "#!/bin/sh\nprintf 'null'\nexit 0\n";
+
+/// A shim standing in for cargo-shear, printing its real empty result.
+///
+/// Captured verbatim from `cargo-shear --format json <dir>` against a crate
+/// with nothing unused. Exit 0, and note that the summary counters are present
+/// and zero — the adapter rejects a document whose counters disagree with the
+/// findings array.
+const SHEAR_EMPTY_SHIM: &str = concat!(
+    "#!/bin/sh\ncat <<'JSON'\n",
+    "{\n  \"summary\": {\n    \"errors\": 0,\n    \"warnings\": 0,\n    \"fixed\": 0\n  },\n",
+    "  \"findings\": []\n}\n",
+    "JSON\nexit 0\n"
+);
+
+#[test]
+fn every_named_analyzer_refuses_loudly_when_it_is_not_installed() {
+    // The same guard vulture already has, extended to the three new options,
+    // and the reason it is written before the wiring: `CommandSut::run` turns a
+    // spawn failure into an empty verdict, an empty verdict is zero false
+    // removals, and zero false removals is "GATE PASSED" and exit 0. A green
+    // build certifying an analyzer that is not on the machine is §6.20's
+    // disarming failure, so each new SUT has to be refused at preflight before
+    // anything else runs.
+    //
+    // The install hint is asserted too. §9.13's presentation rules are about
+    // what a human does next, and "deadcode is not installed" without the
+    // command that installs it makes the reader go and find out.
+    for (sut, binary, hint) in [
+        ("knip", "npx", "Node.js"),
+        (
+            "deadcode",
+            "deadcode",
+            "go install golang.org/x/tools/cmd/deadcode",
+        ),
+        ("shear", "cargo-shear", "cargo install cargo-shear"),
+    ] {
+        let repo = scratch(&format!("{sut}-missing"));
+        let nothing = empty_path(&format!("{sut}-missing-path"));
+
+        let run = judged_with_path(
+            repo.path(),
+            &["mutants", "--sut", sut],
+            Some(nothing.path()),
+        );
+
+        run.expect_code(2, "an analyzer that is not installed analyzed nothing")
+            .expect_says(binary)
+            .expect_says("not installed")
+            .expect_says(hint);
+        expect_no_gate_result(&run);
+    }
+}
+
+#[test]
+fn a_missing_analyzer_refuses_in_json_for_every_named_sut() {
+    // The rendering a dashboard reads. `--json` changes the rendering, never
+    // the verdict, and a refusal must not emit the keys a consumer would read
+    // as a score — a zero here and a zero from a real clean run are the same
+    // bytes.
+    for sut in ["knip", "deadcode", "shear"] {
+        let repo = scratch(&format!("{sut}-missing-json"));
+        let nothing = empty_path(&format!("{sut}-missing-json-path"));
+
+        let run = judged_with_path(
+            repo.path(),
+            &["mutants", "--sut", sut, "--json"],
+            Some(nothing.path()),
+        );
+
+        run.expect_code(2, "--json must not launder a refusal into a result");
+        assert!(
+            !run.stdout.contains("\"gate_passed\""),
+            "a refusal must not emit a gate verdict for --sut {sut}. Report was:\n{}",
+            run.stdout
+        );
+        assert!(
+            !run.stdout.contains("\"false_removal_count\""),
+            "a refusal must not emit a false-removal count for --sut {sut}. Report was:\n{}",
+            run.stdout
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn knip_is_run_and_its_unread_classes_are_counted_out_of_the_score() {
+    // The other half of the guard: a shim on PATH must produce a real report,
+    // or the refusal test above would pass against a feature that never works.
+    //
+    // The shim emits knip's real empty-result SARIF, captured from
+    // `npx knip@6 --reporter sarif --no-progress` against a project with
+    // nothing unused (knip 6.31.0, exit 0). It claims nothing, so what is
+    // under test is the language map: knip reads TypeScript and Polyglot, so
+    // the twelve classes in the other three ecosystems must be marked and
+    // subtracted from the denominator rather than scored as passes.
+    let repo = scratch("knip-present");
+    let bin = scratch("knip-present-path");
+    shim(bin.path(), "npx", KNIP_EMPTY_SARIF_SHIM);
+
+    let run = judged_with_path(
+        repo.path(),
+        &["mutants", "--sut", "knip"],
+        Some(Path::new(&path_with(bin.path()))),
+    );
+
+    run.expect_code(0, "an analyzer that claims nothing has no false removals")
+        .expect_says("knip")
+        .expect_says("[NOT READ by this SUT]")
+        // Six of nineteen classes are TypeScript or Polyglot; the other
+        // thirteen are Python, Rust or Go, and knip opened no file in them.
+        .expect_says("not measured: 13 of 19 classes")
+        .expect_says("decoy recall:");
+    expect_every_class_is_reported(&run);
+}
+
+#[cfg(unix)]
+#[test]
+fn deadcode_reads_go_and_nothing_else() {
+    // One Go class in the catalogue (m12), so eighteen are unread. The shim
+    // emits deadcode's real empty result — the literal four bytes `null`, which
+    // is what Go's encoder writes for a nil slice — captured from
+    // `deadcode -json` against a module with nothing dead (x/tools, exit 0).
+    let repo = scratch("deadcode-present");
+    let bin = scratch("deadcode-present-path");
+    shim(bin.path(), "deadcode", DEADCODE_EMPTY_SHIM);
+
+    let run = judged_with_path(
+        repo.path(),
+        &["mutants", "--sut", "deadcode"],
+        Some(Path::new(&path_with(bin.path()))),
+    );
+
+    run.expect_code(0, "an analyzer that claims nothing has no false removals")
+        .expect_says("deadcode")
+        .expect_says("not measured: 18 of 19 classes");
+    expect_every_class_is_reported(&run);
+}
+
+#[cfg(unix)]
+#[test]
+fn shear_reads_rust_and_nothing_else() {
+    // Six Rust classes, so thirteen are unread. The shim emits cargo-shear's
+    // real empty result, captured from `cargo-shear --format json` against a
+    // crate with nothing unused (exit 0).
+    let repo = scratch("shear-present");
+    let bin = scratch("shear-present-path");
+    shim(bin.path(), "cargo-shear", SHEAR_EMPTY_SHIM);
+
+    let run = judged_with_path(
+        repo.path(),
+        &["mutants", "--sut", "shear"],
+        Some(Path::new(&path_with(bin.path()))),
+    );
+
+    run.expect_code(0, "an analyzer that claims nothing has no false removals")
+        .expect_says("cargo-shear")
+        .expect_says("not measured: 13 of 19 classes");
+    expect_every_class_is_reported(&run);
+}
+
+#[cfg(unix)]
+#[test]
+fn every_named_analyzer_discloses_its_capability_envelope_before_the_rows() {
+    // §9.2's second non-SARIF clause: an adapter declares what the tool
+    // structurally cannot emit, so the orchestrator knows when its silence
+    // means anything. A score published without it is a score somebody reads as
+    // the tool's blast radius when it is the adapter's floor on it.
+    // Asserted against the adapters' own constants rather than against a phrase
+    // retyped here, so that an adapter which reworded its envelope cannot leave
+    // this test passing on prose the report no longer prints.
+    for (sut, binary, body, envelope, mapping) in [
+        (
+            "knip",
+            "npx",
+            KNIP_EMPTY_SARIF_SHIM,
+            knip::CAPABILITY_ENVELOPE,
+            knip::MAPPING_DECISION,
+        ),
+        (
+            "deadcode",
+            "deadcode",
+            DEADCODE_EMPTY_SHIM,
+            deadcode::CAPABILITY_ENVELOPE,
+            deadcode::MAPPING_DECISION,
+        ),
+        (
+            "shear",
+            "cargo-shear",
+            SHEAR_EMPTY_SHIM,
+            shear::CAPABILITY_ENVELOPE,
+            shear::MAPPING_DECISION,
+        ),
+    ] {
+        let repo = scratch(&format!("{sut}-envelope"));
+        let bin = scratch(&format!("{sut}-envelope-path"));
+        shim(bin.path(), binary, body);
+
+        let run = judged_with_path(
+            repo.path(),
+            &["mutants", "--sut", sut],
+            Some(Path::new(&path_with(bin.path()))),
+        );
+
+        run.expect_code(0, "the shim claims nothing")
+            .expect_says(envelope)
+            // The mapping decision too: it is what says which half of a verdict
+            // the adapter fills, and a count read without it is read as the
+            // tool's blast radius when it is the adapter's floor on it.
+            .expect_says(mapping);
+        assert!(
+            run.offset_of(envelope) < run.offset_of("  m01"),
+            "the envelope must be printed before the class rows for --sut {sut}, \
+             or a CI log tail shows the numbers with nothing bounding them. \
+             Report was:\n{}",
+            run.stdout
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_analyzer_that_refuses_a_repository_outside_its_own_language_says_so() {
+    // Measured, and the finding this round produced: none of the three
+    // ecosystem-specific analyzers *tolerates* a repository outside its
+    // ecosystem the way vulture does. Vulture finds no `.py` files and exits 0;
+    // knip exits 2 with `Unable to find package.json`, cargo-shear exits 2 with
+    // `could not find Cargo.toml`, deadcode exits 1 with `packages contain
+    // errors`. The suite runs every class against the selected SUT, so the
+    // first such class stops the run.
+    //
+    // Refusing is the correct behaviour — the alternative is declaring those
+    // exit codes healthy, and each of them is shared with a genuine analysis
+    // failure whose stdout is equally empty. What is under test here is that
+    // the refusal says which ecosystem the tool reads, so the reader is not
+    // left debugging an install that is fine.
+    //
+    // The shim reproduces cargo-shear's measured out-of-ecosystem behaviour
+    // rather than requiring it to be installed.
+    let repo = scratch("shear-foreign");
+    let bin = scratch("shear-foreign-path");
+    shim(
+        bin.path(),
+        "cargo-shear",
+        "#!/bin/sh\necho 'error: Metadata error: `cargo metadata` exited with an error: '\n\
+         echo 'error: could not find `Cargo.toml`' >&2\nexit 2\n",
+    );
+
+    let run = judged_with_path(
+        repo.path(),
+        &["mutants", "--sut", "shear"],
+        Some(Path::new(&path_with(bin.path()))),
+    );
+
+    run.expect_code(2, "a suite that did not finish is not a suite that passed")
+        // The tool and the class it stopped on, which `CommandSut` already
+        // supplies.
+        .expect_says("cargo-shear")
+        .expect_says("m01")
+        // What this build adds: the language the SUT declares it reads, and how
+        // many of the nineteen classes are outside it. Without that the reader
+        // sees `exited with status 2` and goes to check their installation.
+        .expect_says("rust")
+        .expect_says("13 of 19");
+    expect_no_gate_result(&run);
 }

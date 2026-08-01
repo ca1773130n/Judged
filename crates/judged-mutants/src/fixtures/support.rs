@@ -211,6 +211,78 @@ pub(super) fn assert_ground_truth_is_on_disk(repo: &Repo, truth: &GroundTruth) {
             path.display()
         );
     }
+    assert_decoy_symbols_are_well_formed(repo.root(), truth);
+}
+
+/// Assert the decoys' *symbol* route is declared, paired, and real.
+///
+/// A decoy is found when a tool claims its path **or** a symbol it defines. The
+/// second half only measures anything if every fixture declares it, so this is
+/// the guard that a new fixture cannot quietly ship without one: a decoy with no
+/// declared symbol is invisible to every symbol-level analyzer, and its zero
+/// then reads as "found nothing" rather than "was never asked" (§6.20).
+///
+/// What is deliberately *not* asserted: that a decoy symbol appears in no other
+/// file. The equivalent statement about a decoy's filename is
+/// [`assert_decoys_are_unreferenced`], and it works because a filename is a
+/// distinctive literal. A symbol name is not — m18's decoy defines `export`,
+/// which is also a substring of `android:exported` in the manifest next door.
+/// A byte search cannot tell a symbol from a prefix of an XML attribute, so
+/// asserting it would be asserting something the search cannot actually check.
+/// Grading matches whole symbol segments, which is where that distinction
+/// belongs.
+fn assert_decoy_symbols_are_well_formed(root: &Path, truth: &GroundTruth) {
+    // Index-aligned, so a short list is not "the rest have no symbol": it is a
+    // fixture that stopped declaring, and its later decoys silently become
+    // unreachable to every symbol-level tool.
+    assert_eq!(
+        truth.decoy_dead_symbols.len(),
+        truth.decoy_dead_paths.len(),
+        "declares {} decoys but {} decoy symbols; the two lists are paired by \
+         index, and `\"\"` is how a decoy with no symbol route says so",
+        truth.decoy_dead_paths.len(),
+        truth.decoy_dead_symbols.len(),
+    );
+
+    let mut seen = std::collections::BTreeSet::new();
+    for path in &truth.decoy_dead_paths {
+        assert!(
+            seen.insert(path.as_path()),
+            "decoy {} is declared twice; recall counts decoy files, so a \
+             duplicate inflates both halves of the rate and changes what it means",
+            path.display()
+        );
+    }
+
+    for (path, symbol) in truth
+        .decoy_dead_paths
+        .iter()
+        .zip(truth.decoy_dead_symbols.iter())
+    {
+        // `""` is a decoy with no symbol route — a bash script, an nginx
+        // config, a minified bundle. There is nothing to pair it against.
+        if symbol.is_empty() {
+            continue;
+        }
+
+        // The pairing is positional, so nothing about the types catches a
+        // reordered array. Reading the file is what does.
+        let bytes = std::fs::read(root.join(path)).expect("read the decoy named by ground truth");
+        assert!(
+            mentions(&bytes, symbol),
+            "decoy symbol {symbol:?} does not appear in the decoy it is paired \
+             with ({}); `decoy_dead_symbols` is index-aligned with \
+             `decoy_dead_paths`",
+            path.display()
+        );
+
+        assert!(
+            !truth.live_symbols.iter().any(|live| live == symbol),
+            "{symbol:?} is declared both live and dead; one claim would then be \
+             a false removal and a decoy find at once, and the gate's two \
+             numbers would contradict each other"
+        );
+    }
 }
 
 /// Assert no file anywhere in the working tree names a decoy's stem.
@@ -259,5 +331,109 @@ mod tests {
     #[should_panic(expected = "empty needle")]
     fn occurrences_refuses_an_empty_needle() {
         occurrences(b"the haystack is irrelevant", "");
+    }
+
+    /// A throwaway tree containing `files`, for the ground-truth shape tests.
+    fn on_disk(files: &[(&str, &str)]) -> TempDir {
+        let dir = TempDir::new().expect("create a tempdir");
+        for (relative, body) in files {
+            let path = dir.path().join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create parent directory");
+            }
+            std::fs::write(&path, body).expect("write file");
+        }
+        dir
+    }
+
+    fn decoy_truth(decoys: &[(&str, &str)], live_symbols: &[&str]) -> GroundTruth {
+        GroundTruth {
+            live_paths: Vec::new(),
+            live_symbols: live_symbols.iter().map(|s| (*s).to_string()).collect(),
+            decoy_dead_paths: decoys
+                .iter()
+                .map(|(path, _)| std::path::PathBuf::from(path))
+                .collect(),
+            decoy_dead_symbols: decoys
+                .iter()
+                .map(|(_, symbol)| (*symbol).to_string())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_well_formed_decoy_declaration_is_accepted() {
+        // Both shapes the catalogue actually uses: a decoy with a symbol route,
+        // and one without. `""` is a declaration that no symbol-level tool can
+        // reach this file — a bash script, an nginx config — and not a fixture
+        // that forgot.
+        let dir = on_disk(&[
+            ("app/dead.py", "def hang_indent(text):\n    return text\n"),
+            ("scripts/old.sh", "#!/usr/bin/env bash\necho hi\n"),
+        ]);
+        assert_decoy_symbols_are_well_formed(
+            dir.path(),
+            &decoy_truth(
+                &[("app/dead.py", "hang_indent"), ("scripts/old.sh", "")],
+                &["LiveThing"],
+            ),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "declares 2 decoys but 1 decoy symbol")]
+    fn a_decoy_with_no_entry_at_all_is_a_fixture_bug() {
+        // The lists are index-aligned, so a short one is not "the rest have no
+        // symbol" — it is a fixture that stopped declaring halfway, and every
+        // decoy past the end silently becomes unreachable to a symbol-level
+        // tool. Loud, because the symptom is a number that is merely lower.
+        let dir = on_disk(&[("app/dead.py", "def x():\n    pass\n"), ("app/gone.py", "")]);
+        let mut truth = decoy_truth(&[("app/dead.py", "x"), ("app/gone.py", "y")], &[]);
+        truth.decoy_dead_symbols.pop();
+        assert_decoy_symbols_are_well_formed(dir.path(), &truth);
+    }
+
+    #[test]
+    #[should_panic(expected = "does not appear in the decoy it is paired with")]
+    fn a_symbol_paired_with_the_wrong_decoy_is_a_fixture_bug() {
+        // What a reordered array looks like. The pairing is positional, so
+        // nothing about the types catches it; without this check the fixture
+        // would compile, run, and credit the wrong file.
+        let dir = on_disk(&[
+            ("app/dead.py", "def hang_indent(text):\n    return text\n"),
+            ("app/gone.py", "def to_hex(rgb):\n    return rgb\n"),
+        ]);
+        assert_decoy_symbols_are_well_formed(
+            dir.path(),
+            &decoy_truth(
+                &[("app/dead.py", "to_hex"), ("app/gone.py", "hang_indent")],
+                &[],
+            ),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is declared both live and dead")]
+    fn a_symbol_that_is_both_live_and_a_decoy_is_a_fixture_bug() {
+        // The two halves of the grade would then disagree about the same claim:
+        // it is a false removal *and* a decoy find. A gate whose inputs
+        // contradict each other reports a number nobody can act on.
+        let dir = on_disk(&[("app/dead.py", "def render(x):\n    return x\n")]);
+        assert_decoy_symbols_are_well_formed(
+            dir.path(),
+            &decoy_truth(&[("app/dead.py", "render")], &["render"]),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is declared twice")]
+    fn the_same_decoy_declared_twice_is_a_fixture_bug() {
+        // Recall counts decoy files, so a duplicate inflates the denominator and
+        // the numerator together and quietly changes what the rate means.
+        let dir = on_disk(&[("app/dead.py", "def x():\n    pass\n")]);
+        assert_decoy_symbols_are_well_formed(
+            dir.path(),
+            &decoy_truth(&[("app/dead.py", "x"), ("app/dead.py", "x")], &[]),
+        );
     }
 }

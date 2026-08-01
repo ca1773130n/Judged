@@ -217,6 +217,16 @@ impl PlatformSideManifest {
         "app/legacy_metrics_export.py",
         "android/app/src/main/java/com/example/ledger/ota/UnusedBackoffTable.kt",
     ];
+
+    /// The symbol each decoy defines, index-aligned with [`Self::DECOYS`].
+    ///
+    /// `export` is the Python module's only definition, and it is also a
+    /// substring of `android:exported` in the manifest next door. That costs
+    /// nothing here — grading matches whole symbol segments, not substrings —
+    /// but it is why the suite does not assert that a decoy symbol appears in
+    /// no other file: a byte search cannot tell a symbol from a prefix of an
+    /// XML attribute name.
+    const DECOY_SYMBOLS: [&'static str; 2] = ["export", "UnusedBackoffTable"];
 }
 
 impl Mutant for PlatformSideManifest {
@@ -258,6 +268,10 @@ impl Mutant for PlatformSideManifest {
                 .iter()
                 .map(Path::new)
                 .map(Path::to_path_buf)
+                .collect(),
+            decoy_dead_symbols: Self::DECOY_SYMBOLS
+                .iter()
+                .map(|symbol| (*symbol).to_string())
                 .collect(),
         })
     }

@@ -77,7 +77,8 @@ pub struct RatchetArgs {
     pub expected_targets: Option<usize>,
 }
 
-/// `judged mutants [--sut naive|refusing|vulture|command] [--json] [-- <argv>]`.
+/// `judged mutants [--sut naive|refusing|vulture|knip|deadcode|shear|command]
+/// [--json] [-- <argv>]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutantsArgs {
     /// Which system under test to grade.
@@ -90,10 +91,18 @@ pub struct MutantsArgs {
 ///
 /// The first two are controls we wrote ourselves, which is exactly what makes
 /// them insufficient: a suite that has only ever graded its own controls bounds
-/// the harness and says nothing about any real tool. The other two are how a
-/// real analyzer gets in — [`SutChoice::Vulture`] by name because §4.1 already
-/// has published numbers to compare against, and [`SutChoice::Command`] for
-/// everything else, so that adding a tool does not require a code change.
+/// the harness and says nothing about any real tool. The rest are how a real
+/// analyzer gets in — four by name because §4.1 already has published claims to
+/// compare against, and [`SutChoice::Command`] for everything else, so that
+/// adding a tool does not require a code change.
+///
+/// The four named analyzers were chosen to span the catalogue rather than to
+/// flatter it. Vulture reads Python, knip reads JavaScript and TypeScript,
+/// deadcode reads Go and cargo-shear reads Rust; between them they open every
+/// ecosystem §10 E2 injects into. §11 R1 makes "does an auto-act tier exist at
+/// all" the highest-risk open question in the design and names E2 as what
+/// answers it, and an answer obtained from one Python tool is an answer about
+/// Python.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SutChoice {
     /// §7.5's heuristic, faithfully reproduced. The suite's positive control.
@@ -102,6 +111,12 @@ pub enum SutChoice {
     Refusing,
     /// Vulture, invoked at its own defaults (§4.1).
     Vulture,
+    /// Knip, reporting SARIF (§4.1, §9.2).
+    Knip,
+    /// `golang.org/x/tools/cmd/deadcode`, reporting JSON (§2.1, §4.1).
+    Deadcode,
+    /// cargo-shear, reporting JSON (§4.1).
+    Shear,
     /// An arbitrary analyzer, given after `--`. Never empty.
     Command(Vec<String>),
 }
@@ -122,6 +137,93 @@ pub enum SutChoice {
 /// would hand vulture the same directory twice.
 const VULTURE_ARGV: &[&str] = &["vulture"];
 
+/// The argv `--sut knip` runs.
+///
+/// Three things here are decisions rather than defaults.
+///
+/// **`--reporter sarif`.** Knip's default reporter is `symbols`, a
+/// human-oriented table with no stable grammar; the SARIF reporter is the one
+/// [`judged_mutants::adapters::knip`] parses, and it is the interchange format
+/// §9.2 already standardises on. Pinned against
+/// [`judged_mutants::adapters::knip::RECOMMENDED_ARGS`] by a test below, so the
+/// two cannot drift apart.
+///
+/// **`--directory` last, with no value.** [`judged_mutants::sut::CommandSut`]
+/// appends the canonicalized fixture repository as the final argument, and knip
+/// — unlike vulture — takes no positional argument at all. Measured, knip
+/// 6.31.0: a trailing path produces `Unexpected argument '<path>'. This command
+/// does not take positional arguments` and exit 1, which is *also* knip's
+/// "issues found" code. Ending the argv with the flag makes the appended path
+/// the value of `-D/--directory`, which is knip's own spelling for the
+/// directory to run in.
+///
+/// **`npx --yes`.** Knip is distributed on npm and has no system package; `npx`
+/// is how it is run. `--yes` because [`judged_mutants::sut::CommandSut`] gives
+/// the child no stdin, so an install confirmation prompt would be answered by
+/// EOF. The version is pinned — `knip@6` — because an analyzer whose version
+/// floats produces a score that cannot be compared with itself a month later.
+const KNIP_ARGV: &[&str] = &[
+    "npx",
+    "--yes",
+    "knip@6",
+    "--reporter",
+    "sarif",
+    "--no-progress",
+    "--directory",
+];
+
+/// The argv `--sut deadcode` runs, and the one place a shell is involved.
+///
+/// deadcode takes **Go package patterns**, not a directory. A directory names
+/// exactly the package in it, so the repository root — which in every Go layout
+/// worth testing holds `go.mod` and no `.go` files — is not a package at all.
+/// Measured against x/tools, inside a materialized `m12`:
+///
+/// ```text
+/// $ deadcode -json /path/to/m12
+/// -: no Go files in /path/to/m12
+/// deadcode: packages contain errors
+/// $ echo $?
+/// 1
+/// $ deadcode -json /path/to/m12/...
+/// [ ... the package array ... ]
+/// $ echo $?
+/// 0
+/// ```
+///
+/// The pattern deadcode needs is therefore the appended path with `/...` after
+/// it, and [`judged_mutants::sut::CommandSut`] appends the path unmodified. A
+/// one-line `sh -c` is how the appended argument reaches the tool in the shape
+/// the tool documents: `$1` is the repository, `$1/...` is the pattern.
+///
+/// The alternative — passing `./...` and letting the appended root ride along
+/// as a second pattern — was measured and rejected: it is the failing case
+/// above, so `--sut deadcode` would have failed on every class including the
+/// only Go one.
+///
+/// `exec` so the shell is replaced rather than kept as a parent, which keeps
+/// the exit code deadcode's own rather than a shell's rendering of it. It also
+/// means [`SutChoice::probe_program`] has to name `deadcode` rather than
+/// `argv[0]`; see there.
+const DEADCODE_ARGV: &[&str] = &["sh", "-c", r#"exec deadcode -json "$1/...""#, "deadcode"];
+
+/// The argv `--sut shear` runs.
+///
+/// `--format json` for the same reason knip gets `--reporter sarif`: the human
+/// format has no grammar to parse. No `--offline`, no `--locked`, no
+/// `--deny-warnings` — cargo-shear as people run it, so the result is
+/// comparable to §4.1's account of it rather than to a configuration we chose.
+///
+/// No path argument: cargo-shear takes the project directory as its single
+/// positional `PATH`, which is exactly what
+/// [`judged_mutants::sut::CommandSut`] appends. Of the three tools added here
+/// it is the only one whose CLI already matches the harness's calling
+/// convention.
+///
+/// `--fix` is what this must never be, and it is in [`REFUSED_FLAGS`] so that
+/// nobody can add it from the command line either.
+const SHEAR_ARGV: &[&str] = &["cargo-shear", "--format", "json"];
+
 impl SutChoice {
     /// How the report names this SUT.
     ///
@@ -134,16 +236,55 @@ impl SutChoice {
             SutChoice::Naive => "naive".to_string(),
             SutChoice::Refusing => "refusing".to_string(),
             SutChoice::Vulture => "vulture".to_string(),
+            SutChoice::Knip => "knip".to_string(),
+            SutChoice::Deadcode => "deadcode".to_string(),
+            // The tool's own name, not the flag's. `--sut shear` is a short
+            // spelling; a report that said `shear` would name a program nobody
+            // can install.
+            SutChoice::Shear => "cargo-shear".to_string(),
             SutChoice::Command(argv) => argv.join(" "),
         }
     }
 
     /// The analyzer's argv, or `None` for the two in-process controls.
     pub fn external_argv(&self) -> Option<Vec<String>> {
+        let fixed = match self {
+            SutChoice::Naive | SutChoice::Refusing => return None,
+            SutChoice::Vulture => VULTURE_ARGV,
+            SutChoice::Knip => KNIP_ARGV,
+            SutChoice::Deadcode => DEADCODE_ARGV,
+            SutChoice::Shear => SHEAR_ARGV,
+            SutChoice::Command(argv) => return Some(argv.clone()),
+        };
+        Some(fixed.iter().map(|word| (*word).to_string()).collect())
+    }
+
+    /// The binary whose absence means this SUT cannot run at all.
+    ///
+    /// Almost always `argv[0]`, and deliberately not *defined* as `argv[0]`.
+    /// [`DEADCODE_ARGV`] runs `sh`, which is on every machine this builds on,
+    /// so a preflight that looked at `argv[0]` would find a shell, declare the
+    /// analyzer present, and hand the suite a run in which `deadcode` was never
+    /// found. That run exits non-zero and is refused later — but by then the
+    /// message names `sh`, and the operator is told a shell is missing.
+    ///
+    /// The preflight is the one guard between "this analyzer is not installed"
+    /// and a false-removal count of zero, so it points at the analyzer.
+    pub fn probe_program(&self) -> Option<String> {
         match self {
-            SutChoice::Naive | SutChoice::Refusing => None,
-            SutChoice::Vulture => Some(VULTURE_ARGV.iter().map(|w| w.to_string()).collect()),
-            SutChoice::Command(argv) => Some(argv.clone()),
+            // The wrapper's payload. `sh` is not what has to be installed.
+            SutChoice::Deadcode => Some("deadcode".to_string()),
+            // `expect` rather than a fallible lookup on purpose. An empty argv
+            // here would make this `None`, which the preflight reads as "an
+            // in-process control, nothing to check" — and skipping the
+            // preflight is the one failure this whole path exists to prevent. A
+            // panic on an impossible input is louder and safer than a silent
+            // skip (AGENTS.md rule 12).
+            other => other.external_argv().map(|argv| {
+                argv.first()
+                    .expect("an external SUT's argv is non-empty by construction")
+                    .clone()
+            }),
         }
     }
 }
@@ -183,18 +324,30 @@ MUTANTS (§10 E2) — inject 19 known-live artifacts and see what gets called de
         naive                  A deliberately bad cleaner. The positive control:
                                if it ever passes, the suite is theatre.
         refusing               Calls nothing dead. The negative control.
-        vulture                The real analyzer, at its own defaults (§4.1).
+        vulture                Python. The real analyzer, at its own defaults
+                               (§4.1). Needs `vulture` on PATH.
+        knip                   JavaScript/TypeScript, via `npx --yes knip@6`,
+                               reporting SARIF. Needs `npx` on PATH; npx fetches
+                               knip itself on first use.
+        deadcode               Go, via `deadcode -json <repo>/...`. Needs
+                               `deadcode` on PATH and a working Go toolchain.
+        shear                  Rust, via `cargo-shear --format json <repo>`.
+                               Needs `cargo-shear` on PATH.
         command                An arbitrary analyzer, given after `--`. It runs
                                once per fixture repository, from inside it, with
                                the repository path appended as the last argument,
                                and must exit 0. Its stdout is parsed as vulture's
-                               format, the only adapter that exists so far.
+                               format, the only format the escape hatch reads.
     --json                     Machine-readable report.
 
     Exit 0 only when the false-removal count is zero; 2 if the suite could not
     be run at all — including when the selected analyzer is not installed. An
     absent analyzer claims nothing dead, which scores zero false removals, so it
     is refused rather than graded.
+
+    The four named analyzers each read one ecosystem. Classes outside it are
+    marked [NOT READ by this SUT] and subtracted from the denominator, because a
+    tool that opened no file in a language has not passed there — it was absent.
 
 Judged runs an analyzer to READ it. Adapters are read-only (§9.2), so a
 deletion-shaped flag is refused wherever it appears — including inside the argv
@@ -357,13 +510,17 @@ fn parse_mutants<'a>(
         "naive" => in_process(SutChoice::Naive, tail)?,
         "refusing" => in_process(SutChoice::Refusing, tail)?,
         "vulture" => in_process(SutChoice::Vulture, tail)?,
+        "knip" => in_process(SutChoice::Knip, tail)?,
+        "deadcode" => in_process(SutChoice::Deadcode, tail)?,
+        "shear" => in_process(SutChoice::Shear, tail)?,
         "command" => SutChoice::Command(analyzer_argv(tail)?),
         other => {
             return Err(usage(format!(
-                "`--sut` accepts `naive`, `refusing`, `vulture` or `command`, got `{other}`. \
-                 `naive` and `refusing` are the two controls that ship with the suite; `vulture` \
-                 runs the installed vulture at its own defaults; `command` runs whatever argv \
-                 follows `--`."
+                "`--sut` accepts `naive`, `refusing`, `vulture`, `knip`, `deadcode`, `shear` or \
+                 `command`, got `{other}`. `naive` and `refusing` are the two controls that ship \
+                 with the suite; `vulture` (Python), `knip` (JavaScript/TypeScript), `deadcode` \
+                 (Go) and `shear` (Rust) run those installed analyzers at their own defaults; \
+                 `command` runs whatever argv follows `--`."
             )))
         }
     };
@@ -506,11 +663,165 @@ mod tests {
         assert_eq!(mutants_args("mutants --sut naive").sut, SutChoice::Naive);
         assert!(mutants_args("mutants --json").json);
 
-        let message = usage_error("mutants --sut knip");
-        assert!(message.contains("naive"), "got {message}");
-        assert!(message.contains("refusing"), "got {message}");
-        assert!(message.contains("vulture"), "got {message}");
-        assert!(message.contains("command"), "got {message}");
+        // `periphery` rather than `knip`: knip stood in for "a tool judged has
+        // heard of but cannot run" until knip became one of the options.
+        let message = usage_error("mutants --sut periphery");
+        for known in [
+            "naive", "refusing", "vulture", "knip", "deadcode", "shear", "command",
+        ] {
+            assert!(
+                message.contains(known),
+                "the unknown-SUT message is the discovery surface for this flag \
+                 and must name `{known}`; got {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_named_analyzer_is_reachable_by_its_own_word() {
+        assert_eq!(mutants_args("mutants --sut knip").sut, SutChoice::Knip);
+        assert_eq!(
+            mutants_args("mutants --sut deadcode").sut,
+            SutChoice::Deadcode
+        );
+        assert_eq!(mutants_args("mutants --sut shear").sut, SutChoice::Shear);
+    }
+
+    #[test]
+    fn knip_is_run_through_npx_at_the_pinned_version_reporting_sarif() {
+        // Three properties, and each one is load-bearing.
+        let argv = SutChoice::Knip
+            .external_argv()
+            .expect("knip runs an external program");
+
+        // 1. The reporter the adapter parses. Knip's default is a human table
+        //    with no grammar; `judged_mutants::adapters::knip` reads SARIF and
+        //    rejects anything else, so a run without this flag is a hard error
+        //    rather than a wrong number — but it is also a wasted run.
+        assert!(
+            argv.windows(judged_mutants::adapters::knip::RECOMMENDED_ARGS.len())
+                .any(|window| window == judged_mutants::adapters::knip::RECOMMENDED_ARGS),
+            "the argv must carry the adapter's own recommended arguments \
+             contiguously, or the CLI and the adapter can drift apart; got {argv:?}"
+        );
+
+        // 2. A pinned version. An analyzer that floats produces a score that
+        //    cannot be compared with itself a month later, which is the one
+        //    thing an evidence artifact must be able to do.
+        assert!(
+            argv.contains(&"knip@6".to_string()),
+            "knip must be version-pinned; got {argv:?}"
+        );
+
+        // 3. `--directory` last, so that the repository path `CommandSut`
+        //    appends becomes its value. Measured against knip 6.31.0: a
+        //    trailing positional path is refused with `This command does not
+        //    take positional arguments` and exit 1 — which is also knip's
+        //    "issues found" code, so the mistake would not even look like one.
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("--directory"),
+            "the appended repository path has to land on a flag that takes a \
+             directory; got {argv:?}"
+        );
+    }
+
+    #[test]
+    fn deadcode_is_given_a_recursive_package_pattern_not_a_directory() {
+        // deadcode takes Go package patterns. A bare directory names only the
+        // package in it, and a repository root holding `go.mod` and no `.go`
+        // files is not a package — measured, that is `no Go files in <dir>` and
+        // exit 1. The pattern it needs is `<repo>/...`, and `CommandSut`
+        // appends `<repo>` unmodified, so the argv has to place it.
+        let argv = SutChoice::Deadcode
+            .external_argv()
+            .expect("deadcode runs an external program");
+
+        assert!(
+            argv.iter().any(|word| word.contains("$1/...")),
+            "the appended repository path must reach deadcode as a recursive \
+             package pattern; got {argv:?}"
+        );
+        // Joined rather than matched word-by-word: the flag lives inside the
+        // `sh -c` script, which is one argv word.
+        assert!(
+            argv.join(" ").contains("deadcode -json"),
+            "without -json deadcode prints its human format, which the adapter \
+             rejects — and rejects with a message about the missing flag only \
+             because the adapter looks for exactly this; got {argv:?}"
+        );
+    }
+
+    #[test]
+    fn the_binary_preflight_looks_for_the_analyzer_not_for_the_shell() {
+        // The one case where `argv[0]` is the wrong thing to check. `--sut
+        // deadcode` runs `sh`, which exists everywhere; a preflight satisfied by
+        // that would declare deadcode installed on a machine that has never had
+        // it, and the run would then be refused with a message about a missing
+        // shell. The preflight is the only guard between "not installed" and a
+        // false-removal count of zero, so it points at the analyzer.
+        assert_eq!(
+            SutChoice::Deadcode
+                .external_argv()
+                .map(|argv| argv[0].clone()),
+            Some("sh".to_string())
+        );
+        assert_eq!(
+            SutChoice::Deadcode.probe_program(),
+            Some("deadcode".to_string())
+        );
+
+        // Everywhere else it is `argv[0]`, and must stay so.
+        for choice in [SutChoice::Vulture, SutChoice::Knip, SutChoice::Shear] {
+            assert_eq!(
+                choice.probe_program(),
+                choice.external_argv().map(|argv| argv[0].clone()),
+                "{} should be probed by its own argv[0]",
+                choice.label()
+            );
+        }
+        assert_eq!(
+            SutChoice::Command(vec!["mytool".to_string(), "--flag".to_string()]).probe_program(),
+            Some("mytool".to_string())
+        );
+
+        // And the controls have nothing to probe, or `judged mutants` would
+        // start refusing to run its own controls.
+        assert_eq!(SutChoice::Naive.probe_program(), None);
+        assert_eq!(SutChoice::Refusing.probe_program(), None);
+    }
+
+    #[test]
+    fn a_report_names_the_analyzer_a_reader_would_have_to_install() {
+        // `--sut shear` is a short flag spelling; `shear` is not a program.
+        assert_eq!(SutChoice::Shear.label(), "cargo-shear");
+        assert_eq!(SutChoice::Knip.label(), "knip");
+        assert_eq!(SutChoice::Deadcode.label(), "deadcode");
+    }
+
+    #[test]
+    fn no_named_analyzer_is_handed_a_flag_that_deletes() {
+        // §9.13 invariant 1 and §9.2's read-only rule, applied to the argvs this
+        // module builds rather than to the ones a user types. Every one of these
+        // tools ships a destructive mode — knip has `--fix` and
+        // `--allow-remove-files`, cargo-shear has `--fix` — and the argv here is
+        // the one place they could be switched on without going through the
+        // command line at all.
+        for choice in [
+            SutChoice::Vulture,
+            SutChoice::Knip,
+            SutChoice::Deadcode,
+            SutChoice::Shear,
+        ] {
+            let argv = choice.external_argv().unwrap_or_default().join(" ");
+            for refused in REFUSED_FLAGS {
+                assert!(
+                    !argv.contains(refused),
+                    "`--sut {}` would run `{argv}`, which carries {refused}",
+                    choice.label()
+                );
+            }
+        }
     }
 
     #[test]
@@ -596,7 +907,7 @@ mod tests {
 
     #[test]
     fn an_argv_given_to_a_sut_that_cannot_use_it_is_an_error_not_a_shrug() {
-        for control in ["naive", "refusing", "vulture"] {
+        for control in ["naive", "refusing", "vulture", "knip", "deadcode", "shear"] {
             let message = usage_error(&format!("mutants --sut {control} -- some-linter"));
             assert!(
                 message.contains("--sut command"),

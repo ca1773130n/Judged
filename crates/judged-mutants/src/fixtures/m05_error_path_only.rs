@@ -165,6 +165,11 @@ impl ErrorPathOnly {
         "ledger/legacy_fixed_width.py",
         "ledger/unused_locale_map.py",
     ];
+
+    /// The symbol each decoy defines, index-aligned with [`Self::DECOYS`].
+    /// Without these a symbol-level analyzer scores zero decoys here and reads
+    /// as having found nothing (see `GroundTruth::decoy_dead_symbols`).
+    const DECOY_SYMBOLS: [&'static str; 2] = ["format_row", "DECIMAL_COMMA"];
 }
 
 impl Mutant for ErrorPathOnly {
@@ -202,6 +207,10 @@ impl Mutant for ErrorPathOnly {
             live_paths: vec![PathBuf::from(LIVE)],
             live_symbols: vec![LIVE_SYMBOL.to_string()],
             decoy_dead_paths: Self::DECOYS.iter().map(PathBuf::from).collect(),
+            decoy_dead_symbols: Self::DECOY_SYMBOLS
+                .iter()
+                .map(|symbol| (*symbol).to_string())
+                .collect(),
         })
     }
 }

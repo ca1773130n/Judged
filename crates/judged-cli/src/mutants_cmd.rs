@@ -25,11 +25,11 @@
 
 use std::path::{Path, PathBuf};
 
-use judged_mutants::adapters::vulture;
+use judged_mutants::adapters::{deadcode, knip, shear, vulture};
 use judged_mutants::fixtures;
-use judged_mutants::mutant::Ecosystem;
+use judged_mutants::mutant::{Ecosystem, Mutant};
 use judged_mutants::runner::{run_suite, MutantReport, SuiteReport};
-use judged_mutants::sut::{CommandSut, NaiveSut, RefusingSut, Sut};
+use judged_mutants::sut::{CommandSut, NaiveSut, RefusingSut, Sut, SutVerdict};
 use serde_json::{json, Value};
 
 use crate::args::{MutantsArgs, SutChoice};
@@ -54,6 +54,89 @@ use crate::args::{MutantsArgs, SutChoice};
 /// So the productive case is 3, not 0, and 1 has to stay out even though a
 /// crashed vulture prints a plausible-looking empty result.
 const VULTURE_COMPLETED_EXIT_CODES: [i32; 2] = [0, 3];
+
+/// Exit codes that mean a knip run finished its analysis.
+///
+/// Measured against **knip 6.31.0** (`npx --yes knip@6 --reporter sarif
+/// --no-progress --directory <repo>`), on this machine, in the fixture
+/// repositories this suite materializes:
+///
+/// | Condition | Exit | stdout |
+/// | --- | --- | --- |
+/// | Analysis ran, nothing unused | 0 | a SARIF log with `"results":[]` |
+/// | Analysis ran, unused files or dependencies found | 1 | a SARIF log with results |
+/// | Unknown option, or a positional argument | 1 | knip's usage text |
+/// | No `package.json` anywhere above the directory | 2 | a one-line pointer to `--help` |
+///
+/// So the productive case is **1**, and 1 is also how knip reports being called
+/// wrongly. Those two are told apart by the parser rather than by the code:
+/// [`knip::parse`] rejects anything that is not a SARIF log, so the usage text
+/// becomes a hard error instead of an empty verdict. That is the split §6.20
+/// demands — *"no data" must be a distinct state from "zero executions"* — and
+/// it is why 1 can be declared healthy without declaring a misconfigured run
+/// clean.
+///
+/// 2 stays out. It is what knip returns for the fixture repositories that hold
+/// no `package.json` at all, which is most of the catalogue, and it is
+/// indistinguishable from the fatal errors knip also exits 2 on.
+const KNIP_COMPLETED_EXIT_CODES: [i32; 2] = [0, 1];
+
+/// Exit codes that mean a deadcode run finished its analysis.
+///
+/// Measured against **`golang.org/x/tools/cmd/deadcode`** with go1.26.2 on
+/// darwin/arm64, using the argv [`crate::args`] declares:
+///
+/// | Condition | Exit | stdout |
+/// | --- | --- | --- |
+/// | Analysis ran, nothing dead | 0 | the four bytes `null` |
+/// | Analysis ran, dead functions found | 0 | the `Package` JSON array |
+/// | Target directory holds no Go files | 1 | empty |
+/// | Target is not inside a Go module | 1 | empty |
+/// | A package fails to parse or type-check | 1 | empty |
+/// | Unknown flag, or no package pattern at all | 2 | usage text on stderr |
+///
+/// **Only 0 is a completed run**, and it covers both the productive and the
+/// empty case — deadcode gives a caller no exit code by which to tell "I
+/// analyzed your program and it is all reachable" from "I refused". The stdout
+/// does: `null` versus an array. That distinction is the adapter's, not the
+/// harness's.
+///
+/// Note what 1 collides with, and why nothing may be added to this list to make
+/// the suite quieter. "This repository has no Go in it" and "your Go does not
+/// compile" are the same code and the same empty stdout. Declaring 1 healthy
+/// would hand [`deadcode::verdict_from_stdout`] an empty stream for a run that
+/// never analyzed anything — and an empty stream parses to no claims, which is
+/// zero false removals, which is a passing gate.
+const DEADCODE_COMPLETED_EXIT_CODES: [i32; 1] = [0];
+
+/// Exit codes that mean a cargo-shear run finished its analysis.
+///
+/// Measured against **cargo-shear** (`--format json <repo>`), built from source
+/// for this round because it needs a newer rustc than this repository pins:
+///
+/// | Condition | Exit | stdout |
+/// | --- | --- | --- |
+/// | Analysis ran, nothing found | 0 | `{"summary":{"errors":0,...},"findings":[]}` |
+/// | Analysis ran, warning-severity findings only (unlinked files) | 0 | the JSON document |
+/// | Analysis ran, error-severity findings (unused dependencies) | 1 | the JSON document |
+/// | Unknown or malformed command-line argument | 1 | empty |
+/// | No `Cargo.toml`, or `cargo metadata` failed | 2 | `error: Metadata error: ...` |
+///
+/// Two things here are worth stating out loud, because both are the sort of
+/// detail a remembered exit-code table gets wrong.
+///
+/// First, cargo-shear's exit code depends on the **severity** of what it found,
+/// not on whether it found anything: an unlinked file is a warning and exits 0,
+/// while an unused dependency is an error and exits 1. A list of `[0]` would
+/// therefore discard exactly the findings §4.1 cares most about.
+///
+/// Second, 1 is shared with "you called me wrongly", as it is for knip, and is
+/// separated the same way — by the parser. [`shear::parse_output`] rejects an
+/// empty stream and rejects the plain-text `error:` line, so neither can arrive
+/// as a clean verdict. 2 stays out for the same reason knip's does: it is what
+/// every non-Rust fixture produces, and it is also what a broken `Cargo.toml`
+/// produces.
+const SHEAR_COMPLETED_EXIT_CODES: [i32; 2] = [0, 1];
 
 /// Run the catalogue and render the result.
 pub fn run(args: &MutantsArgs) -> (String, i32) {
@@ -102,7 +185,7 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
                     &Refusal {
                         headline: "the E2 suite did not complete".to_string(),
                         detail: error.to_string(),
-                        remedy: None,
+                        remedy: foreign_ecosystem_hint(&args.sut, &mutants),
                     },
                     &args.sut,
                     args.json,
@@ -152,13 +235,13 @@ struct Refusal {
 fn preflight(choice: &SutChoice) -> Result<(), Refusal> {
     // The two in-process controls start no subprocess, so there is nothing to
     // look for and nothing that can be missing.
-    let Some(argv) = choice.external_argv() else {
+    //
+    // `probe_program` rather than `argv[0]`: for `--sut deadcode` the argv
+    // begins with `sh`, and a preflight satisfied by a shell would report every
+    // machine as having deadcode installed.
+    let Some(program) = choice.probe_program() else {
         return Ok(());
     };
-    let program = argv
-        .first()
-        .expect("an external SUT's argv is non-empty by construction")
-        .clone();
 
     if locate(&program).is_some() {
         return Ok(());
@@ -209,6 +292,67 @@ fn preflight(choice: &SutChoice) -> Result<(), Refusal> {
     })
 }
 
+/// The one thing a reader needs when a language-specific analyzer stops the
+/// suite, and cannot get from the tool's own message.
+///
+/// Measured this round, and worth stating because it separates the four named
+/// analyzers into two kinds. Vulture *tolerates* a repository with no Python in
+/// it: it finds no `.py` files, prints nothing and exits 0, so the nineteen
+/// classes run to completion and the twelve it cannot read are marked
+/// `[NOT READ by this SUT]` in the report. The other three refuse the directory
+/// instead —
+///
+/// | Tool | On a repository outside its ecosystem | Exit |
+/// | --- | --- | --- |
+/// | knip | `ERROR: Unable to find package.json` | 2 |
+/// | cargo-shear | `could not find Cargo.toml in <dir> or any parent directory` | 2 |
+/// | deadcode | `no Go files in <dir>` / `cannot find main module` | 1 |
+///
+/// — and since [`judged_mutants::runner::run_suite`] runs every class against
+/// the selected SUT and treats a SUT error as fatal, the first foreign class
+/// ends the run. The suite therefore cannot currently produce a score for these
+/// three, and that is reported rather than worked around.
+///
+/// Widening [`KNIP_COMPLETED_EXIT_CODES`] and friends to swallow those codes
+/// would produce a score, and it is exactly the silent scoring error this
+/// module exists to prevent: knip and cargo-shear both exit 2 for a *broken*
+/// project as well as for an absent one, and deadcode's 1 covers "no Go here"
+/// and "your Go does not compile" alike. Each of those states leaves stdout
+/// empty or non-report, which parses to no claims, which is zero false
+/// removals, which is a passing gate.
+///
+/// The wording is conditional on purpose. This hint is attached to *every*
+/// incomplete run of a language-specific SUT, including one that failed inside
+/// its own ecosystem for an unrelated reason, and asserting a cause it cannot
+/// check would send the reader past a real bug.
+fn foreign_ecosystem_hint(choice: &SutChoice, mutants: &[Box<dyn Mutant>]) -> Option<String> {
+    let langs = reads(choice)?;
+    let foreign = mutants
+        .iter()
+        .filter(|mutant| !was_read(choice, mutant.ecosystem()))
+        .count();
+    if foreign == 0 {
+        return None;
+    }
+
+    let spoken: Vec<&str> = langs.iter().map(|lang| ecosystem(*lang)).collect();
+    Some(format!(
+        "`{}` reads {}, and {foreign} of {} classes in the catalogue are outside that. The suite \
+         runs every class against the selected analyzer, so if the class named above is one of \
+         those, the tool was handed a repository it cannot analyze — which is not a broken \
+         install. Analyzers split on what they then do: vulture finds no Python and exits 0, so \
+         its run completes and those classes are simply marked unread, while knip, cargo-shear \
+         and deadcode refuse the directory and exit non-zero. Those exit codes are deliberately \
+         not declared healthy, because each is shared with a genuine analysis failure whose \
+         output is equally empty — accepting them would score a crashed run as a clean one \
+         (§6.20). Until the runner can skip a class its analyzer declares it cannot read, grade \
+         these on a catalogue they can read.",
+        choice.label(),
+        spoken.join(" and "),
+        mutants.len(),
+    ))
+}
+
 /// Where `program` is, if it is anywhere.
 ///
 /// A name is looked up on `PATH`; anything containing a separator is taken as
@@ -235,6 +379,26 @@ fn install_hint(program: &str) -> String {
     match program {
         "vulture" => "Install it with `pipx install vulture`, or `pip install vulture` into the \
                       environment judged runs in. It needs Python."
+            .to_string(),
+        // The missing thing is npx, not knip: `--sut knip` runs
+        // `npx --yes knip@6`, and npx fetches knip itself. Saying "install
+        // knip" would send the reader to `npm i -g knip`, which pins a
+        // different version than the one the suite grades.
+        "npx" => "`npx` ships with Node.js — install Node 20 or newer (`brew install node`, or \
+                  https://nodejs.org). knip itself does not need installing: `--sut knip` runs \
+                  `npx --yes knip@6`, which fetches the pinned version on first use and needs \
+                  network access to do it."
+            .to_string(),
+        "deadcode" => "Install it with `go install golang.org/x/tools/cmd/deadcode@latest`, then \
+                       put `$(go env GOPATH)/bin` on PATH — that last step is the one that is \
+                       usually missing. It also needs the Go toolchain at run time, because it \
+                       loads the program from source."
+            .to_string(),
+        "cargo-shear" => "Install it with `cargo install cargo-shear`. Judged runs the binary \
+                          directly rather than as `cargo shear`, so it has to be on PATH by that \
+                          name. Note that recent versions need a newer rustc than this repository \
+                          pins; `cargo install --locked cargo-shear` with a toolchain of its own \
+                          is the way round that."
             .to_string(),
         other => format!(
             "Install `{other}` and put it on PATH, or give its path instead: \
@@ -296,6 +460,25 @@ fn build_sut(choice: &SutChoice) -> Box<dyn Sut> {
                 // orchestrator knows when the tool's silence means anything.
                 .with_cannot_emit([vulture::CAPABILITY_ENVELOPE]),
         ),
+        // The three below share a shape with vulture and differ in one respect
+        // worth naming: each takes its argv from [`SutChoice::external_argv`]
+        // rather than repeating the program here, because for `deadcode` the
+        // program is a shell and the analyzer's name lives in the argv.
+        SutChoice::Knip => Box::new(
+            external(choice, knip::parse)
+                .with_success_exit_codes(KNIP_COMPLETED_EXIT_CODES)
+                .with_cannot_emit([knip::CAPABILITY_ENVELOPE]),
+        ),
+        SutChoice::Deadcode => Box::new(
+            external(choice, deadcode::verdict_from_stdout)
+                .with_success_exit_codes(DEADCODE_COMPLETED_EXIT_CODES)
+                .with_cannot_emit([deadcode::CAPABILITY_ENVELOPE]),
+        ),
+        SutChoice::Shear => Box::new(
+            external(choice, shear::verdict_from_stdout)
+                .with_success_exit_codes(SHEAR_COMPLETED_EXIT_CODES)
+                .with_cannot_emit([shear::CAPABILITY_ENVELOPE]),
+        ),
         SutChoice::Command(argv) => {
             let (program, args) = argv
                 .split_first()
@@ -320,6 +503,23 @@ fn build_sut(choice: &SutChoice) -> Box<dyn Sut> {
             )
         }
     }
+}
+
+/// A [`CommandSut`] built from a named SUT's declared argv.
+///
+/// One place where `external_argv()` is split into program and arguments, so
+/// that a SUT whose analyzer is not `argv[0]` — `deadcode`, which is run through
+/// a one-line `sh -c` because it takes package patterns rather than a directory
+/// — cannot end up with a different argv here than the one
+/// [`SutChoice::probe_program`] was checked against.
+fn external(choice: &SutChoice, parse: fn(&str) -> judged_core::Result<SutVerdict>) -> CommandSut {
+    let argv = choice
+        .external_argv()
+        .expect("a named external SUT declares an argv");
+    let (program, args) = argv
+        .split_first()
+        .expect("a named external SUT's argv is non-empty by construction");
+    CommandSut::new(choice.label(), program.clone(), parse).with_args(args.to_vec())
 }
 
 /// What the reader has to know about the translation before they read a number
@@ -351,6 +551,18 @@ fn disclosure(choice: &SutChoice) -> Option<Disclosure> {
             envelope: vulture::CAPABILITY_ENVELOPE,
             mapping: vulture::MAPPING_DECISION,
         }),
+        SutChoice::Knip => Some(Disclosure {
+            envelope: knip::CAPABILITY_ENVELOPE,
+            mapping: knip::MAPPING_DECISION,
+        }),
+        SutChoice::Deadcode => Some(Disclosure {
+            envelope: deadcode::CAPABILITY_ENVELOPE,
+            mapping: deadcode::MAPPING_DECISION,
+        }),
+        SutChoice::Shear => Some(Disclosure {
+            envelope: shear::CAPABILITY_ENVELOPE,
+            mapping: shear::MAPPING_DECISION,
+        }),
         // Its stdout is read by the vulture adapter, so the mapping decision
         // applies verbatim; the envelope cannot.
         SutChoice::Command(_) => Some(Disclosure {
@@ -377,6 +589,26 @@ fn reads(choice: &SutChoice) -> Option<&'static [Ecosystem]> {
         // Vulture is a Python AST tool. It cannot parse Rust, Go or TypeScript,
         // so on those classes it is not scoring — it is absent.
         SutChoice::Vulture => Some(&[Ecosystem::Python, Ecosystem::Polyglot]),
+        // Knip resolves a JavaScript/TypeScript module graph from
+        // `package.json` and `tsconfig.json`. `Polyglot` is claimed because
+        // every polyglot fixture in the catalogue contains a JS or TS half —
+        // that is what makes it polyglot — and knip genuinely parses it. It is
+        // *not* a claim that knip understands the other half; §10 E2 grades a
+        // single mechanism per class, and a class knip fails because the
+        // reference lives in the non-JS half is knip failing, not knip being
+        // absent.
+        SutChoice::Knip => Some(&[Ecosystem::TypeScript, Ecosystem::Polyglot]),
+        // deadcode loads a Go program from source and needs a Go module. Go is
+        // the whole of its reach — and deliberately *not* Polyglot: unlike a
+        // JS bundler-shaped tool, deadcode has no partial reading of a
+        // repository whose Go half is absent. It refuses the directory
+        // outright.
+        SutChoice::Deadcode => Some(&[Ecosystem::Go]),
+        // cargo-shear reads a cargo workspace: `Cargo.toml` plus the crate
+        // sources cargo metadata points it at. Same reasoning as deadcode for
+        // leaving Polyglot out — with no manifest there is nothing for
+        // `cargo metadata` to answer with, so it never opens a file.
+        SutChoice::Shear => Some(&[Ecosystem::Rust]),
         // An arbitrary command declares nothing, so we must not assume it read
         // anything OR that it failed to. Unknown competence is not a claim.
         SutChoice::Command(_) => None,
@@ -687,6 +919,150 @@ mod tests {
         // And the language-agnostic controls are never marked, in any ecosystem.
         let naive = render_text(&suite_in(Ecosystem::Go), &catalogue(), &SutChoice::Naive);
         assert!(!naive.contains("NOT READ"), "got {naive}");
+    }
+
+    #[test]
+    fn every_ecosystem_is_claimed_by_exactly_the_analyzers_that_parse_it() {
+        // The language map decides two things a report cannot recover from
+        // being wrong about. Too narrow and a genuine false removal is excused
+        // as "not measured"; too wide and a tool is credited with passing a
+        // class it never opened. Both are stated here as the full matrix rather
+        // than as spot checks, because the failure is a *missing* or *extra*
+        // entry and a spot check on the entries that exist cannot see either.
+        let expected: &[(SutChoice, &[Ecosystem])] = &[
+            (
+                SutChoice::Vulture,
+                &[Ecosystem::Python, Ecosystem::Polyglot],
+            ),
+            (
+                SutChoice::Knip,
+                &[Ecosystem::TypeScript, Ecosystem::Polyglot],
+            ),
+            (SutChoice::Deadcode, &[Ecosystem::Go]),
+            (SutChoice::Shear, &[Ecosystem::Rust]),
+        ];
+
+        for (choice, langs) in expected {
+            assert_eq!(
+                reads(choice),
+                Some(*langs),
+                "`--sut {}` reads the wrong set of languages",
+                choice.label()
+            );
+
+            for ecosystem in [
+                Ecosystem::Python,
+                Ecosystem::TypeScript,
+                Ecosystem::Rust,
+                Ecosystem::Go,
+                Ecosystem::Polyglot,
+            ] {
+                assert_eq!(
+                    was_read(choice, ecosystem),
+                    langs.contains(&ecosystem),
+                    "`--sut {}` on a {} class: the marker and the language map disagree",
+                    choice.label(),
+                    self::ecosystem(ecosystem),
+                );
+            }
+        }
+
+        // And the ones that declare nothing keep declaring nothing. An
+        // arbitrary command has unknown competence, which is not a claim in
+        // either direction.
+        for choice in [
+            SutChoice::Naive,
+            SutChoice::Refusing,
+            SutChoice::Command(vec!["mytool".to_string()]),
+        ] {
+            assert_eq!(reads(&choice), None, "got a language claim for {choice:?}");
+        }
+    }
+
+    #[test]
+    fn a_go_only_analyzer_is_marked_absent_on_every_other_ecosystem() {
+        // The concrete consequence of the map above, at the surface a human
+        // reads. deadcode graded against a Rust fixture opens no file, claims
+        // nothing, and would otherwise render identically to a tool that read
+        // the code and correctly kept it (§6.20).
+        let text = render_text(
+            &suite_in(Ecosystem::Rust),
+            &catalogue(),
+            &SutChoice::Deadcode,
+        );
+        assert!(text.contains("[NOT READ by this SUT]"), "got {text}");
+        assert!(text.contains("not measured: 1 of 1 classes"), "got {text}");
+
+        // Its own ecosystem carries no marker, or the marker stops carrying
+        // information and starts being noise a reader learns to skip.
+        let go = render_text(&suite_in(Ecosystem::Go), &catalogue(), &SutChoice::Deadcode);
+        assert!(!go.contains("NOT READ"), "got {go}");
+        assert!(!go.contains("not measured"), "got {go}");
+    }
+
+    #[test]
+    fn the_declared_completed_exit_codes_are_the_measured_ones() {
+        // Measured tables live on the constants; this pins the values so that a
+        // later edit has to go and change the documented measurement too.
+        //
+        // The direction of each mistake is the reason this is a test rather
+        // than a comment. A set that is too narrow refuses every productive run
+        // — knip and cargo-shear both report findings *by* exiting 1. A set
+        // that is too wide grades a crash as a clean scan: deadcode returns 1
+        // for "this is not a Go module" and for "your Go does not compile"
+        // alike, with empty stdout both times.
+        assert_eq!(VULTURE_COMPLETED_EXIT_CODES, [0, 3]);
+        assert_eq!(KNIP_COMPLETED_EXIT_CODES, [0, 1]);
+        assert_eq!(DEADCODE_COMPLETED_EXIT_CODES, [0]);
+        assert_eq!(SHEAR_COMPLETED_EXIT_CODES, [0, 1]);
+
+        // knip is the one tool that states its own health bit, so the CLI's
+        // copy must not disagree with it.
+        assert_eq!(
+            KNIP_COMPLETED_EXIT_CODES.as_slice(),
+            knip::SUCCESS_EXIT_CODES,
+            "the CLI and the knip adapter disagree about which exits are healthy"
+        );
+
+        // No named analyzer may declare 2 healthy. Every one of these tools
+        // uses it for "I could not run here at all" — no package.json, no
+        // Cargo.toml, an unparseable command line — and every one of those
+        // states has an empty or non-report stdout that parses to no claims,
+        // which is zero false removals, which is a passing gate.
+        for codes in [
+            VULTURE_COMPLETED_EXIT_CODES.as_slice(),
+            KNIP_COMPLETED_EXIT_CODES.as_slice(),
+            DEADCODE_COMPLETED_EXIT_CODES.as_slice(),
+            SHEAR_COMPLETED_EXIT_CODES.as_slice(),
+        ] {
+            assert!(!codes.contains(&2), "exit 2 declared healthy in {codes:?}");
+        }
+    }
+
+    #[test]
+    fn every_named_analyzer_discloses_an_envelope_and_a_mapping() {
+        // §9.2's second non-SARIF clause. A SUT wired without a disclosure
+        // publishes a number with nothing bounding it, and the omission is
+        // invisible in the report — there is simply one less paragraph.
+        for choice in [
+            SutChoice::Vulture,
+            SutChoice::Knip,
+            SutChoice::Deadcode,
+            SutChoice::Shear,
+        ] {
+            let disclosure = disclosure(&choice)
+                .unwrap_or_else(|| panic!("{} discloses nothing", choice.label()));
+            assert!(
+                !disclosure.envelope.trim().is_empty(),
+                "{} has an empty capability envelope",
+                choice.label()
+            );
+            assert!(
+                !disclosure.mapping.trim().is_empty(),
+                "{} has an empty mapping decision",
+                choice.label()
+            );
+        }
     }
 
     #[test]

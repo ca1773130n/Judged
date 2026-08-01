@@ -130,6 +130,10 @@ def main():
                 "legal_hold_until".to_string(),
             ],
             decoy_dead_paths: vec!["app/color_utils.py".into()],
+            // Index-aligned with the decoy above: a symbol-level analyzer never
+            // claims a path, so without this it is never asked a question it
+            // can answer (see `GroundTruth::decoy_dead_symbols`).
+            decoy_dead_symbols: vec!["to_hex".to_string()],
         })
     }
 }

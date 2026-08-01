@@ -179,6 +179,10 @@ module.exports = { createClient };
                 "reporting/textwrap_helper.py".into(),
                 "src/color_utils.js".into(),
             ],
+            // Index-aligned with the decoys above: without a symbol route a
+            // symbol-level analyzer is never asked a question it can answer
+            // here (see `GroundTruth::decoy_dead_symbols`).
+            decoy_dead_symbols: vec!["hang_indent".to_string(), "toHex".to_string()],
         })
     }
 }

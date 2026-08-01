@@ -141,6 +141,15 @@ export const FLAGS: Record<string, boolean> = { legacyCheckout: false };
 impl CheckedInGeneratedAsset {
     /// Repo-relative paths of the genuinely-dead files planted here.
     const DECOYS: [&'static str; 2] = ["dist/widget.0c9e142.js", "src/unusedFeatureFlags.ts"];
+
+    /// The symbol each decoy defines, index-aligned with [`Self::DECOYS`].
+    ///
+    /// The bundle's is `""`. Its only function is a single letter inside an
+    /// IIFE — not a module-level name any analyzer reports, and declaring `m`
+    /// would additionally make a claim of `anything.m` score as a decoy find.
+    /// A minified artifact has no symbol route, and saying so is the honest
+    /// declaration.
+    const DECOY_SYMBOLS: [&'static str; 2] = ["", "FLAGS"];
 }
 
 impl Mutant for CheckedInGeneratedAsset {
@@ -178,6 +187,10 @@ impl Mutant for CheckedInGeneratedAsset {
                 .iter()
                 .map(Path::new)
                 .map(Path::to_path_buf)
+                .collect(),
+            decoy_dead_symbols: Self::DECOY_SYMBOLS
+                .iter()
+                .map(|symbol| (*symbol).to_string())
                 .collect(),
         })
     }

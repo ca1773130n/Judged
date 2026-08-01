@@ -13,10 +13,12 @@
 //!   fixtures have gone soft and every future green is untrustworthy.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
+use judged_core::Result;
 use judged_mutants::fixtures;
 use judged_mutants::runner::{run_suite, SuiteReport};
-use judged_mutants::sut::{NaiveSut, RefusingSut};
+use judged_mutants::sut::{NaiveSut, RefusingSut, Sut, SutVerdict};
 
 /// A naive cleaner must be caught by at least this many distinct classes.
 ///
@@ -155,6 +157,124 @@ fn naive_sut_is_caught_by_the_catalogue() {
         caught,
         NAIVE_MUST_FAIL_AT_LEAST,
     );
+}
+
+/// A cleaner that only ever names symbols, never files.
+///
+/// The shape of every symbol-level analyzer — vulture, deadcode, a Kotlin
+/// unused-symbol check — and the shape [`NaiveSut`] cannot model, because it
+/// claims paths. It is scripted with the catalogue's own decoy symbols and
+/// claims one only when the decoy that defines it is present in the repository
+/// it is shown, so nothing leaks between mutants.
+struct SymbolOnlySut {
+    decoys: Vec<(PathBuf, String)>,
+}
+
+impl Sut for SymbolOnlySut {
+    fn name(&self) -> &str {
+        "symbol-only"
+    }
+    fn run(&self, repo: &Path) -> Result<SutVerdict> {
+        Ok(SutVerdict {
+            claimed_dead_paths: Vec::new(),
+            claimed_dead_symbols: self
+                .decoys
+                .iter()
+                .filter(|(path, _)| repo.join(path).is_file())
+                .map(|(_, symbol)| symbol.clone())
+                .collect(),
+        })
+    }
+}
+
+/// Every `(decoy, symbol)` pair the catalogue declares, with the decoys that
+/// have no symbol route left out.
+fn declared_decoy_symbols() -> Vec<(PathBuf, String)> {
+    let mut pairs = Vec::new();
+    for mutant in fixtures::all() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let truth = mutant
+            .materialize(dir.path())
+            .expect("fixture materializes");
+        for (path, symbol) in truth
+            .decoy_dead_paths
+            .iter()
+            .zip(truth.decoy_dead_symbols.iter())
+        {
+            if !symbol.is_empty() {
+                pairs.push((path.clone(), symbol.clone()));
+            }
+        }
+    }
+    pairs
+}
+
+#[test]
+fn a_symbol_level_cleaner_can_score_decoy_recall_at_all() {
+    // The measurement defect this control exists to keep fixed. Decoy recall
+    // used to be path-only, and a symbol-level analyzer never claims a path, so
+    // vulture scored 0 of 31 decoys — a number that reads as "found nothing"
+    // when the truth was "was never asked a question it could answer". §6.20:
+    // "no data" must be a distinct state from "zero executions", and the suite
+    // was committing that error against its own positive control.
+    //
+    // Scored against the real catalogue rather than a stub, because the claim
+    // being checked is about the fixtures: that each decoy really does declare
+    // a symbol a symbol-level tool could name.
+    let decoys = declared_decoy_symbols();
+    assert!(
+        !decoys.is_empty(),
+        "no fixture declares a decoy symbol, so the symbol half of decoy recall \
+         is unmeasurable and every symbol-level analyzer will score zero for a \
+         reason that has nothing to do with the analyzer"
+    );
+
+    let mutants = fixtures::all();
+    let report = run_suite(
+        &SymbolOnlySut {
+            decoys: decoys.clone(),
+        },
+        &mutants,
+    )
+    .expect("suite runs");
+
+    assert_eq!(
+        report.false_removal_count,
+        0,
+        "claiming only declared decoy symbols must remove nothing live; a \
+         non-zero count means a decoy symbol collides with a live one and the \
+         two halves of the grade contradict each other. Offenders: {:?}",
+        failing_classes(&report)
+    );
+
+    let found: usize = report.reports.iter().map(|r| r.decoys_found).sum();
+    assert_eq!(
+        found,
+        decoys.len(),
+        "a cleaner that names exactly the symbols the catalogue declares must \
+         find exactly that many decoy files, by the symbol route alone"
+    );
+}
+
+#[test]
+fn a_path_level_cleaner_still_finds_every_decoy_by_path_alone() {
+    // The other half, and the one that proves the symbol route was added rather
+    // than swapped in. Every decoy is unreferenced anywhere in its repository
+    // (`assert_decoys_are_unreferenced`), and NaiveSut claims a file whose
+    // basename appears in no other source file — so full recall here is
+    // structural, and anything less means the path route broke.
+    let mutants = fixtures::all();
+    let report = run_suite(&NaiveSut, &mutants).expect("suite runs");
+
+    for row in &report.reports {
+        assert!(row.decoys_total > 0, "{} plants no decoy", row.mutant_id);
+        assert_eq!(
+            row.decoys_found, row.decoys_total,
+            "{} lost decoy recall for a cleaner that names files: every decoy is \
+             referenced by nothing, so a basename search must find all of them",
+            row.mutant_id
+        );
+    }
 }
 
 #[test]

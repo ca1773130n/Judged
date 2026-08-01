@@ -178,6 +178,11 @@ impl GuardClause {
     /// is declared with `mod`, so neither is even compiled.
     const DECOYS: [&'static str; 2] = ["src/orphan_glob_cache.rs", "src/unused_depth_limit.rs"];
 
+    /// The symbol each decoy defines, index-aligned with [`Self::DECOYS`].
+    /// Without these a symbol-level analyzer scores zero decoys here and reads
+    /// as having found nothing (see `GroundTruth::decoy_dead_symbols`).
+    const DECOY_SYMBOLS: [&'static str; 2] = ["cache_key", "MAX_DEPTH"];
+
     /// Filesystem primitives that must not appear anywhere in the fixture.
     ///
     /// The research provenance of this class is a debloated `rm` that deleted
@@ -227,6 +232,10 @@ impl Mutant for GuardClause {
             // as catastrophic and as invisible as deleting the module.
             live_symbols: vec![LIVE_SYMBOL.to_string()],
             decoy_dead_paths: Self::DECOYS.iter().copied().map(PathBuf::from).collect(),
+            decoy_dead_symbols: Self::DECOY_SYMBOLS
+                .iter()
+                .map(|symbol| (*symbol).to_string())
+                .collect(),
         })
     }
 }

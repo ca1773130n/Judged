@@ -45,7 +45,8 @@
 //! silently mis-parsed; it is simply not read, and [`scan`] reports which files
 //! it did read.
 
-use std::collections::BTreeSet;
+use saphyr_parser::{Event, Marker, Parser, ScalarStyle, ScanError};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -886,568 +887,61 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 // ---------------------------------------------------------------------------
 //
 // `pyproject.toml` and `Cargo.toml` are the two manifests §5.2 puts in the Tier
-// A checklist that are written in TOML, and both are read here for a handful of
-// tables. What follows is a parser for the subset that reaches: tables, arrays
-// of tables, dotted and quoted keys, the four string forms, arrays, inline
-// tables, booleans, and comments.
+// A checklist that are written in TOML, and both are read with the `toml`
+// crate — the parser Cargo is itself built on, so a manifest Cargo accepts is a
+// manifest this module accepts.
 //
-// It is deliberately *strict* rather than lenient. A lenient parser that
-// shrugged at a construct it did not know would return a partial table, and a
-// partial table is indistinguishable from a manifest that declares nothing —
-// the §6.20 failure this whole module is built to avoid. Anything it cannot
-// account for is an error carrying the line it gave up on. Numbers and
-// datetimes are kept verbatim as [`Toml::Bare`] and never interpreted, because
-// no key this module reads is a number.
+// What stood here was a hand-written parser for the subset of TOML those two
+// files were assumed to need, and a subset of somebody else's file format is a
+// list of valid files we reject. It rejected ripgrep's `Cargo.toml`, whose
+// Debian `extended-description` opens with `"""\` — TOML 1.0 line continuation,
+// which trims the newline and the next line's leading whitespace — and all 76
+// of that repository's Tier A roots went with it.
+//
+// Strictness is unchanged and still the whole point (§6.20): `toml` refuses a
+// malformed document rather than handing back a partial table, and a partial
+// table is indistinguishable from a manifest that declares nothing.
 
-/// A TOML value, in the subset the Tier A manifests need.
-#[derive(Debug, Clone, PartialEq)]
-enum Toml {
-    Str(String),
-    Bool(bool),
-    /// An integer, float or datetime, unparsed. Kept so that a manifest
-    /// containing one is not an error, and never read as anything else.
-    Bare(String),
-    Array(Vec<Toml>),
-    /// Ordered so that `-printseeds` output follows the manifest, not the
-    /// alphabet — a human checking a root against the file reads top to bottom.
-    Table(Vec<(String, Toml)>),
+/// Parse a TOML manifest, naming the file and the line when it will not parse.
+fn parse_toml(path: &Path, content: &str) -> ManifestResult<toml::Value> {
+    // `from_str`, not `Value::from_str`: the latter parses a single TOML
+    // *value*, and a manifest is a document.
+    toml::from_str::<toml::Value>(content).map_err(|err| match err.span() {
+        Some(span) => ManifestError::at_line(path, line_at(content, span.start), err.message()),
+        None => ManifestError::parse(path, err.message()),
+    })
 }
 
-impl Toml {
-    fn as_str(&self) -> Option<&str> {
-        match self {
-            Toml::Str(s) => Some(s),
-            _ => None,
-        }
-    }
+/// The 1-based line holding byte `offset`.
+fn line_at(content: &str, offset: usize) -> usize {
+    content[..offset.min(content.len())]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
+}
 
-    fn as_array(&self) -> Option<&[Toml]> {
-        match self {
-            Toml::Array(items) => Some(items),
-            _ => None,
-        }
-    }
-
-    fn as_table(&self) -> Option<&[(String, Toml)]> {
-        match self {
-            Toml::Table(entries) => Some(entries),
-            _ => None,
-        }
-    }
-
-    fn get(&self, key: &str) -> Option<&Toml> {
-        self.as_table()?
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v)
-    }
-
-    fn get_path(&self, path: &[&str]) -> Option<&Toml> {
-        let mut node = self;
-        for key in path {
-            node = node.get(key)?;
-        }
-        Some(node)
-    }
-
-    fn type_name(&self) -> &'static str {
-        match self {
-            Toml::Str(_) => "a string",
-            Toml::Bool(_) => "a boolean",
-            Toml::Bare(_) => "a number or datetime",
-            Toml::Array(_) => "an array",
-            Toml::Table(_) => "a table",
-        }
+/// What the manifest actually holds, for an error that says so rather than
+/// saying only that a key was wrong.
+fn toml_type_name(value: &toml::Value) -> &'static str {
+    match value {
+        toml::Value::String(_) => "a string",
+        toml::Value::Integer(_) => "an integer",
+        toml::Value::Float(_) => "a float",
+        toml::Value::Boolean(_) => "a boolean",
+        toml::Value::Datetime(_) => "a datetime",
+        toml::Value::Array(_) => "an array",
+        toml::Value::Table(_) => "a table",
     }
 }
 
-/// One step of the "current table" path: a key, or an index into an array of
-/// tables produced by a `[[header]]`.
-enum Step {
-    Key(String),
-    Index(usize),
-}
-
-struct TomlParser<'a> {
-    path: &'a Path,
-    bytes: &'a [u8],
-    pos: usize,
-    line: usize,
-}
-
-impl<'a> TomlParser<'a> {
-    fn new(path: &'a Path, content: &'a str) -> TomlParser<'a> {
-        TomlParser {
-            path,
-            bytes: content.as_bytes(),
-            pos: 0,
-            line: 1,
-        }
-    }
-
-    fn err<T>(&self, detail: impl Into<String>) -> ManifestResult<T> {
-        Err(ManifestError::at_line(self.path, self.line, detail))
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn bump(&mut self) -> Option<u8> {
-        let byte = self.peek()?;
-        self.pos += 1;
-        if byte == b'\n' {
-            self.line += 1;
-        }
-        Some(byte)
-    }
-
-    fn eat(&mut self, byte: u8) -> bool {
-        if self.peek() == Some(byte) {
-            self.bump();
-            true
-        } else {
-            false
-        }
-    }
-
-    fn starts_with(&self, s: &str) -> bool {
-        self.bytes[self.pos..].starts_with(s.as_bytes())
-    }
-
-    /// Spaces and tabs only. Newlines are structural at the top level.
-    fn skip_inline_space(&mut self) {
-        while matches!(self.peek(), Some(b' ') | Some(b'\t') | Some(b'\r')) {
-            self.bump();
-        }
-    }
-
-    fn skip_comment(&mut self) {
-        if self.peek() == Some(b'#') {
-            while !matches!(self.peek(), None | Some(b'\n')) {
-                self.bump();
-            }
-        }
-    }
-
-    /// Everything that may appear between two structural tokens at the top
-    /// level: blank lines, indentation, comments.
-    fn skip_trivia(&mut self) {
-        loop {
-            self.skip_inline_space();
-            self.skip_comment();
-            if self.peek() == Some(b'\n') {
-                self.bump();
-            } else {
-                return;
-            }
-        }
-    }
-
-    /// Nothing but whitespace and a comment may follow a value on its line.
-    fn expect_line_end(&mut self) -> ManifestResult<()> {
-        self.skip_inline_space();
-        self.skip_comment();
-        match self.peek() {
-            None => Ok(()),
-            Some(b'\n') => {
-                self.bump();
-                Ok(())
-            }
-            Some(byte) => self.err(format!("unexpected {:?} after a value", byte as char)),
-        }
-    }
-
-    fn parse_document(&mut self) -> ManifestResult<Toml> {
-        let mut root = Toml::Table(Vec::new());
-        let mut current: Vec<Step> = Vec::new();
-
-        loop {
-            self.skip_trivia();
-            match self.peek() {
-                None => return Ok(root),
-                Some(b'[') => current = self.parse_header(&mut root)?,
-                _ => {
-                    let key = self.parse_dotted_key()?;
-                    self.skip_inline_space();
-                    if !self.eat(b'=') {
-                        return self.err("expected `=` after a key");
-                    }
-                    self.skip_inline_space();
-                    let value = self.parse_value()?;
-                    self.expect_line_end()?;
-                    let table = resolve_step_path(&mut root, &current).ok_or_else(|| {
-                        ManifestError::at_line(
-                            self.path,
-                            self.line,
-                            "internal: lost the current table",
-                        )
-                    })?;
-                    self.insert(table, &key, value)?;
-                }
-            }
-        }
-    }
-
-    /// `[a.b]` or `[[a.b]]`, returning the new current-table path.
-    fn parse_header(&mut self, root: &mut Toml) -> ManifestResult<Vec<Step>> {
-        let array = self.starts_with("[[");
-        self.bump();
-        if array {
-            self.bump();
-        }
-        self.skip_inline_space();
-        let key = self.parse_dotted_key()?;
-        self.skip_inline_space();
-        if !self.eat(b']') || (array && !self.eat(b']')) {
-            return self.err("unterminated table header");
-        }
-        self.expect_line_end()?;
-
-        let mut steps: Vec<Step> = Vec::new();
-        for (index, segment) in key.iter().enumerate() {
-            let last = index + 1 == key.len();
-            let node = resolve_step_path(root, &steps).ok_or_else(|| {
-                ManifestError::at_line(self.path, self.line, "internal: lost the current table")
-            })?;
-            let entries = match node {
-                Toml::Table(entries) => entries,
-                other => {
-                    return self.err(format!(
-                        "`{segment}` is declared inside {}, which is not a table",
-                        other.type_name()
-                    ))
-                }
-            };
-            if !entries.iter().any(|(k, _)| k == segment) {
-                let empty = if last && array {
-                    Toml::Array(Vec::new())
-                } else {
-                    Toml::Table(Vec::new())
-                };
-                entries.push((segment.clone(), empty));
-            }
-            steps.push(Step::Key(segment.clone()));
-
-            if last && array {
-                let node = resolve_step_path(root, &steps).ok_or_else(|| {
-                    ManifestError::at_line(self.path, self.line, "internal: lost the current table")
-                })?;
-                let Toml::Array(items) = node else {
-                    return self.err(format!("`{segment}` was already declared as a table, so `[[{segment}]]` cannot extend it"));
-                };
-                items.push(Toml::Table(Vec::new()));
-                steps.push(Step::Index(items.len() - 1));
-            } else {
-                // A `[[a]]` earlier in the file means later `[a.b]` headers
-                // address the *last* element of the array (TOML 1.0).
-                let node = resolve_step_path(root, &steps).ok_or_else(|| {
-                    ManifestError::at_line(self.path, self.line, "internal: lost the current table")
-                })?;
-                if let Toml::Array(items) = node {
-                    if items.is_empty() {
-                        return self.err(format!("`{segment}` is an array with no tables in it"));
-                    }
-                    steps.push(Step::Index(items.len() - 1));
-                }
-            }
-        }
-        Ok(steps)
-    }
-
-    /// `a`, `a.b`, `"a.b"`, `'a'` — returns the segments with quoting removed.
-    fn parse_dotted_key(&mut self) -> ManifestResult<Vec<String>> {
-        let mut segments = Vec::new();
-        loop {
-            self.skip_inline_space();
-            let segment = match self.peek() {
-                Some(b'"') => self.parse_basic_string()?,
-                Some(b'\'') => self.parse_literal_string()?,
-                _ => {
-                    let start = self.pos;
-                    while matches!(self.peek(), Some(b) if b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-                    {
-                        self.bump();
-                    }
-                    if self.pos == start {
-                        return self.err("expected a key");
-                    }
-                    String::from_utf8_lossy(&self.bytes[start..self.pos]).into_owned()
-                }
-            };
-            segments.push(segment);
-            self.skip_inline_space();
-            if !self.eat(b'.') {
-                return Ok(segments);
-            }
-        }
-    }
-
-    fn parse_value(&mut self) -> ManifestResult<Toml> {
-        match self.peek() {
-            Some(b'"') => {
-                if self.starts_with(r#"""""#) {
-                    self.parse_multiline_string(r#"""""#).map(Toml::Str)
-                } else {
-                    self.parse_basic_string().map(Toml::Str)
-                }
-            }
-            Some(b'\'') => {
-                if self.starts_with("'''") {
-                    self.parse_multiline_string("'''").map(Toml::Str)
-                } else {
-                    self.parse_literal_string().map(Toml::Str)
-                }
-            }
-            Some(b'[') => self.parse_array(),
-            Some(b'{') => self.parse_inline_table(),
-            Some(_) => self.parse_bare_value(),
-            None => self.err("expected a value"),
-        }
-    }
-
-    fn parse_basic_string(&mut self) -> ManifestResult<String> {
-        self.bump(); // opening quote
-        let mut out = String::new();
-        loop {
-            match self.bump() {
-                None | Some(b'\n') => return self.err("unterminated string"),
-                Some(b'"') => return Ok(out),
-                Some(b'\\') => out.push(self.parse_escape()?),
-                Some(byte) => self.push_utf8(&mut out, byte),
-            }
-        }
-    }
-
-    fn parse_literal_string(&mut self) -> ManifestResult<String> {
-        self.bump(); // opening quote
-        let mut out = String::new();
-        loop {
-            match self.bump() {
-                None | Some(b'\n') => return self.err("unterminated literal string"),
-                Some(b'\'') => return Ok(out),
-                Some(byte) => self.push_utf8(&mut out, byte),
-            }
-        }
-    }
-
-    fn parse_multiline_string(&mut self, fence: &str) -> ManifestResult<String> {
-        for _ in 0..3 {
-            self.bump();
-        }
-        // A newline immediately after the opening fence is trimmed (TOML 1.0).
-        if self.peek() == Some(b'\n') {
-            self.bump();
-        }
-        let basic = fence.starts_with('"');
-        let mut out = String::new();
-        loop {
-            if self.starts_with(fence) {
-                for _ in 0..3 {
-                    self.bump();
-                }
-                return Ok(out);
-            }
-            match self.bump() {
-                None => return self.err("unterminated multi-line string"),
-                Some(b'\\') if basic => out.push(self.parse_escape()?),
-                Some(byte) => self.push_utf8(&mut out, byte),
-            }
-        }
-    }
-
-    fn parse_escape(&mut self) -> ManifestResult<char> {
-        match self.bump() {
-            Some(b'n') => Ok('\n'),
-            Some(b't') => Ok('\t'),
-            Some(b'r') => Ok('\r'),
-            Some(b'"') => Ok('"'),
-            Some(b'\\') => Ok('\\'),
-            Some(b'b') => Ok('\u{8}'),
-            Some(b'f') => Ok('\u{c}'),
-            Some(b'u') => self.parse_unicode_escape(4),
-            Some(b'U') => self.parse_unicode_escape(8),
-            Some(byte) => self.err(format!("unknown escape `\\{}`", byte as char)),
-            None => self.err("string ends in a backslash"),
-        }
-    }
-
-    fn parse_unicode_escape(&mut self, digits: usize) -> ManifestResult<char> {
-        let mut value: u32 = 0;
-        for _ in 0..digits {
-            let byte = match self.bump() {
-                Some(b) => b,
-                None => return self.err("truncated unicode escape"),
-            };
-            match (byte as char).to_digit(16) {
-                Some(digit) => value = value * 16 + digit,
-                None => return self.err("non-hex digit in a unicode escape"),
-            }
-        }
-        match char::from_u32(value) {
-            Some(c) => Ok(c),
-            None => self.err("unicode escape is not a scalar value"),
-        }
-    }
-
-    /// Bytes arrive one at a time, so a multi-byte UTF-8 sequence is
-    /// reassembled here rather than lost.
-    fn push_utf8(&mut self, out: &mut String, first: u8) {
-        if first.is_ascii() {
-            out.push(first as char);
-            return;
-        }
-        let extra = match first {
-            0xC0..=0xDF => 1,
-            0xE0..=0xEF => 2,
-            _ => 3,
-        };
-        let start = self.pos - 1;
-        for _ in 0..extra {
-            self.bump();
-        }
-        out.push_str(&String::from_utf8_lossy(&self.bytes[start..self.pos]));
-    }
-
-    fn parse_array(&mut self) -> ManifestResult<Toml> {
-        self.bump(); // '['
-        let mut items = Vec::new();
-        loop {
-            self.skip_trivia();
-            if self.peek().is_none() {
-                return self.err("unterminated array");
-            }
-            if self.eat(b']') {
-                return Ok(Toml::Array(items));
-            }
-            items.push(self.parse_value()?);
-            self.skip_trivia();
-            if self.eat(b',') {
-                continue;
-            }
-            self.skip_trivia();
-            if self.eat(b']') {
-                return Ok(Toml::Array(items));
-            }
-            return self.err("expected `,` or `]` in an array");
-        }
-    }
-
-    fn parse_inline_table(&mut self) -> ManifestResult<Toml> {
-        self.bump(); // '{'
-        let mut table = Toml::Table(Vec::new());
-        loop {
-            self.skip_inline_space();
-            if self.peek().is_none() {
-                return self.err("unterminated inline table");
-            }
-            if self.eat(b'}') {
-                return Ok(table);
-            }
-            let key = self.parse_dotted_key()?;
-            self.skip_inline_space();
-            if !self.eat(b'=') {
-                return self.err("expected `=` in an inline table");
-            }
-            self.skip_inline_space();
-            let value = self.parse_value()?;
-            self.insert(&mut table, &key, value)?;
-            self.skip_inline_space();
-            if self.eat(b',') {
-                continue;
-            }
-            if self.eat(b'}') {
-                return Ok(table);
-            }
-            return self.err("expected `,` or `}` in an inline table");
-        }
-    }
-
-    /// `true`, `false`, or a number/datetime kept verbatim.
-    ///
-    /// The charset check is what stops a lenient read of garbage: `name =
-    /// widget` and `name = @@@` are both rejected here rather than silently
-    /// becoming strings.
-    fn parse_bare_value(&mut self) -> ManifestResult<Toml> {
-        let start = self.pos;
-        while matches!(self.peek(), Some(b) if !b" \t\r\n,]}#".contains(&b)) {
-            self.bump();
-        }
-        let token = String::from_utf8_lossy(&self.bytes[start..self.pos]).into_owned();
-        match token.as_str() {
-            "true" => return Ok(Toml::Bool(true)),
-            "false" => return Ok(Toml::Bool(false)),
-            "" => return self.err("expected a value"),
-            _ => {}
-        }
-        let numeric = token.starts_with(|c: char| c.is_ascii_digit() || c == '+' || c == '-')
-            && token
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-' | '.' | ':'));
-        if numeric {
-            Ok(Toml::Bare(token))
-        } else {
-            self.err(format!(
-                "`{token}` is not a value: strings must be quoted, and this is not a number, a datetime, or a boolean"
-            ))
-        }
-    }
-
-    fn insert(&self, table: &mut Toml, key: &[String], value: Toml) -> ManifestResult<()> {
-        let mut node = table;
-        for segment in &key[..key.len() - 1] {
-            let Toml::Table(entries) = node else {
-                return Err(ManifestError::at_line(
-                    self.path,
-                    self.line,
-                    format!("`{segment}` is not inside a table"),
-                ));
-            };
-            if !entries.iter().any(|(k, _)| k == segment) {
-                entries.push((segment.clone(), Toml::Table(Vec::new())));
-            }
-            node = entries
-                .iter_mut()
-                .find(|(k, _)| k == segment)
-                .map(|(_, v)| v)
-                .expect("just inserted");
-        }
-        let last = &key[key.len() - 1];
-        let Toml::Table(entries) = node else {
-            return Err(ManifestError::at_line(
-                self.path,
-                self.line,
-                format!("`{last}` is not inside a table"),
-            ));
-        };
-        if entries.iter().any(|(k, _)| k == last) {
-            return Err(ManifestError::at_line(
-                self.path,
-                self.line,
-                format!("`{last}` is defined twice"),
-            ));
-        }
-        entries.push((last.clone(), value));
-        Ok(())
-    }
-}
-
-fn resolve_step_path<'a>(root: &'a mut Toml, steps: &[Step]) -> Option<&'a mut Toml> {
-    let mut node = root;
-    for step in steps {
-        node = match (step, node) {
-            (Step::Key(key), Toml::Table(entries)) => {
-                entries.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v)?
-            }
-            (Step::Index(index), Toml::Array(items)) => items.get_mut(*index)?,
-            _ => return None,
-        };
+/// Follow a key path, stopping at the first segment the document does not have.
+fn toml_path<'a>(value: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Value> {
+    let mut node = value;
+    for key in path {
+        node = node.get(key)?;
     }
     Some(node)
-}
-
-fn parse_toml(path: &Path, content: &str) -> ManifestResult<Toml> {
-    TomlParser::new(path, content).parse_document()
 }
 
 /// Render one key-path segment for an [`Origin`], quoting it when it contains a
@@ -1465,12 +959,12 @@ fn toml_key_segment(segment: &str) -> String {
     }
 }
 
-fn toml_str<'a>(path: &Path, key: &str, value: &'a Toml) -> ManifestResult<&'a str> {
+fn toml_str<'a>(path: &Path, key: &str, value: &'a toml::Value) -> ManifestResult<&'a str> {
     value.as_str().ok_or_else(|| {
         ManifestError::at_key(
             path,
             key,
-            format!("must be a string, found {}", value.type_name()),
+            format!("must be a string, found {}", toml_type_name(value)),
         )
     })
 }
@@ -1499,7 +993,7 @@ pub fn parse_pyproject_toml(manifest: &Path, content: &str) -> ManifestResult<Ma
         ("scripts", RootKind::Executable),
         ("gui-scripts", RootKind::Executable),
     ] {
-        if let Some(node) = doc.get_path(&["project", table]) {
+        if let Some(node) = toml_path(&doc, &["project", table]) {
             let entries = expect_toml_table(manifest, &format!("project.{table}"), node)?;
             for (name, value) in entries {
                 let key = format!("project.{table}.{}", toml_key_segment(name));
@@ -1509,7 +1003,7 @@ pub fn parse_pyproject_toml(manifest: &Path, content: &str) -> ManifestResult<Ma
         }
     }
 
-    if let Some(node) = doc.get_path(&["project", "entry-points"]) {
+    if let Some(node) = toml_path(&doc, &["project", "entry-points"]) {
         let groups = expect_toml_table(manifest, "project.entry-points", node)?;
         for (group, members) in groups {
             let group_key = format!("project.entry-points.{}", toml_key_segment(group));
@@ -1533,13 +1027,13 @@ pub fn parse_pyproject_toml(manifest: &Path, content: &str) -> ManifestResult<Ma
 fn expect_toml_table<'a>(
     manifest: &Path,
     key: &str,
-    value: &'a Toml,
-) -> ManifestResult<&'a [(String, Toml)]> {
+    value: &'a toml::Value,
+) -> ManifestResult<&'a toml::Table> {
     value.as_table().ok_or_else(|| {
         ManifestError::at_key(
             manifest,
             key,
-            format!("must be a table, found {}", value.type_name()),
+            format!("must be a table, found {}", toml_type_name(value)),
         )
     })
 }
@@ -1589,7 +1083,7 @@ pub fn parse_cargo_toml(manifest: &Path, content: &str) -> ManifestResult<Manife
             ManifestError::at_key(
                 manifest,
                 table,
-                format!("must be an array of tables, found {}", node.type_name()),
+                format!("must be an array of tables, found {}", toml_type_name(node)),
             )
         })?;
         for (index, item) in items.iter().enumerate() {
@@ -1606,17 +1100,15 @@ fn push_cargo_target(
     manifest: &Path,
     dir: &Path,
     key: &str,
-    entries: &[(String, Toml)],
+    entries: &toml::Table,
     kind: RootKind,
     out: &mut ManifestRoots,
 ) -> ManifestResult<()> {
-    let lookup = |name: &str| entries.iter().find(|(k, _)| k == name).map(|(_, v)| v);
-
-    if let Some(path) = lookup("path") {
+    if let Some(path) = entries.get("path") {
         let key = key_join(key, "path");
         let text = toml_str(manifest, &key, path)?;
         out.push(kind, manifest, key, rel_path(dir, text));
-    } else if let Some(name) = lookup("name") {
+    } else if let Some(name) = entries.get("name") {
         let key = key_join(key, "name");
         let text = toml_str(manifest, &key, name)?;
         out.push(kind, manifest, key, RootTarget::Reference(text.to_string()));
@@ -1627,12 +1119,12 @@ fn push_cargo_target(
 fn push_crate_type_declaration(
     manifest: &Path,
     key: &str,
-    entries: &[(String, Toml)],
+    entries: &toml::Table,
     out: &mut ManifestRoots,
 ) -> ManifestResult<()> {
     // Cargo accepts both spellings; the key recorded is the one written.
     for spelling in ["crate-type", "crate_type"] {
-        let Some(value) = entries.iter().find(|(k, _)| k == spelling).map(|(_, v)| v) else {
+        let Some(value) = entries.get(spelling) else {
             continue;
         };
         let key = key_join(key, spelling);
@@ -1640,7 +1132,7 @@ fn push_crate_type_declaration(
             ManifestError::at_key(
                 manifest,
                 &key,
-                format!("must be an array, found {}", value.type_name()),
+                format!("must be an array, found {}", toml_type_name(value)),
             )
         })?;
         for (index, item) in items.iter().enumerate() {
@@ -1770,14 +1262,22 @@ pub fn parse_setup_cfg(manifest: &Path, content: &str) -> ManifestResult<Manifes
 
 /// Every directive `go.mod` may contain. An unknown one means this is not a
 /// `go.mod` we understand, which is not the same as one declaring no roots.
-const GO_MOD_DIRECTIVES: [&str; 7] = [
+///
+/// The list is a moving target and being one release behind it is a defect, not
+/// a limitation: `godebug` has existed since Go 1.23, and rejecting it cost
+/// sample-controller — whose `go.mod` is generated, and carries one — its
+/// entire Tier A root set. `tool` arrived in 1.24 and `ignore` in 1.25.
+const GO_MOD_DIRECTIVES: [&str; 10] = [
     "module",
     "go",
     "toolchain",
+    "godebug",
     "require",
     "replace",
     "exclude",
     "retract",
+    "tool",
+    "ignore",
 ];
 
 /// Parse a `go.mod` for the module path.
@@ -2201,15 +1701,24 @@ fn shell_split(text: &str) -> Vec<String> {
 // YAML
 // ---------------------------------------------------------------------------
 //
-// §5.2 asks for `.github/workflows/*.yml` `run:` bodies and `uses:` paths. A
-// line scanner would find most of them, and would be the wrong tool for exactly
-// one reason: it can never fail. A scanner that shrugs at a file it does not
-// understand reports "this workflow declares no roots", which is the §6.20
-// failure the whole module exists to avoid. So this is a real, if small,
-// parser: block mappings and sequences, the four scalar styles, block scalars
-// with their indicators and chomping, and flow collections. Anchors, aliases,
-// tags and multi-document streams are *rejected*, not ignored — a construct we
-// do not model is an error with a line number, never silence.
+// §5.2 asks for `.github/workflows/*.yml` `run:` bodies and `uses:` paths, and
+// the reading is done by `saphyr-parser`: a YAML 1.2 parser, pure Rust, no
+// `unsafe`, and the maintained line of descent from `yaml-rust`.
+//
+// It is used as an event stream rather than through a value tree, for two
+// reasons. Nothing here wants YAML's type resolution — `on:` is a key GitHub
+// reads, not the boolean `true`, and every value this module records is
+// transcribed as written. And a value tree resolves anchors and aliases
+// silently, where this module wants to refuse them: GitHub does not expand
+// anchors in a workflow, so a file using one does not mean here what it says.
+//
+// What stood here was a hand-written parser for the subset of YAML workflows
+// were assumed to use. It read a trailing comment as a key's value and it could
+// not read a flow mapping, and between them those two rejected five of the nine
+// repositories in the out-of-sample corpus. A construct we do not model is
+// still an error carrying a line number, never silence — but "do not model" now
+// means anchors, aliases and tags, and no longer means "written on one line
+// instead of three".
 
 #[derive(Debug, Clone, PartialEq)]
 enum Yaml {
@@ -2219,467 +1728,185 @@ enum Yaml {
     Empty,
 }
 
-struct YamlParser<'a> {
-    path: &'a Path,
-    lines: Vec<&'a str>,
-    pos: usize,
-    /// A mapping that began on a sequence line (`- uses: x`) is re-presented to
-    /// the mapping parser as a line of its own, indented to the column the key
-    /// actually starts at.
-    pending: Option<(usize, usize, String)>,
-    started: bool,
+/// A collection under construction: its children so far, and — for a mapping —
+/// the key still waiting for its value.
+enum Frame {
+    Seq(Vec<Yaml>),
+    Map(Vec<(String, Yaml)>, Option<String>),
 }
 
-/// One significant line: 1-based number, indent column, content.
-type YamlLine = (usize, usize, String);
+/// Parse a YAML document into [`Yaml`].
+///
+/// Mappings keep the order they were written in, because `-printseeds` output
+/// a human checks against the file has to read top to bottom.
+fn parse_yaml(path: &Path, content: &str) -> ManifestResult<Yaml> {
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut document = Yaml::Empty;
+    let mut documents = 0usize;
 
-impl<'a> YamlParser<'a> {
-    fn new(path: &'a Path, content: &'a str) -> YamlParser<'a> {
-        YamlParser {
-            path,
-            lines: content.lines().collect(),
-            pos: 0,
-            pending: None,
-            started: false,
-        }
-    }
+    for event in Parser::new_from_str(content) {
+        let (event, span) = event.map_err(|err| {
+            ManifestError::at_line(path, err.marker().line(), yaml_detail(content, &err))
+        })?;
+        let line = span.start.line();
 
-    fn err<T>(&self, line: usize, detail: impl Into<String>) -> ManifestResult<T> {
-        Err(ManifestError::at_line(self.path, line, detail))
-    }
-
-    /// The next line that carries structure, without consuming it.
-    fn peek(&mut self) -> ManifestResult<Option<YamlLine>> {
-        if let Some(pending) = &self.pending {
-            return Ok(Some(pending.clone()));
-        }
-        while self.pos < self.lines.len() {
-            let raw = self.lines[self.pos];
-            let indent = raw.len() - raw.trim_start_matches(' ').len();
-            let content = raw[indent..].trim_end();
-            if content.is_empty() || content.starts_with('#') {
-                self.pos += 1;
-                continue;
-            }
-            if content.starts_with('\t') || raw[..indent].contains('\t') {
-                return self.err(self.pos + 1, "a tab may not indent a YAML line");
-            }
-            if indent == 0 && (content == "---" || content == "...") {
-                if self.started {
-                    return self.err(
-                        self.pos + 1,
-                        "more than one document in a workflow file is not modelled",
-                    );
-                }
-                self.pos += 1;
-                continue;
-            }
-            self.started = true;
-            return Ok(Some((self.pos + 1, indent, content.to_string())));
-        }
-        Ok(None)
-    }
-
-    fn consume(&mut self) {
-        if self.pending.take().is_none() {
-            self.pos += 1;
-        }
-    }
-
-    fn parse_document(&mut self) -> ManifestResult<Yaml> {
-        let Some((_, indent, _)) = self.peek()? else {
-            return Ok(Yaml::Empty);
-        };
-        let node = self.parse_node(indent)?;
-        if let Some((line, _, _)) = self.peek()? {
-            return self.err(line, "content after the end of the document");
-        }
-        Ok(node)
-    }
-
-    fn parse_node(&mut self, indent: usize) -> ManifestResult<Yaml> {
-        let Some((line, actual, content)) = self.peek()? else {
-            return Ok(Yaml::Empty);
-        };
-        if actual < indent {
-            return Ok(Yaml::Empty);
-        }
-        if actual > indent {
-            return self.err(line, "unexpected indentation");
-        }
-        if is_sequence_entry(&content) {
-            self.parse_seq(indent)
-        } else {
-            self.parse_map(indent)
-        }
-    }
-
-    fn parse_map(&mut self, indent: usize) -> ManifestResult<Yaml> {
-        let mut entries: Vec<(String, Yaml)> = Vec::new();
-        loop {
-            let Some((line, actual, content)) = self.peek()? else {
-                break;
-            };
-            if actual < indent {
-                break;
-            }
-            if actual > indent {
-                return self.err(line, "unexpected indentation");
-            }
-            if is_sequence_entry(&content) {
-                return self.err(line, "a sequence entry where a mapping key was expected");
-            }
-            let Some((key, rest)) = split_key(&content) else {
-                return self.err(line, format!("`{content}` is not `key: value`"));
-            };
-            self.consume();
-            let value = self.parse_value(line, indent, rest)?;
-            if entries.iter().any(|(k, _)| *k == key) {
-                return self.err(line, format!("`{key}` is defined twice"));
-            }
-            entries.push((key, value));
-        }
-        Ok(Yaml::Map(entries))
-    }
-
-    fn parse_seq(&mut self, indent: usize) -> ManifestResult<Yaml> {
-        let mut items = Vec::new();
-        loop {
-            let Some((line, actual, content)) = self.peek()? else {
-                break;
-            };
-            if actual < indent || !is_sequence_entry(&content) {
-                break;
-            }
-            if actual > indent {
-                return self.err(line, "unexpected indentation");
-            }
-            let after_dash = &content[1..];
-            let rest = after_dash.trim_start();
-            let column = indent + 1 + (after_dash.len() - rest.len());
-            self.consume();
-            if rest.is_empty() {
-                items.push(self.parse_child(indent)?);
-            } else if split_key(rest).is_some() {
-                // `- uses: x` opens a mapping at the column the key sits in.
-                self.pending = Some((line, column, rest.to_string()));
-                items.push(self.parse_map(column)?);
-            } else {
-                items.push(self.parse_value(line, indent, rest)?);
-            }
-        }
-        Ok(Yaml::Seq(items))
-    }
-
-    /// The value of `key:` — either on the same line, or the block under it.
-    fn parse_value(&mut self, line: usize, indent: usize, rest: &str) -> ManifestResult<Yaml> {
-        if rest.is_empty() {
-            return self.parse_child(indent);
-        }
-        if let Some((style, chomp)) = block_scalar_header(rest) {
-            return self.read_block_scalar(indent, style, chomp);
-        }
-        parse_flow(self.path, line, rest)
-    }
-
-    /// The block nested under a key or a bare `-`.
-    ///
-    /// A sequence is allowed to sit at the *same* column as its key — both
-    /// styles are ubiquitous in workflow files — but a mapping must be deeper.
-    fn parse_child(&mut self, indent: usize) -> ManifestResult<Yaml> {
-        let Some((_, actual, content)) = self.peek()? else {
-            return Ok(Yaml::Empty);
-        };
-        if actual > indent {
-            return self.parse_node(actual);
-        }
-        if actual == indent && is_sequence_entry(&content) {
-            return self.parse_seq(indent);
-        }
-        Ok(Yaml::Empty)
-    }
-
-    fn read_block_scalar(&mut self, indent: usize, style: u8, chomp: u8) -> ManifestResult<Yaml> {
-        let mut raw: Vec<&str> = Vec::new();
-        while self.pos < self.lines.len() {
-            let line = self.lines[self.pos];
-            let line_indent = line.len() - line.trim_start_matches(' ').len();
-            if line.trim().is_empty() {
-                raw.push("");
-                self.pos += 1;
-                continue;
-            }
-            if line_indent <= indent {
-                break;
-            }
-            raw.push(line);
-            self.pos += 1;
-        }
-        while raw.last().is_some_and(|l| l.is_empty()) {
-            raw.pop();
-        }
-        let content_indent = raw
-            .iter()
-            .find(|l| !l.is_empty())
-            .map(|l| l.len() - l.trim_start_matches(' ').len())
-            .unwrap_or(0);
-        let dedented: Vec<&str> = raw
-            .iter()
-            .map(|l| {
-                if l.len() > content_indent {
-                    &l[content_indent..]
-                } else {
-                    ""
-                }
-            })
-            .collect();
-
-        let mut body = if style == b'|' {
-            dedented.join("\n")
-        } else {
-            // Folded: a line break between two non-empty lines becomes a space.
-            let mut folded = String::new();
-            for (index, line) in dedented.iter().enumerate() {
-                if index > 0 {
-                    if line.is_empty() || dedented[index - 1].is_empty() {
-                        folded.push('\n');
-                    } else {
-                        folded.push(' ');
-                    }
-                }
-                folded.push_str(line);
-            }
-            folded
-        };
-        match chomp {
-            b'-' => {}
-            b'+' => body.push('\n'),
-            _ if !body.is_empty() => body.push('\n'),
-            _ => {}
-        }
-        Ok(Yaml::Scalar(body))
-    }
-}
-
-fn is_sequence_entry(content: &str) -> bool {
-    content == "-" || content.starts_with("- ")
-}
-
-/// `|`, `>`, with an optional chomping indicator. Returns (style, chomp).
-fn block_scalar_header(rest: &str) -> Option<(u8, u8)> {
-    let bytes = rest.as_bytes();
-    let style = *bytes.first()?;
-    if style != b'|' && style != b'>' {
-        return None;
-    }
-    let mut chomp = b' ';
-    for &byte in &bytes[1..] {
-        match byte {
-            b'+' | b'-' => chomp = byte,
-            b'0'..=b'9' => {}
-            _ => return None,
-        }
-    }
-    Some((style, chomp))
-}
-
-/// Split `key: value`, honouring quoted keys. `None` when the line is not a
-/// mapping entry at all.
-fn split_key(content: &str) -> Option<(String, &str)> {
-    let bytes = content.as_bytes();
-    let (key, after) = match bytes.first()? {
-        quote @ (b'"' | b'\'') => {
-            let end = content[1..].find(*quote as char)? + 1;
-            (content[1..end].to_string(), &content[end + 1..])
-        }
-        _ => {
-            let mut index = 0;
-            loop {
-                let offset = content[index..].find(':')? + index;
-                let next = content.as_bytes().get(offset + 1);
-                if next.is_none() || next == Some(&b' ') {
-                    break (content[..offset].trim().to_string(), &content[offset + 1..]);
-                }
-                index = offset + 1;
-            }
-        }
-    };
-    let after = after.strip_prefix(':').unwrap_or(after);
-    if key.is_empty() || key.contains('#') {
-        return None;
-    }
-    Some((key, after.trim()))
-}
-
-/// A scalar or flow collection written on one line.
-fn parse_flow(path: &Path, line: usize, text: &str) -> ManifestResult<Yaml> {
-    let text = strip_trailing_comment(text);
-    match text.as_bytes().first() {
-        None => Ok(Yaml::Empty),
-        Some(b'&' | b'*' | b'!') => Err(ManifestError::at_line(
-            path,
-            line,
-            "anchors, aliases and tags are not modelled",
-        )),
-        Some(b'"' | b'\'') => {
-            let (value, rest) = read_quoted(path, line, text)?;
-            if !rest.trim().is_empty() {
-                return Err(ManifestError::at_line(
-                    path,
-                    line,
-                    "trailing text after a quoted scalar",
-                ));
-            }
-            Ok(Yaml::Scalar(value))
-        }
-        Some(b'[') | Some(b'{') => {
-            let (value, rest) = read_flow_collection(path, line, text)?;
-            if !rest.trim().is_empty() {
-                return Err(ManifestError::at_line(
-                    path,
-                    line,
-                    "trailing text after a flow collection",
-                ));
-            }
-            Ok(value)
-        }
-        _ => Ok(Yaml::Scalar(text.to_string())),
-    }
-}
-
-fn strip_trailing_comment(text: &str) -> &str {
-    let bytes = text.as_bytes();
-    let mut quote: Option<u8> = None;
-    for (index, &byte) in bytes.iter().enumerate() {
-        match (quote, byte) {
-            (Some(q), b) if b == q => quote = None,
-            (Some(_), _) => {}
-            (None, b'"' | b'\'') => quote = Some(byte),
-            (None, b'#') if index == 0 || bytes[index - 1] == b' ' => {
-                return text[..index].trim_end();
-            }
-            _ => {}
-        }
-    }
-    text.trim_end()
-}
-
-fn read_quoted<'a>(path: &Path, line: usize, text: &'a str) -> ManifestResult<(String, &'a str)> {
-    let quote = text.as_bytes()[0];
-    let mut out = String::new();
-    let mut chars = text.char_indices().skip(1);
-    while let Some((index, c)) = chars.next() {
-        if c as u8 == quote && quote == b'\'' {
-            // `''` is an escaped quote inside a single-quoted scalar.
-            if text[index + 1..].starts_with('\'') {
-                out.push('\'');
-                chars.next();
-                continue;
-            }
-            return Ok((out, &text[index + 1..]));
-        }
-        if c == '\\' && quote == b'"' {
-            match chars.next() {
-                Some((_, 'n')) => out.push('\n'),
-                Some((_, 't')) => out.push('\t'),
-                Some((_, other)) => out.push(other),
-                None => break,
-            }
-            continue;
-        }
-        if c as u8 == quote {
-            return Ok((out, &text[index + 1..]));
-        }
-        out.push(c);
-    }
-    Err(ManifestError::at_line(
-        path,
-        line,
-        "unterminated quoted scalar",
-    ))
-}
-
-fn read_flow_collection<'a>(
-    path: &Path,
-    line: usize,
-    text: &'a str,
-) -> ManifestResult<(Yaml, &'a str)> {
-    let (open, close) = match text.as_bytes()[0] {
-        b'[' => (b'[', b']'),
-        _ => (b'{', b'}'),
-    };
-    let mut rest = &text[1..];
-    let mut items: Vec<Yaml> = Vec::new();
-    let mut pairs: Vec<(String, Yaml)> = Vec::new();
-    loop {
-        rest = rest.trim_start();
-        if rest.is_empty() {
-            return Err(ManifestError::at_line(
-                path,
-                line,
-                "unterminated flow collection",
-            ));
-        }
-        if rest.as_bytes()[0] == close {
-            let node = if open == b'[' {
-                Yaml::Seq(items)
-            } else {
-                Yaml::Map(pairs)
-            };
-            return Ok((node, &rest[1..]));
-        }
-        let (element, after) = read_flow_element(path, line, rest)?;
-        rest = after;
-        if open == b'[' {
-            items.push(element);
-        } else {
-            let Yaml::Scalar(key) = element else {
-                return Err(ManifestError::at_line(
-                    path,
-                    line,
-                    "a flow mapping key must be a scalar",
-                ));
-            };
-            let (key, value_text) = match key.split_once(':') {
-                Some((k, v)) => (k.trim().to_string(), v.trim().to_string()),
-                None => {
+        let node = match event {
+            Event::Nothing | Event::StreamStart | Event::StreamEnd | Event::DocumentEnd => continue,
+            Event::DocumentStart(_) => {
+                documents += 1;
+                if documents > 1 {
                     return Err(ManifestError::at_line(
                         path,
                         line,
-                        "a flow mapping needs `key: value`",
-                    ))
+                        "more than one document in a workflow file is not modelled",
+                    ));
                 }
-            };
-            pairs.push((key, Yaml::Scalar(value_text)));
-        }
-        rest = rest.trim_start();
-        if rest.starts_with(',') {
-            rest = &rest[1..];
+                continue;
+            }
+            // An alias is only ever a reference to an anchor, so both spellings
+            // of the construct land on the same sentence.
+            Event::Alias(_) => {
+                return Err(ManifestError::at_line(
+                    path,
+                    line,
+                    "anchors and aliases are not modelled in a workflow file",
+                ))
+            }
+            Event::Scalar(value, style, anchor, tag) => {
+                reject_anchor_or_tag(path, line, anchor, tag.is_some())?;
+                if style == ScalarStyle::Plain && is_yaml_null(&value) {
+                    Yaml::Empty
+                } else {
+                    Yaml::Scalar(value.into_owned())
+                }
+            }
+            Event::SequenceStart(anchor, tag) => {
+                reject_anchor_or_tag(path, line, anchor, tag.is_some())?;
+                stack.push(Frame::Seq(Vec::new()));
+                continue;
+            }
+            Event::MappingStart(anchor, tag) => {
+                reject_anchor_or_tag(path, line, anchor, tag.is_some())?;
+                stack.push(Frame::Map(Vec::new(), None));
+                continue;
+            }
+            Event::SequenceEnd => match stack.pop() {
+                Some(Frame::Seq(items)) => Yaml::Seq(items),
+                _ => return Err(unbalanced(path, line)),
+            },
+            Event::MappingEnd => match stack.pop() {
+                Some(Frame::Map(entries, None)) => Yaml::Map(entries),
+                _ => return Err(unbalanced(path, line)),
+            },
+        };
+
+        match stack.last_mut() {
+            None => document = node,
+            Some(Frame::Seq(items)) => items.push(node),
+            Some(Frame::Map(entries, pending)) => match pending.take() {
+                Some(key) => entries.push((key, node)),
+                None => match node {
+                    Yaml::Scalar(key) => *pending = Some(key),
+                    _ => {
+                        return Err(ManifestError::at_line(
+                            path,
+                            line,
+                            "a mapping key that is not a scalar is not modelled",
+                        ))
+                    }
+                },
+            },
         }
     }
+
+    Ok(document)
 }
 
-fn read_flow_element<'a>(
+/// A collection that ended where none had begun, or a mapping that ended on a
+/// key with no value. The parser does not produce either, and if it ever does
+/// the answer is an error rather than a half-read document.
+fn unbalanced(path: &Path, line: usize) -> ManifestError {
+    ManifestError::at_line(path, line, "a collection ended where none was open")
+}
+
+fn reject_anchor_or_tag(
     path: &Path,
     line: usize,
-    text: &'a str,
-) -> ManifestResult<(Yaml, &'a str)> {
-    match text.as_bytes().first() {
-        Some(b'"' | b'\'') => {
-            let (value, rest) = read_quoted(path, line, text)?;
-            Ok((Yaml::Scalar(value), rest))
-        }
-        Some(b'[' | b'{') => read_flow_collection(path, line, text),
-        Some(b'&' | b'*' | b'!') => Err(ManifestError::at_line(
+    anchor: usize,
+    tagged: bool,
+) -> ManifestResult<()> {
+    if anchor != 0 {
+        return Err(ManifestError::at_line(
             path,
             line,
-            "anchors, aliases and tags are not modelled",
-        )),
-        _ => {
-            let end = text.find([',', ']', '}']).unwrap_or(text.len());
-            Ok((Yaml::Scalar(text[..end].trim().to_string()), &text[end..]))
-        }
+            "anchors and aliases are not modelled in a workflow file",
+        ));
     }
+    if tagged {
+        return Err(ManifestError::at_line(
+            path,
+            line,
+            "an explicit tag is not modelled in a workflow file",
+        ));
+    }
+    Ok(())
+}
+
+/// YAML 1.2 core-schema null.
+///
+/// A key written with no value at all (`pull_request:`) reaches us as a plain
+/// `~`, so this is also what keeps an empty `run:` from being read as the
+/// command `~`: an absent value is [`Yaml::Empty`], and a `run` that is not a
+/// scalar is an error rather than a root pointing at nothing.
+fn is_yaml_null(value: &str) -> bool {
+    matches!(value, "" | "~" | "null" | "Null" | "NULL")
+}
+
+/// Say what the scanner found in this module's vocabulary, keeping its own
+/// words in parentheses.
+///
+/// The classification matters because a caller has to be able to tell a
+/// construct we deliberately refuse from a file that is simply broken. Each
+/// branch is a fact about the input rather than a guess: the last one asks
+/// whether the failing line is indented to a column no earlier line opened, and
+/// leaves the scanner's wording alone when it is not.
+fn yaml_detail(content: &str, err: &ScanError) -> String {
+    let info = err.info();
+    if info.contains("anchor") || info.contains("alias") {
+        return format!("anchors and aliases are not modelled in a workflow file ({info})");
+    }
+    if info.contains("tab") {
+        return info.to_string();
+    }
+    if info.contains("quoted scalar") && info.contains("end of stream") {
+        return format!("unterminated quoted scalar ({info})");
+    }
+    if is_unopened_column(content, err.marker()) {
+        return format!("unexpected indentation ({info})");
+    }
+    info.to_string()
+}
+
+/// Whether the failing line sits at a column no earlier line indented to.
+///
+/// A dedent onto a column that was never opened is reported by the scanner as
+/// "did not find expected key", which is true and useless: §6.20 wants a
+/// message a human can act on, and the corpus quotes these messages back at
+/// their authors. A line at a column that *is* open failed for some other
+/// reason and keeps the scanner's own wording.
+fn is_unopened_column(content: &str, marker: &Marker) -> bool {
+    let mut opened = BTreeSet::new();
+    for (index, raw) in content.lines().enumerate() {
+        if index + 1 >= marker.line() {
+            break;
+        }
+        let text = raw.trim_start_matches(' ');
+        if text.is_empty() || text.starts_with('#') {
+            continue;
+        }
+        opened.insert(raw.len() - text.len());
+    }
+    !opened.contains(&marker.col())
 }
 
 // ---------------------------------------------------------------------------
@@ -2697,10 +1924,23 @@ fn read_flow_element<'a>(
 /// directory; anything else (`owner/repo@ref`, `docker://image`) resolves
 /// outside this repository and stays a [`RootTarget::Reference`].
 pub fn parse_github_workflow(manifest: &Path, content: &str) -> ManifestResult<ManifestRoots> {
-    let document = YamlParser::new(manifest, content).parse_document()?;
+    let document = parse_yaml(manifest, content)?;
     let mut out = ManifestRoots::from_source(manifest);
     collect_workflow_roots(manifest, &document, "", &mut out)?;
     Ok(out)
+}
+
+/// Whether a `run` key at this position is a `defaults` block rather than a
+/// step's command.
+///
+/// The Actions schema spells two different things `run`: a step's `run` is the
+/// command, and `defaults.run` — at the workflow or at a job — is a mapping of
+/// `shell` and `working-directory` that applies to every step under it. Reading
+/// the second as a command rejected cobra's workflow, and with it every root in
+/// the repository. The distinction is positional in the schema, so it is
+/// positional here: `key` is the path of the *holder* of the `run` key.
+fn is_defaults_block(key: &str) -> bool {
+    key == "defaults" || key.ends_with(".defaults")
 }
 
 fn collect_workflow_roots(
@@ -2714,6 +1954,9 @@ fn collect_workflow_roots(
             for (name, value) in entries {
                 let child = key_join(key, name);
                 match name.as_str() {
+                    "run" if is_defaults_block(key) => {
+                        collect_workflow_roots(manifest, value, &child, out)?;
+                    }
                     "run" | "uses" => {
                         let Yaml::Scalar(text) = value else {
                             return Err(ManifestError::at_key(manifest, child, "must be a scalar"));
@@ -2815,11 +2058,7 @@ pub fn scan(repo_root: &Path) -> ManifestResult<ManifestRoots> {
     walk(repo_root, Path::new(""), &mut files)?;
     files.sort();
 
-    let crate_dirs: BTreeSet<PathBuf> = files
-        .iter()
-        .filter(|rel| rel.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")))
-        .map(|rel| manifest_dir(rel).to_path_buf())
-        .collect();
+    let crates = cargo_crates(repo_root, &files)?;
 
     let mut out = ManifestRoots::default();
     for rel in &files {
@@ -2858,10 +2097,11 @@ pub fn scan(repo_root: &Path) -> ManifestResult<ManifestRoots> {
             ));
         }
 
-        if let Some(key) = cargo_implicit_key(rel, &crate_dirs) {
+        if let Some(key) = cargo_implicit_key(rel, &crates) {
             let kind = match key {
                 "cargo:default-lib" => RootKind::LibraryEntry,
                 "cargo:build-script" => RootKind::BuildHook,
+                "cargo:test" | "cargo:bench" | "cargo:example" => RootKind::DevTarget,
                 _ => RootKind::Executable,
             };
             out.push(kind, rel, key.to_string(), RootTarget::Path(rel.clone()));
@@ -2926,32 +2166,119 @@ fn is_workflow(rel: &Path) -> bool {
         && manifest_dir(rel) == Path::new(".github/workflows")
 }
 
+/// Which of Cargo's four target auto-discovery sweeps a crate leaves switched
+/// on.
+///
+/// Every one can be turned off in the manifest, and ripgrep — the first
+/// repository in the out-of-sample corpus — turns `autotests` off and declares
+/// the one test target it wants. Sweeping `tests/*.rs` regardless would invent
+/// targets Cargo does not build, which is §9.5's fabricated root: a longer list
+/// that hides a real gap rather than closing one.
+#[derive(Debug, Clone, Copy)]
+struct CargoAutoDiscovery {
+    bins: bool,
+    examples: bool,
+    tests: bool,
+    benches: bool,
+}
+
+impl CargoAutoDiscovery {
+    /// Read the four `[package]` switches. A switch that is present but not a
+    /// boolean is an error, like every other mistyped key in this module: it
+    /// means we do not know which targets this crate has.
+    fn read(manifest: &Path, doc: &toml::Value) -> ManifestResult<CargoAutoDiscovery> {
+        let switch = |name: &str| match toml_path(doc, &["package", name]) {
+            None => Ok(true),
+            Some(toml::Value::Boolean(value)) => Ok(*value),
+            Some(other) => Err(ManifestError::at_key(
+                manifest,
+                format!("package.{name}"),
+                format!("must be a boolean, found {}", toml_type_name(other)),
+            )),
+        };
+        Ok(CargoAutoDiscovery {
+            bins: switch("autobins")?,
+            examples: switch("autoexamples")?,
+            tests: switch("autotests")?,
+            benches: switch("autobenches")?,
+        })
+    }
+}
+
+/// Every crate directory in the tree, with the auto-discovery its manifest
+/// leaves on.
+///
+/// A manifest with no `[package]` is a workspace file, and a workspace file has
+/// no targets: Cargo discovers nothing beside it, so neither do we.
+fn cargo_crates(
+    repo_root: &Path,
+    files: &[PathBuf],
+) -> ManifestResult<BTreeMap<PathBuf, CargoAutoDiscovery>> {
+    let mut crates = BTreeMap::new();
+    for rel in files {
+        if rel.file_name() != Some(std::ffi::OsStr::new("Cargo.toml")) {
+            continue;
+        }
+        let content =
+            std::fs::read_to_string(repo_root.join(rel)).map_err(|source| ManifestError::Read {
+                path: rel.clone(),
+                source,
+            })?;
+        let doc = parse_toml(rel, &content)?;
+        if doc.get("package").is_none() {
+            continue;
+        }
+        crates.insert(
+            manifest_dir(rel).to_path_buf(),
+            CargoAutoDiscovery::read(rel, &doc)?,
+        );
+    }
+    Ok(crates)
+}
+
 /// Which Cargo auto-discovered target, if any, this file is.
 ///
 /// Anchored on the directory of a `Cargo.toml`, because `src/main.rs` is only
 /// Cargo's default binary when there is a crate around it.
-fn cargo_implicit_key(rel: &Path, crate_dirs: &BTreeSet<PathBuf>) -> Option<&'static str> {
-    for crate_dir in crate_dirs {
+///
+/// §5.2 asks for `[[bin]]`, `[[example]]`, `[[bench]]` and `[[test]]`, and
+/// Cargo finds all four on disk with no key naming them. A test binary nothing
+/// declares is still a binary Cargo builds, and the file that holds it is still
+/// an entry point with no caller.
+fn cargo_implicit_key(
+    rel: &Path,
+    crates: &BTreeMap<PathBuf, CargoAutoDiscovery>,
+) -> Option<&'static str> {
+    for (crate_dir, auto) in crates {
         let Ok(inner) = rel.strip_prefix(crate_dir) else {
             continue;
         };
         let inner = inner.to_string_lossy();
         let key = match inner.as_ref() {
-            "src/main.rs" => "cargo:default-bin",
+            "src/main.rs" if auto.bins => "cargo:default-bin",
             "src/lib.rs" => "cargo:default-lib",
             "build.rs" => "cargo:build-script",
-            // Cargo's two `src/bin` layouts, and only those: a module inside a
-            // multi-file binary is part of a target, not a target.
-            other
-                if other.starts_with("src/bin/")
-                    && ((other.ends_with(".rs") && other.matches('/').count() == 2)
-                        || (other.ends_with("/main.rs") && other.matches('/').count() == 3)) =>
-            {
-                "cargo:src-bin"
-            }
+            other if auto.bins && is_cargo_target(other, "src/bin/") => "cargo:src-bin",
+            other if auto.tests && is_cargo_target(other, "tests/") => "cargo:test",
+            other if auto.benches && is_cargo_target(other, "benches/") => "cargo:bench",
+            other if auto.examples && is_cargo_target(other, "examples/") => "cargo:example",
             _ => continue,
         };
         return Some(key);
     }
     None
+}
+
+/// Cargo's two layouts for a target directory, and only those: `<dir>/name.rs`
+/// and `<dir>/name/main.rs`.
+///
+/// Anything else under the directory is part of a target rather than a target —
+/// a module beside a multi-file target's `main.rs`, or the `tests/common/mod.rs`
+/// that test files share fixtures through.
+fn is_cargo_target(inner: &str, dir: &str) -> bool {
+    let Some(rest) = inner.strip_prefix(dir) else {
+        return false;
+    };
+    (rest.ends_with(".rs") && !rest.contains('/'))
+        || (rest.ends_with("/main.rs") && rest.matches('/').count() == 1)
 }

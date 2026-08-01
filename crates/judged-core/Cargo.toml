@@ -14,6 +14,11 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
 aho-corasick = { workspace = true }
+# The Tier A manifest parsers (§5.2): every TOML and YAML file this crate reads
+# belongs to somebody else's tool, so both formats are read by the crate that
+# tool's own ecosystem uses.
+toml = { workspace = true }
+saphyr-parser = { workspace = true }
 
 [dev-dependencies]
 # The git tests build real repositories on disk; tempfile owns their creation,

@@ -27,6 +27,30 @@ judged-mutants = { path = "crates/judged-mutants" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Tier A (§5.2) is a list of other people's file formats, and a parser for a
+# *subset* of one of them is a list of valid files we reject: measured on the
+# out-of-sample corpus, hand-written TOML and YAML subsets emptied the root set
+# of 7 of 9 real repositories. Both of these are read with the implementation
+# the ecosystem already trusts.
+#
+# `toml` is toml-rs, the parser Cargo itself is built on, so a manifest Cargo
+# accepts is one we accept. `preserve_order` keeps a document's own key order,
+# which is what makes `show-roots` output checkable against the file.
+toml = { version = "1", default-features = false, features = [
+    "std",
+    "parse",
+    "serde",
+    "preserve_order",
+] }
+# `saphyr-parser` is YAML 1.2, pure Rust, no `unsafe`, and maintained — the
+# line of descent from `yaml-rust` through `yaml-rust2`. §7.6 is a section on
+# not building on graveyards, and the obvious alternatives are graveyards:
+# `serde_yaml` ships as `0.9.34+deprecated`, and `serde_yml` now describes
+# itself on crates.io as unmaintained. It is used as an event stream because
+# this module wants neither YAML's type resolution (`on:` is a key GitHub
+# reads, not the boolean `true`) nor silent anchor expansion.
+saphyr-parser = "0.0.11"
+
 # Fingerprints are content-derived SHA-256 over a canonical input (§9.2:
 # "fingerprints must be content-derived ... never line-based"). sha2 + hex give
 # exactly the `judged/v1:<64 hex>` shape and nothing more.

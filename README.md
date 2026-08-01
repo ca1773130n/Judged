@@ -12,8 +12,11 @@ So Judged is not a better analyzer. Existing analyzers answer "unreachable from
 root set R under resolver X"; none of them answers "is deleting this safe". The
 research this repository is built from
 ([docs/research](docs/research/2026-07-31-universal-safe-repo-cleaner-research.md))
-argues the product is the layers around those analyzers, and that two of them
-should exist before anything is allowed to delete a byte.
+argues the product is the layers around those analyzers, and that three of them
+should exist before anything is allowed to delete a byte: something that stops
+new findings without demanding the backlog be fixed, something that measures how
+often an analyzer is wrong about live code, and something that writes down the
+root set a human can audit instead of one a tool inferred.
 
 Judged deletes nothing. Not by default, not behind a flag. There is no `--fix`,
 and passing one is refused before the subcommand is even parsed. The ratchet's
@@ -25,7 +28,7 @@ suite below is the experiment that decides it, with the answer pre-committed: if
 no signal combination clears the catalogue at zero false removals, the tier is
 deleted from the design rather than tuned.
 
-## The two commands
+## The three commands
 
 ### `judged ratchet` — baseline today's findings, fail CI only on new ones
 
@@ -149,6 +152,49 @@ envelope — the finding classes the tool structurally *cannot* emit — and the
 decision about which half of a verdict its findings were mapped to, printed
 above the table. Without those, a low false-removal count reads as a good score
 when it may only be a narrow one.
+
+### `judged show-roots` — print the root set, and what could not be resolved
+
+```sh
+judged show-roots [--json] [<path>]
+```
+
+ProGuard's `-printseeds` and Nix's `--print-roots`, which §9.13 asks for by
+name. It decides nothing and deletes nothing: it materializes what was
+*declared* — with the file and the key that declared it, so a human can check
+each line against the repository before anything acts on it. §1.2 is the reason
+the command has this shape rather than a better one: you cannot infer the closed
+world, you can only have it declared.
+
+Roots come in three provenance tiers, and the tier travels with every root
+because a caller that cannot tell them apart will trust a guessed convention as
+though a manifest had declared it:
+
+| Tier | Where it comes from | Confidence |
+| --- | --- | --- |
+| **A — machine-declared** | A build system already reads this file to find roots: `Cargo.toml [[bin]]`, `package.json` exports/bin/scripts, `go.mod`, `pyproject`, `Dockerfile` CMD/ENTRYPOINT, GitHub workflow `run`/`uses` | High |
+| **B — convention-inferable** | A framework's file layout turns a file into an entry point with no source reference: Django `INSTALLED_APPS` and management commands, pytest `test_*.py` | Medium — correct only if framework **and version** were detected correctly |
+| **C — human-declared** | Solicited from a person and committed | Whatever the person knew |
+
+The other half of the output is the half that gets dropped everywhere else: every
+framework recognized with no plugin behind it, every manifest that would not
+parse, every declared entry that matched nothing. §6.20 requires "no data" to be
+a distinct state from "zero", and a report printing only successes renders a
+framework whose entire convention is missing identically to one that genuinely
+has no roots. Both counts are always printed, and `--json` always carries `gaps`
+beside `roots`.
+
+Exit 0 whenever a root set was materialized, whatever it contains — a repository
+with few roots is a normal repository. Exit 2 only when nothing could be read at
+all, because zero roots over zero files is the absence of a scan wearing the
+digits of an empty repository.
+
+Measured out of sample on nine real repositories in
+[`docs/evals/2026-08-02-out-of-sample-corpus.md`](docs/evals/2026-08-02-out-of-sample-corpus.md):
+854 roots, 787 of them Tier A, worst case 15.9 ms over a 574-file repository. That
+document is also where the layer's current defects are recorded, and they are not
+small — 99 of those roots name a path that does not exist. Read it before
+trusting the output.
 
 ## The headline result
 
@@ -284,11 +330,23 @@ counts their four decoys twice.
 
 The §11 R8 needle sweep is in the same document and is reproducible with
 `--needles`. `basename+stem` is what ships and is the narrowest strategy meeting
-R8's own criterion; `basename` alone fails it. `+parent-dir` is the only strategy
-that reaches the tenth false removal, and it buys it by also blocking on the words
-`src` and `dist` — taking knip's decoy recall to zero. Full write-up, per-class
-needle trace, sweep and limits in
+the **rescue** half of R8's criterion; `basename` alone fails it. `+parent-dir` is
+the only strategy that reaches the tenth false removal, and it buys it by also
+blocking on the words `src` and `dist` — taking knip's decoy recall to zero. Full
+write-up, per-class needle trace, sweep and limits in
 [`docs/evals/2026-08-02-gate2-veto.md`](docs/evals/2026-08-02-gate2-veto.md).
+
+**R8's other half — a tolerable flag rate — is not met by any strategy measured
+here.** R8 sets no numeric threshold for "tolerable", so this is a measurement
+and not a verdict against the criterion. On nine real repositories, over the population an
+analyzer actually claims, the shipped `basename+stem` blocks a median **84.6%** of
+candidates and `+parent-dir` blocks **100% on seven of the nine**. Even `basename`
+alone, the part §9.3 makes structurally impossible to remove, blocks a median
+27.3%. R8 never writes down what "tolerable" means, so no measurement can settle
+it; what the measurement does establish is that R8's space contains no
+low-flag-rate strategy to retreat to, which is not what R8 assumed when it framed
+the question as a choice of needle set.
+[`docs/evals/2026-08-02-out-of-sample-corpus.md`](docs/evals/2026-08-02-out-of-sample-corpus.md).
 
 That document also records a defect worth reading on its own account. Until it was
 fixed, `SutVerdict` carried symbol claims as bare names with no location, so Gate
@@ -312,10 +370,17 @@ and every prevention figure is an upper bound.
 
 | Crate | What it holds |
 | --- | --- |
-| `judged-core` | The SARIF 2.1.0 subset adapters are held to, content-derived fingerprints, git recoverability classification |
+| `judged-core` | The SARIF 2.1.0 subset adapters are held to, content-derived fingerprints, git recoverability classification, Gate 2's vetoes, and the Tier A/B/C root readers under `roots/` |
 | `judged-ratchet` | Baseline, diff, rot detection |
-| `judged-mutants` | The 19-class catalogue, the SUT contract, the runner |
-| `judged-cli` | The `judged` binary |
+| `judged-mutants` | The 19-class catalogue, the SUT contract, the runner, and the root-set materializer that assembles the three tiers |
+| `judged-cli` | The `judged` binary: `ratchet`, `mutants`, `show-roots` |
+
+The root readers under `judged-core/src/roots/` parse other people's file
+formats, so they use those ecosystems' own parsers — `toml` (toml-rs, what Cargo
+parses manifests with) and `saphyr-parser` for YAML — rather than subsets of
+them. That is not a style preference. Hand-written subsets shipped first, and a
+parser for a *subset* of a format is a list of valid files you reject: measured
+out of sample, they emptied the Tier A root set of 7 of 9 real repositories.
 
 `judged_core::git::RecoverabilityClass` is worth reading before anything else.
 Git protects the object database, not the working tree: a file that was never

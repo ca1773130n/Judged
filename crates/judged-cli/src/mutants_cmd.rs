@@ -14,6 +14,15 @@
 //! from the design rather than tuned**, so it is the only number the gate may
 //! depend on.
 //!
+//! One precondition sits in front of it, and it is not a softening. A SUT
+//! declares which ecosystems it can read and the runner skips the rest, so a
+//! report can now cover fewer than nineteen classes — and over *zero* graded
+//! classes, `false_removal_count == 0` is the absence of a run wearing the
+//! digits of a clean one. That is refused rather than gated; see [`gate`].
+//! Every skipped class is still printed, marked, and counted in its own column,
+//! because a skip that reads as a pass would make narrowing an adapter's
+//! declared languages a way to raise a green (§6.20).
+//!
 //! That leaves a hole, and the report is built around admitting it: a system
 //! under test that claims nothing is ever dead scores a perfect zero and passes
 //! the gate. It is also useless. So decoy recall — how many genuinely-dead
@@ -28,7 +37,7 @@ use std::path::{Path, PathBuf};
 use judged_mutants::adapters::{deadcode, knip, shear, vulture};
 use judged_mutants::fixtures;
 use judged_mutants::mutant::{Ecosystem, Mutant};
-use judged_mutants::runner::{run_suite, MutantReport, SuiteReport};
+use judged_mutants::runner::{reads_mutant, run_suite, Grade, MutantReport, SuiteReport};
 use judged_mutants::sut::{CommandSut, NaiveSut, RefusingSut, Sut, SutVerdict};
 use serde_json::{json, Value};
 
@@ -185,7 +194,7 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
                     &Refusal {
                         headline: "the E2 suite did not complete".to_string(),
                         detail: error.to_string(),
-                        remedy: foreign_ecosystem_hint(&args.sut, &mutants),
+                        remedy: foreign_ecosystem_hint(sut.as_ref(), &mutants),
                     },
                     &args.sut,
                     args.json,
@@ -195,11 +204,11 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
         }
     };
 
-    // The gate, and only the gate (§10 E2, §11 R1).
-    let code = if report.false_removal_count == 0 {
-        0
-    } else {
-        1
+    // The gate, and only the gate (§10 E2, §11 R1) — but not before checking
+    // that there is something for it to be a gate over.
+    let code = match gate(&report) {
+        Ok(code) => code,
+        Err(refusal) => return (render_refusal(&refusal, &args.sut, args.json), 2),
     };
 
     let rendered = if args.json {
@@ -229,6 +238,48 @@ struct Refusal {
     /// can do next; "vulture is missing" without "install it like this" makes
     /// the reader go and find out.
     remedy: Option<String>,
+}
+
+/// The exit code a finished run earns, or a refusal to publish one.
+///
+/// §10 E2 gates on `false_removal_count` and on nothing else, and that stays
+/// true — with one precondition that is not a softening of it. Zero false
+/// removals over **zero graded classes** is not a clean run: it is the absence
+/// of a run, wearing the same digits. §6.20 is explicit that "no data" must be
+/// a distinct state from "zero executions" and must never flow into a score, so
+/// a report with nothing in the denominator is refused rather than gated.
+///
+/// This is the arithmetic that makes skipping safe. A SUT declares which
+/// ecosystems it reads and the runner skips the rest; without this check, the
+/// narrowest possible declaration — reads nothing — would grade nothing, remove
+/// nothing, and exit 0 with "GATE PASSED". Adding a language filter to an
+/// adapter would then be a way to raise a green, which is worse than the defect
+/// the filter was added to fix.
+fn gate(report: &SuiteReport) -> Result<i32, Refusal> {
+    if report.graded_count() == 0 {
+        return Err(Refusal {
+            headline: format!(
+                "the E2 suite graded none of its {} classes",
+                report.reports.len()
+            ),
+            detail: "Every class was skipped: the system under test declares it reads no \
+                     ecosystem present in any of them, so no repository was built and the \
+                     analyzer was never run. Its false-removal count is 0 because nothing was \
+                     measured, not because nothing was wrong."
+                .to_string(),
+            remedy: Some(
+                "Widen the ecosystems this SUT declares it reads, or grade it against a \
+                 catalogue in a language it can load."
+                    .to_string(),
+            ),
+        });
+    }
+
+    Ok(if report.false_removal_count == 0 {
+        0
+    } else {
+        1
+    })
 }
 
 /// Refuse to grade a SUT whose analyzer is not on this machine.
@@ -295,59 +346,41 @@ fn preflight(choice: &SutChoice) -> Result<(), Refusal> {
 /// The one thing a reader needs when a language-specific analyzer stops the
 /// suite, and cannot get from the tool's own message.
 ///
-/// Measured this round, and worth stating because it separates the four named
-/// analyzers into two kinds. Vulture *tolerates* a repository with no Python in
-/// it: it finds no `.py` files, prints nothing and exits 0, so the nineteen
-/// classes run to completion and the twelve it cannot read are marked
-/// `[NOT READ by this SUT]` in the report. The other three refuse the directory
-/// instead —
+/// Every class the analyzer is handed is now one it declared it can read
+/// ([`judged_mutants::sut::Sut::reads`]), so a failure here is a failure
+/// *inside* its own ecosystem — a broken fixture, a broken toolchain, a
+/// genuine crash — and specifically **not** the language mismatch that used to
+/// end these runs on `m01`. Saying which language it reads, and how many
+/// classes were skipped for being outside it, is what stops a reader spending
+/// the afternoon reinstalling a tool that is fine.
 ///
-/// | Tool | On a repository outside its ecosystem | Exit |
-/// | --- | --- | --- |
-/// | knip | `ERROR: Unable to find package.json` | 2 |
-/// | cargo-shear | `could not find Cargo.toml in <dir> or any parent directory` | 2 |
-/// | deadcode | `no Go files in <dir>` / `cannot find main module` | 1 |
-///
-/// — and since [`judged_mutants::runner::run_suite`] runs every class against
-/// the selected SUT and treats a SUT error as fatal, the first foreign class
-/// ends the run. The suite therefore cannot currently produce a score for these
-/// three, and that is reported rather than worked around.
-///
-/// Widening [`KNIP_COMPLETED_EXIT_CODES`] and friends to swallow those codes
-/// would produce a score, and it is exactly the silent scoring error this
-/// module exists to prevent: knip and cargo-shear both exit 2 for a *broken*
-/// project as well as for an absent one, and deadcode's 1 covers "no Go here"
-/// and "your Go does not compile" alike. Each of those states leaves stdout
-/// empty or non-report, which parses to no claims, which is zero false
-/// removals, which is a passing gate.
-///
-/// The wording is conditional on purpose. This hint is attached to *every*
-/// incomplete run of a language-specific SUT, including one that failed inside
-/// its own ecosystem for an unrelated reason, and asserting a cause it cannot
-/// check would send the reader past a real bug.
-fn foreign_ecosystem_hint(choice: &SutChoice, mutants: &[Box<dyn Mutant>]) -> Option<String> {
-    let langs = reads(choice)?;
-    let foreign = mutants
+/// Kept in the conditional voice for the same reason it always was: this hint
+/// is attached to every incomplete run of a language-specific SUT, and
+/// asserting a cause it cannot check would send the reader past a real bug.
+fn foreign_ecosystem_hint(sut: &dyn Sut, mutants: &[Box<dyn Mutant>]) -> Option<String> {
+    let langs = sut.reads()?;
+    // The runner's own predicate, not a second copy of it. A reimplementation
+    // here could report a different number of skipped classes from the one the
+    // run actually skipped, in a message whose whole job is to explain that
+    // number.
+    let skipped = mutants
         .iter()
-        .filter(|mutant| !was_read(choice, mutant.ecosystem()))
+        .filter(|mutant| !reads_mutant(sut, mutant.as_ref()))
         .count();
-    if foreign == 0 {
-        return None;
-    }
 
     let spoken: Vec<&str> = langs.iter().map(|lang| ecosystem(*lang)).collect();
     Some(format!(
-        "`{}` reads {}, and {foreign} of {} classes in the catalogue are outside that. The suite \
-         runs every class against the selected analyzer, so if the class named above is one of \
-         those, the tool was handed a repository it cannot analyze — which is not a broken \
-         install. Analyzers split on what they then do: vulture finds no Python and exits 0, so \
-         its run completes and those classes are simply marked unread, while knip, cargo-shear \
-         and deadcode refuse the directory and exit non-zero. Those exit codes are deliberately \
-         not declared healthy, because each is shared with a genuine analysis failure whose \
-         output is equally empty — accepting them would score a crashed run as a clean one \
-         (§6.20). Until the runner can skip a class its analyzer declares it cannot read, grade \
-         these on a catalogue they can read.",
-        choice.label(),
+        "`{}` reads {}, and {skipped} of {} classes in the catalogue are outside that. Those are \
+         skipped before the analyzer is spawned — never materialized, never handed over, never \
+         graded — so the class named above is one this analyzer declared it CAN read, and the \
+         failure is inside its own ecosystem rather than a language mismatch. Note that the \
+         skipped classes are not passes: they are counted in their own column and in neither the \
+         numerator nor the denominator of anything (§6.20, \"no data\" is a distinct state from \
+         \"zero executions\"). Declaring the refusing exit code healthy is not the alternative \
+         fix — knip and cargo-shear exit 2 for a broken project as well as an absent one, and \
+         deadcode's 1 covers \"no Go here\" and \"your Go does not compile\" alike, so accepting \
+         them would score a crashed run as a clean one.",
+        sut.name(),
         spoken.join(" and "),
         mutants.len(),
     ))
@@ -458,7 +491,13 @@ fn build_sut(choice: &SutChoice) -> Box<dyn Sut> {
                 // §9.2's other non-SARIF clause: every adapter declares the
                 // finding classes it structurally cannot emit, so the
                 // orchestrator knows when the tool's silence means anything.
-                .with_cannot_emit([vulture::CAPABILITY_ENVELOPE]),
+                .with_cannot_emit([vulture::CAPABILITY_ENVELOPE])
+                // The coarsest entry in that envelope, and the one the runner
+                // acts on rather than prints: a whole language the tool cannot
+                // open. Taken from the adapter rather than restated here, so
+                // the CLI and the adapter cannot disagree about what a tool
+                // reads.
+                .with_reads(vulture::READS.iter().copied()),
         ),
         // The three below share a shape with vulture and differ in one respect
         // worth naming: each takes its argv from [`SutChoice::external_argv`]
@@ -467,17 +506,20 @@ fn build_sut(choice: &SutChoice) -> Box<dyn Sut> {
         SutChoice::Knip => Box::new(
             external(choice, knip::parse)
                 .with_success_exit_codes(KNIP_COMPLETED_EXIT_CODES)
-                .with_cannot_emit([knip::CAPABILITY_ENVELOPE]),
+                .with_cannot_emit([knip::CAPABILITY_ENVELOPE])
+                .with_reads(knip::READS.iter().copied()),
         ),
         SutChoice::Deadcode => Box::new(
             external(choice, deadcode::verdict_from_stdout)
                 .with_success_exit_codes(DEADCODE_COMPLETED_EXIT_CODES)
-                .with_cannot_emit([deadcode::CAPABILITY_ENVELOPE]),
+                .with_cannot_emit([deadcode::CAPABILITY_ENVELOPE])
+                .with_reads(deadcode::READS.iter().copied()),
         ),
         SutChoice::Shear => Box::new(
             external(choice, shear::verdict_from_stdout)
                 .with_success_exit_codes(SHEAR_COMPLETED_EXIT_CODES)
-                .with_cannot_emit([shear::CAPABILITY_ENVELOPE]),
+                .with_cannot_emit([shear::CAPABILITY_ENVELOPE])
+                .with_reads(shear::READS.iter().copied()),
         ),
         SutChoice::Command(argv) => {
             let (program, args) = argv
@@ -488,6 +530,13 @@ fn build_sut(choice: &SutChoice) -> Box<dyn Sut> {
             // non-zero exit is treated as a run that failed rather than as a
             // run that found things. Somebody who knows better can say so out
             // loud with `-- sh -c 'mytool "$@"; true' --`.
+            //
+            // No `with_reads` either, and for the mirror-image reason. A
+            // language guessed from an argv would let the harness skip classes
+            // on a claim the analyzer never made, and a skipped class is a
+            // false removal that never gets counted. Unknown competence is not
+            // a claim in either direction, so the escape hatch is measured on
+            // the whole catalogue.
             //
             // Its stdout is parsed as vulture's format because that is the only
             // adapter that exists. The usage text says so; guessing a format
@@ -572,56 +621,14 @@ fn disclosure(choice: &SutChoice) -> Option<Disclosure> {
     }
 }
 
-/// The ecosystems a SUT can actually read, or `None` if it reads everything.
-///
-/// This exists so the report can tell "ran, looked, and claimed nothing" apart
-/// from "never opened a file here". They render identically otherwise — zero
-/// false removals, zero decoys — and the second is not a result. §6.20 states
-/// the rule in general ("no data" must be a distinct state from "zero
-/// executions"); this is that rule applied to Judged's own scoreboard, which
-/// would otherwise let a Python-only tool look competent at Rust.
-fn reads(choice: &SutChoice) -> Option<&'static [Ecosystem]> {
-    match choice {
-        // Both controls are language-agnostic by construction: NaiveSut walks
-        // every source extension the catalogue uses, and RefusingSut declines
-        // uniformly rather than out of incapacity.
-        SutChoice::Naive | SutChoice::Refusing => None,
-        // Vulture is a Python AST tool. It cannot parse Rust, Go or TypeScript,
-        // so on those classes it is not scoring — it is absent.
-        SutChoice::Vulture => Some(&[Ecosystem::Python, Ecosystem::Polyglot]),
-        // Knip resolves a JavaScript/TypeScript module graph from
-        // `package.json` and `tsconfig.json`. `Polyglot` is claimed because
-        // every polyglot fixture in the catalogue contains a JS or TS half —
-        // that is what makes it polyglot — and knip genuinely parses it. It is
-        // *not* a claim that knip understands the other half; §10 E2 grades a
-        // single mechanism per class, and a class knip fails because the
-        // reference lives in the non-JS half is knip failing, not knip being
-        // absent.
-        SutChoice::Knip => Some(&[Ecosystem::TypeScript, Ecosystem::Polyglot]),
-        // deadcode loads a Go program from source and needs a Go module. Go is
-        // the whole of its reach — and deliberately *not* Polyglot: unlike a
-        // JS bundler-shaped tool, deadcode has no partial reading of a
-        // repository whose Go half is absent. It refuses the directory
-        // outright.
-        SutChoice::Deadcode => Some(&[Ecosystem::Go]),
-        // cargo-shear reads a cargo workspace: `Cargo.toml` plus the crate
-        // sources cargo metadata points it at. Same reasoning as deadcode for
-        // leaving Polyglot out — with no manifest there is nothing for
-        // `cargo metadata` to answer with, so it never opens a file.
-        SutChoice::Shear => Some(&[Ecosystem::Rust]),
-        // An arbitrary command declares nothing, so we must not assume it read
-        // anything OR that it failed to. Unknown competence is not a claim.
-        SutChoice::Command(_) => None,
+/// The JSON spelling of a grade. Lower-case and stable, because a consumer will
+/// match on it.
+fn grade_name(grade: Grade) -> &'static str {
+    match grade {
+        Grade::Passed => "passed",
+        Grade::Failed => "failed",
+        Grade::NotRead => "not_read",
     }
-}
-
-/// Whether this SUT could read anything in this mutant's ecosystem.
-///
-/// `Polyglot` counts as readable for any SUT that reads at least one language,
-/// because a polyglot fixture contains a Python half the tool genuinely does
-/// parse — the grade there is earned, not vacuous.
-fn was_read(choice: &SutChoice, of: Ecosystem) -> bool {
-    reads(choice).is_none_or(|langs| langs.contains(&of))
 }
 
 /// The catalogue's own spelling for an ecosystem.
@@ -658,7 +665,12 @@ fn failing_classes(report: &SuiteReport) -> Vec<&str> {
 }
 
 fn totals(report: &SuiteReport) -> (usize, usize, usize) {
-    let passed = report.reports.iter().filter(|r| r.passed).count();
+    let passed = report.passed_count();
+    // Summed over the whole report, which needs no filtering: a class the SUT
+    // could not read was never materialized, so it declared no decoys and
+    // contributes zero to both halves. That is the point of skipping before
+    // materialization rather than after — the exclusion is structural instead
+    // of being a condition somebody has to remember to write here.
     let decoys_found = report.reports.iter().map(|r| r.decoys_found).sum();
     let decoys_total = report.reports.iter().map(|r| r.decoys_total).sum();
     (passed, decoys_found, decoys_total)
@@ -694,11 +706,7 @@ fn render_text(
 
     for row in &report.reports {
         let (mechanism, research) = lookup(catalogue, &row.mutant_id);
-        out.push_str(&mutant_line(
-            row,
-            mechanism,
-            was_read(choice, row.ecosystem),
-        ));
+        out.push_str(&mutant_line(row, mechanism));
         for removed in &row.false_removals {
             // Indented under its class and spelled out, because this line is
             // the finding: a live artifact the tool would have deleted, and the
@@ -709,23 +717,26 @@ fn render_text(
 
     // Summary lines are unindented: they are what a CI log tail shows, and what
     // a human reads in the ten seconds §9.13 budgets.
+    //
+    // Three columns, because there are three states. The old two-column line
+    // spent the unread classes as failures, which was wrong in the harmless
+    // direction; folding them into `passed` instead would have been wrong in
+    // the direction that ships an auto-act tier (§6.20).
+    let unread = report.not_read_count();
     out.push_str(&format!(
-        "\n{classes} classes: {passed} passed, {} failed\n",
-        classes - passed
+        "\n{classes} classes: {} graded — {passed} passed, {} failed; {unread} not read\n",
+        report.graded_count(),
+        report.failed_count(),
     ));
     // Stated as its own line rather than a footnote, because it is the single
     // number most likely to be misread out of this report. A Python-only tool
     // scored against 19 classes has genuinely been measured on far fewer, and
     // a summary that does not say so invites "vulture only broke 4 of 19".
-    let unread = report
-        .reports
-        .iter()
-        .filter(|row| !was_read(choice, row.ecosystem))
-        .count();
     if unread > 0 {
         out.push_str(&format!(
             "not measured: {unread} of {classes} classes are outside this SUT's languages — \
-             it opened no file in them, so neither its passes nor its failures there are results\n"
+             they were never built and never handed to it, so they are in neither column above \
+             and in neither half of the decoy line below\n"
         ));
     }
     out.push_str(&format!(
@@ -761,19 +772,31 @@ fn render_text(
 }
 
 /// One row of the table: id, verdict, ecosystem, the two counts, the mechanism.
-fn mutant_line(row: &MutantReport, mechanism: &str, was_read: bool) -> String {
+fn mutant_line(row: &MutantReport, mechanism: &str) -> String {
     format!(
         "  {id}  {verdict:4}  {ecosystem:10}  {false_removals} false  {found}/{total} decoys  {mechanism}{note}\n",
         id = row.mutant_id,
-        verdict = if row.passed { "pass" } else { "FAIL" },
+        // Three verdicts, and `----` rather than a word for the third. A class
+        // that was never attempted has no verdict, and any word in this column
+        // would be read as one — "skip" most of all, which sounds like a
+        // decision the analyzer made about the code.
+        verdict = match row.grade {
+            Grade::Passed => "pass",
+            Grade::Failed => "FAIL",
+            Grade::NotRead => "----",
+        },
         ecosystem = ecosystem(row.ecosystem),
         false_removals = row.false_removals.len(),
         found = row.decoys_found,
         total = row.decoys_total,
-        // Not a verdict column, deliberately: the gate arithmetic is unchanged
-        // and a false removal here would still be a false removal. This only
-        // stops a reader crediting the tool for a class it never opened.
-        note = if was_read { "" } else { "  [NOT READ by this SUT]" },
+        // Spelled out beside the dashes, because the dashes alone are easy to
+        // read as a rendering artifact. The zeros on this row are not findings;
+        // they are the absence of a measurement.
+        note = if row.grade == Grade::NotRead {
+            "  [NOT READ by this SUT]"
+        } else {
+            ""
+        },
     )
 }
 
@@ -800,7 +823,15 @@ fn render_json(
                 "ecosystem": ecosystem(row.ecosystem),
                 "mechanism": mechanism,
                 "research_ref": research,
-                "passed": row.passed,
+                // Both, and in this order. `passed` is what a consumer written
+                // before this build already reads, and it is false for an
+                // unread class — but false alone reads as "failed", so the
+                // three-state field is emitted beside it rather than instead of
+                // it. A consumer that ignores `grade` under-credits the tool;
+                // one that inferred a pass from `not_read` would over-credit
+                // it, and only the second error ships something.
+                "grade": grade_name(row.grade),
+                "passed": row.passed(),
                 "false_removals": row.false_removals,
                 "decoys_found": row.decoys_found,
                 "decoys_total": row.decoys_total,
@@ -818,7 +849,14 @@ fn render_json(
             "mapping_decision": d.mapping,
         })),
         "classes": report.reports.len(),
+        "graded_classes": report.graded_count(),
         "passed_classes": passed,
+        "failed_classes": report.failed_count(),
+        // Emitted whether or not it is zero, so a consumer can require the key
+        // and notice a producer that predates it. A dashboard that reads
+        // `false_removal_count` without this one has recorded a numerator with
+        // no denominator (§6.20).
+        "not_read_classes": report.not_read_count(),
         "false_removal_count": report.false_removal_count,
         "gate_passed": report.false_removal_count == 0,
         "decoys_found": decoys_found,
@@ -855,7 +893,11 @@ mod tests {
             reports: vec![MutantReport {
                 mutant_id: "m01".to_string(),
                 ecosystem: Ecosystem::Python,
-                passed: count == 0 && decoys_found == decoys_total,
+                grade: if count == 0 && decoys_found == decoys_total {
+                    Grade::Passed
+                } else {
+                    Grade::Failed
+                },
                 false_removals,
                 decoys_found,
                 decoys_total,
@@ -864,140 +906,163 @@ mod tests {
         }
     }
 
-    /// A one-row suite in an ecosystem the caller chooses, for the not-read tests.
-    fn suite_in(ecosystem: Ecosystem) -> SuiteReport {
-        let mut report = suite(Vec::new(), 0, 1);
-        report.reports[0].ecosystem = ecosystem;
-        report
+    /// A one-row suite the SUT could not read, in the ecosystem the caller
+    /// names — the shape [`run_suite`] produces for a skipped class: no ground
+    /// truth, no claims, and a grade that is neither of the other two.
+    fn unread_suite(ecosystem: Ecosystem) -> SuiteReport {
+        SuiteReport {
+            sut_name: "test".to_string(),
+            reports: vec![MutantReport {
+                mutant_id: "m01".to_string(),
+                ecosystem,
+                grade: Grade::NotRead,
+                false_removals: Vec::new(),
+                decoys_found: 0,
+                decoys_total: 0,
+            }],
+            false_removal_count: 0,
+        }
     }
 
     #[test]
-    fn a_class_the_sut_cannot_read_is_marked_and_counted_out() {
-        // Vulture is a Python AST tool. Graded against a Rust fixture it opens
-        // no file, claims nothing, and renders — without this marker —
-        // identically to a tool that read the code and correctly kept it.
-        // §6.20: "no data" must be a distinct state from "zero executions".
+    fn a_class_the_sut_could_not_read_is_marked_and_counted_out() {
+        // Vulture is a Python AST tool. Handed a Rust fixture it opens no file
+        // and claims nothing, which without this marker renders identically to
+        // a tool that read the code and correctly kept it. §6.20: "no data"
+        // must be a distinct state from "zero executions".
         let text = render_text(
-            &suite_in(Ecosystem::Rust),
+            &unread_suite(Ecosystem::Rust),
             &catalogue(),
             &SutChoice::Vulture,
         );
 
         assert!(
             text.contains("[NOT READ by this SUT]"),
-            "a Rust class graded by vulture must be marked unread; got {text}"
+            "an unread class must be marked; got {text}"
         );
         assert!(
             text.contains("not measured: 1 of 1 classes"),
             "the summary must carry the denominator, or '4 of 19' is the reading people take; \
              got {text}"
         );
+        // And it must not appear in either verdict column. This is the whole
+        // arithmetic of the feature: a skipped class that counted as passed
+        // would make narrowing an adapter's languages a way to raise a green.
+        assert!(
+            text.contains("0 graded — 0 passed, 0 failed; 1 not read"),
+            "the summary folded an unread class into a verdict column; got {text}"
+        );
     }
 
     #[test]
-    fn a_class_the_sut_can_read_carries_no_such_marker() {
+    fn a_class_the_sut_read_carries_no_such_marker() {
         // The other half, and the one that keeps the marker meaningful: if it
         // appeared on rows the tool genuinely analyzed, it would stop carrying
         // information and start being noise a reader learns to skip.
-        let python = render_text(
-            &suite_in(Ecosystem::Python),
-            &catalogue(),
-            &SutChoice::Vulture,
+        let text = render_text(&suite(Vec::new(), 1, 1), &catalogue(), &SutChoice::Vulture);
+        assert!(!text.contains("NOT READ"), "got {text}");
+        assert!(!text.contains("not measured"), "got {text}");
+        assert!(
+            text.contains("1 graded — 1 passed, 0 failed; 0 not read"),
+            "got {text}"
         );
-        assert!(!python.contains("NOT READ"), "got {python}");
-        assert!(!python.contains("not measured"), "got {python}");
-
-        // Polyglot fixtures contain a Python half vulture really does parse, so
-        // a grade there is earned rather than vacuous.
-        let polyglot = render_text(
-            &suite_in(Ecosystem::Polyglot),
-            &catalogue(),
-            &SutChoice::Vulture,
-        );
-        assert!(!polyglot.contains("NOT READ"), "got {polyglot}");
-
-        // And the language-agnostic controls are never marked, in any ecosystem.
-        let naive = render_text(&suite_in(Ecosystem::Go), &catalogue(), &SutChoice::Naive);
-        assert!(!naive.contains("NOT READ"), "got {naive}");
     }
 
     #[test]
-    fn every_ecosystem_is_claimed_by_exactly_the_analyzers_that_parse_it() {
-        // The language map decides two things a report cannot recover from
-        // being wrong about. Too narrow and a genuine false removal is excused
-        // as "not measured"; too wide and a tool is credited with passing a
-        // class it never opened. Both are stated here as the full matrix rather
-        // than as spot checks, because the failure is a *missing* or *extra*
-        // entry and a spot check on the entries that exist cannot see either.
+    fn every_named_analyzer_declares_the_languages_its_tool_can_load() {
+        // The map that decides what gets skipped. It lives on the adapters now,
+        // not here — one copy, next to the measurements that justify it — and
+        // this pins that the CLI wires each SUT to its own adapter's
+        // declaration rather than to a second list that can disagree.
+        //
+        // Both directions of error are damaging. Too wide and the analyzer is
+        // handed a repository it cannot open, which is the abort this feature
+        // exists to prevent; too narrow and a class it really does read is
+        // dropped from the measurement, which turns an uncounted false removal
+        // into a green.
         let expected: &[(SutChoice, &[Ecosystem])] = &[
-            (
-                SutChoice::Vulture,
-                &[Ecosystem::Python, Ecosystem::Polyglot],
-            ),
-            (
-                SutChoice::Knip,
-                &[Ecosystem::TypeScript, Ecosystem::Polyglot],
-            ),
+            (SutChoice::Vulture, &[Ecosystem::Python]),
+            (SutChoice::Knip, &[Ecosystem::TypeScript]),
             (SutChoice::Deadcode, &[Ecosystem::Go]),
             (SutChoice::Shear, &[Ecosystem::Rust]),
         ];
 
         for (choice, langs) in expected {
+            let sut = build_sut(choice);
             assert_eq!(
-                reads(choice),
+                sut.reads(),
                 Some(*langs),
                 "`--sut {}` reads the wrong set of languages",
                 choice.label()
             );
-
-            for ecosystem in [
-                Ecosystem::Python,
-                Ecosystem::TypeScript,
-                Ecosystem::Rust,
-                Ecosystem::Go,
-                Ecosystem::Polyglot,
-            ] {
-                assert_eq!(
-                    was_read(choice, ecosystem),
-                    langs.contains(&ecosystem),
-                    "`--sut {}` on a {} class: the marker and the language map disagree",
-                    choice.label(),
-                    self::ecosystem(ecosystem),
-                );
-            }
+            assert!(
+                !langs.contains(&Ecosystem::Polyglot),
+                "`--sut {}` claims to read `Polyglot`. That is a property of a class's \
+                 liveness mechanism, not a toolchain any analyzer can be pointed at — a \
+                 fixture says which languages are actually in it, and matching on Polyglot \
+                 hands the tool repositories with none of them (measured: knip exits 2 on \
+                 m08, m13 and m18)",
+                choice.label()
+            );
         }
 
-        // And the ones that declare nothing keep declaring nothing. An
-        // arbitrary command has unknown competence, which is not a claim in
-        // either direction.
+        // And the ones that declare nothing keep declaring nothing. Both
+        // controls are language-agnostic by construction, and an arbitrary
+        // command has unknown competence — which is not a claim in either
+        // direction, so it is measured on everything.
         for choice in [
             SutChoice::Naive,
             SutChoice::Refusing,
             SutChoice::Command(vec!["mytool".to_string()]),
         ] {
-            assert_eq!(reads(&choice), None, "got a language claim for {choice:?}");
+            assert_eq!(
+                build_sut(&choice).reads(),
+                None,
+                "got a language claim for {choice:?}"
+            );
         }
     }
 
     #[test]
-    fn a_go_only_analyzer_is_marked_absent_on_every_other_ecosystem() {
-        // The concrete consequence of the map above, at the surface a human
-        // reads. deadcode graded against a Rust fixture opens no file, claims
-        // nothing, and would otherwise render identically to a tool that read
-        // the code and correctly kept it (§6.20).
-        let text = render_text(
-            &suite_in(Ecosystem::Rust),
-            &catalogue(),
-            &SutChoice::Deadcode,
-        );
-        assert!(text.contains("[NOT READ by this SUT]"), "got {text}");
-        assert!(text.contains("not measured: 1 of 1 classes"), "got {text}");
+    fn a_report_that_graded_nothing_is_refused_rather_than_gated() {
+        // The abuse case, at the surface that produces the exit code. An
+        // analyzer declaring it reads no ecosystem present in any class grades
+        // none of them, removes nothing live, and would otherwise print
+        // "false removals: 0 — GATE PASSED" and exit 0 — a green build
+        // certifying a tool that never opened a file (§6.20, §3.7).
+        let nothing_graded = unread_suite(Ecosystem::Rust);
+        assert_eq!(nothing_graded.false_removal_count, 0);
 
-        // Its own ecosystem carries no marker, or the marker stops carrying
-        // information and starts being noise a reader learns to skip.
-        let go = render_text(&suite_in(Ecosystem::Go), &catalogue(), &SutChoice::Deadcode);
-        assert!(!go.contains("NOT READ"), "got {go}");
-        assert!(!go.contains("not measured"), "got {go}");
+        let refusal = gate(&nothing_graded)
+            .expect_err("a suite that graded nothing must not produce an exit code");
+        assert!(
+            refusal.headline.contains("graded none"),
+            "the refusal must say what is missing: {}",
+            refusal.headline
+        );
+        assert!(
+            refusal.detail.contains("nothing was measured"),
+            "the refusal must name the reason the zero is not a result: {}",
+            refusal.detail
+        );
+
+        // And the rendering must not contain the words a gate result is made
+        // of, in either direction.
+        let rendered = render_refusal(&refusal, &SutChoice::Vulture, false);
+        for forbidden in ["GATE PASSED", "GATE FAILED", "false removals:"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "a refusal printed `{forbidden}`: {rendered}"
+            );
+        }
+
+        // The other side of the guard: one graded class is enough to gate on,
+        // and the gate is still false removals and nothing else.
+        assert_eq!(gate(&suite(Vec::new(), 1, 1)).ok(), Some(0));
+        assert_eq!(
+            gate(&suite(vec!["live.py".to_string()], 1, 1)).ok(),
+            Some(1)
+        );
     }
 
     #[test]

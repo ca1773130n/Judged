@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 
 use judged_core::{Error, Result};
 
+use crate::mutant::Ecosystem;
 use crate::sut::SutVerdict;
 
 /// What Vulture can and cannot say, in the form §9.2 requires of every adapter.
@@ -93,6 +94,27 @@ precision) — 59 on httpx, which contains zero dead items, 260 on Flask via \
 field, plus globals(), dataclasses, TypedDict and Protocol. Those are wrong \
 answers, not silence. They are what E2 grades, and an envelope that declared \
 them would be excusing the number this suite exists to produce.";
+
+/// The ecosystems vulture can load a repository from, for
+/// [`crate::sut::CommandSut::with_reads`].
+///
+/// Vulture is a Python AST tool: `vulture/core.py` walks the paths it is given
+/// for `*.py`, parses each with `ast`, and has no other front end. A repository
+/// with no Python in it is not a repository it read badly — it is one it never
+/// opened, and §6.20 requires that to be a distinct state from "scanned it and
+/// found nothing dead".
+///
+/// Measured 2026-08-01, vulture 2.16: pointed at a repository containing no
+/// `.py` file it prints nothing and exits 0. That is the dangerous case, not
+/// the safe one — an empty verdict is zero false removals, which is a passing
+/// gate — and it is why the declaration has to be made here rather than
+/// inferred from the exit code.
+///
+/// Deliberately not `Polyglot`: that is a property of a class's liveness
+/// mechanism, not a language, and the polyglot fixtures vulture can genuinely
+/// read say so themselves through
+/// [`crate::mutant::Mutant::languages`].
+pub const READS: &[Ecosystem] = &[Ecosystem::Python];
 
 /// [`CAPABILITY_ENVELOPE`] in the shape [`crate::sut::Sut::cannot_emit`] wants:
 /// one prose class per entry, so a report can list them and a `Sut` impl can

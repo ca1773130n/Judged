@@ -191,6 +191,16 @@ impl Mutant for GitignoreNegation {
     fn ecosystem(&self) -> Ecosystem {
         Ecosystem::Polyglot
     }
+    /// PHP, `composer.json`, and checked-in media. None of the four analyzers
+    /// Judged adapts reads PHP, so every one of them skips this class — which
+    /// is the honest answer rather than a gap in the catalogue. A tool that
+    /// cannot parse the language cannot have an opinion about it, and grading
+    /// its silence here would be §6.20's error exactly. The class still does
+    /// its job against a language-agnostic cleaner: it is one of the five that
+    /// must always catch [`crate::sut::NaiveSut`].
+    fn languages(&self) -> &'static [Ecosystem] {
+        &[]
+    }
     fn mechanism(&self) -> &str {
         "file rescued from a broad ignore rule by an explicit ! negation"
     }

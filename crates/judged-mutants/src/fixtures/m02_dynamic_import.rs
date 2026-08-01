@@ -222,6 +222,13 @@ impl Mutant for DynamicImport {
     fn ecosystem(&self) -> Ecosystem {
         Ecosystem::Polyglot
     }
+    /// A Python package under `app/` and a TypeScript one under `src/`, with
+    /// `package.json` and `tsconfig.json` at the root. Measured 2026-08-01:
+    /// knip 6.31.0 loads this repository and reports on it (exit 1 with a SARIF
+    /// log), so both toolchains genuinely read it and both must be graded here.
+    fn languages(&self) -> &'static [Ecosystem] {
+        &[Ecosystem::Python, Ecosystem::TypeScript]
+    }
     fn mechanism(&self) -> &str {
         "module name computed at runtime and passed to importlib / require"
     }

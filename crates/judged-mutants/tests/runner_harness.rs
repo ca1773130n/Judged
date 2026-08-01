@@ -309,7 +309,7 @@ fn any_false_removal_fails_that_mutant() {
     let report = run_suite(&sut, &mutants).expect("suite runs");
 
     assert!(
-        !report.reports[0].passed,
+        !report.reports[0].passed(),
         "one false removal must fail the mutant regardless of decoy recall"
     );
     assert_eq!(report.reports[0].decoys_found, 1);
@@ -333,7 +333,7 @@ fn decoy_recall_is_recorded_and_required_for_a_pass() {
     assert_eq!(silent_report.reports[0].decoys_found, 0);
     assert_eq!(silent_report.reports[0].decoys_total, 2);
     assert!(
-        !silent_report.reports[0].passed,
+        !silent_report.reports[0].passed(),
         "zero false removals is not a pass when no decoy was found"
     );
 
@@ -342,7 +342,7 @@ fn decoy_recall_is_recorded_and_required_for_a_pass() {
     };
     let working_report = run_suite(&working, &mutants).expect("suite runs");
     assert_eq!(working_report.reports[0].decoys_found, 2);
-    assert!(working_report.reports[0].passed);
+    assert!(working_report.reports[0].passed());
 }
 
 /// Ground truth with a symbol route on every decoy, paired by index.
@@ -382,7 +382,7 @@ fn a_decoy_is_found_when_the_sut_names_a_symbol_defined_in_it() {
     );
     assert_eq!(report.reports[0].decoys_total, 1);
     assert!(
-        report.reports[0].passed,
+        report.reports[0].passed(),
         "zero false removals plus full decoy recall is a pass, whichever route \
          the recall came through"
     );
@@ -538,9 +538,9 @@ fn a_failing_mutant_does_not_stop_later_mutants_from_being_graded() {
         vec!["s01", "s02", "s03"],
         "every mutant is graded and reports stay in catalogue order"
     );
-    assert!(!report.reports[0].passed);
-    assert!(report.reports[1].passed);
-    assert!(!report.reports[2].passed);
+    assert!(!report.reports[0].passed());
+    assert!(report.reports[1].passed());
+    assert!(!report.reports[2].passed());
     assert_eq!(report.false_removal_count, 2);
 }
 

@@ -42,6 +42,13 @@ impl Mutant for FrameworkConvention {
     fn ecosystem(&self) -> Ecosystem {
         Ecosystem::Polyglot
     }
+    /// A Django app and a JavaScript half with `package.json`, `src/` and a
+    /// Jest test. `TypeScript` is this enum's name for the JS/TS ecosystem, not
+    /// a claim that the files are typed. Measured 2026-08-01: knip 6.31.0 loads
+    /// it and reports on it.
+    fn languages(&self) -> &'static [Ecosystem] {
+        &[Ecosystem::Python, Ecosystem::TypeScript]
+    }
     fn mechanism(&self) -> &str {
         "loaded by framework convention: Django AppConfig autoload, Jest __mocks__"
     }

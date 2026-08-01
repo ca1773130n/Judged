@@ -8,6 +8,8 @@ use std::process::Command;
 
 use judged_core::{Error, Result};
 
+use crate::mutant::Ecosystem;
+
 /// What a cleaner claims is dead after looking at a repository.
 ///
 /// There is no field for "confidence" and no field for "score". §9.2 records
@@ -51,6 +53,50 @@ pub trait Sut {
     /// and an enum would have to be right about every tool in advance.
     fn cannot_emit(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// The language ecosystems this SUT can load a repository from, or `None`
+    /// for a tool that is language-agnostic.
+    ///
+    /// The coarsest and most consequential entry in the capability envelope
+    /// above: an entire language the tool structurally cannot open.
+    /// [`crate::runner::run_suite`] intersects this with each mutant's
+    /// [`crate::mutant::Mutant::languages`] and **skips** a class with no
+    /// overlap — it is not materialized, this SUT is never spawned on it, and
+    /// it is recorded as [`crate::runner::Grade::NotRead`].
+    ///
+    /// # Why the declaration has to exist at all
+    ///
+    /// A language-specific analyzer handed a repository in another language
+    /// does one of two things, and neither can be graded. It refuses — knip
+    /// exits 2 with `Unable to find package.json`, cargo-shear 2 with
+    /// `could not find Cargo.toml`, deadcode 1 with `packages contain errors` —
+    /// and since every one of those codes is shared with a genuine analysis
+    /// failure whose stdout is equally empty, none may be declared healthy
+    /// (§6.20), so the run aborts. Or it tolerates the directory, finds none of
+    /// its own file types, prints nothing and exits 0 — which grades as zero
+    /// false removals, a perfect result for a tool that opened no file.
+    ///
+    /// # The direction each mistake runs in
+    ///
+    /// Declaring too *little* is not the safe side. A class dropped from the
+    /// measurement is a false removal that never gets counted, and the report
+    /// loses discriminating power silently. Declaring too *much* re-creates the
+    /// abort. Neither is a default anything can pick, which is why this is
+    /// `None` unless a SUT says otherwise: unknown competence is not a claim in
+    /// either direction, and a tool that declares nothing is measured on
+    /// everything.
+    ///
+    /// `Some(&[])` — "I read no language at all" — is legal and is the abuse
+    /// case the runner is built against: it grades nothing, and a report over
+    /// zero graded classes is not a clean run (see
+    /// [`crate::runner::SuiteReport::graded_count`]).
+    ///
+    /// [`crate::mutant::Ecosystem::Polyglot`] must never appear here. It names
+    /// a class's liveness mechanism, not a toolchain, and no analyzer can be
+    /// pointed at it.
+    fn reads(&self) -> Option<&[Ecosystem]> {
+        None
     }
 }
 
@@ -102,6 +148,7 @@ pub struct CommandSut {
     parse: VerdictParser,
     success_exit_codes: Vec<i32>,
     cannot_emit: Vec<String>,
+    reads: Option<Vec<Ecosystem>>,
 }
 
 impl CommandSut {
@@ -121,6 +168,7 @@ impl CommandSut {
             parse,
             success_exit_codes: vec![0],
             cannot_emit: Vec::new(),
+            reads: None,
         }
     }
 
@@ -160,6 +208,19 @@ impl CommandSut {
         classes: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         self.cannot_emit = classes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Declare the ecosystems this tool can load a repository from; see
+    /// [`Sut::reads`].
+    ///
+    /// Opt-in and never inferred, for the same reason as
+    /// [`CommandSut::with_success_exit_codes`]: Judged knows nothing about the
+    /// command it was handed, and guessing a language from an argv would be the
+    /// harness asserting something the adapter never said. Left unset, the SUT
+    /// is measured on the whole catalogue.
+    pub fn with_reads(mut self, ecosystems: impl IntoIterator<Item = Ecosystem>) -> Self {
+        self.reads = Some(ecosystems.into_iter().collect());
         self
     }
 
@@ -238,6 +299,10 @@ impl Sut for CommandSut {
 
     fn cannot_emit(&self) -> Vec<String> {
         self.cannot_emit.clone()
+    }
+
+    fn reads(&self) -> Option<&[Ecosystem]> {
+        self.reads.as_deref()
     }
 
     fn run(&self, repo: &Path) -> Result<SutVerdict> {

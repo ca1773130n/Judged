@@ -104,6 +104,7 @@ use std::path::{Path, PathBuf};
 
 use judged_core::{Error, Result};
 
+use crate::mutant::Ecosystem;
 use crate::sut::SutVerdict;
 
 /// What deadcode can and cannot say, in the form §9.2 requires of every adapter.
@@ -122,6 +123,18 @@ use crate::sut::SutVerdict;
 /// unreachability analysis does not come out as silence, it comes out as an
 /// accusation, and that accusation is exactly what §10 E2 class 12 grades. The
 /// envelope explains the mechanism; the score still counts the removal.
+/// The ecosystems deadcode can load a repository from, for
+/// [`crate::sut::CommandSut::with_reads`].
+///
+/// deadcode loads a Go program from source with `packages.Load`, which needs a
+/// module — a `go.mod` and packages the Go toolchain can type-check. There is no
+/// partial reading: a directory with no Go in it produces `no Go files in <dir>`
+/// or `cannot find main module`, empty stdout and exit 1 (measured 2026-08-01,
+/// x/tools with go1.26.2). That exit code is shared with "your Go does not
+/// compile", so it cannot be declared healthy (§6.20) and the class has to be
+/// skipped before the tool is spawned instead.
+pub const READS: &[Ecosystem] = &[Ecosystem::Go];
+
 pub const CAPABILITY_ENVELOPE: &str = "\
 deadcode computes whole-program Rapid Type Analysis from every main and init in \
 the packages it was given, and is sound through func values, interface dispatch \

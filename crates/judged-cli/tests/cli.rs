@@ -1600,9 +1600,20 @@ fn knip_is_run_and_its_unread_classes_are_counted_out_of_the_score() {
     // The shim emits knip's real empty-result SARIF, captured from
     // `npx knip@6 --reporter sarif --no-progress` against a project with
     // nothing unused (knip 6.31.0, exit 0). It claims nothing, so what is
-    // under test is the language map: knip reads TypeScript and Polyglot, so
-    // the twelve classes in the other three ecosystems must be marked and
-    // subtracted from the denominator rather than scored as passes.
+    // under test is the language map.
+    //
+    // Three of nineteen classes are ones knip can load: m02 and m10, whose
+    // polyglot trees carry a package.json and a JS/TS half, and m14, which is
+    // TypeScript outright. The other sixteen it cannot open at all.
+    //
+    // That sixteen was thirteen before this build, and the three-class
+    // difference was a bug, not a rounding. The old map claimed knip reads
+    // `Polyglot`, on the reasoning that a polyglot fixture always contains a JS
+    // or TS half. Measured 2026-08-01 against knip 6.31.0 on the materialized
+    // catalogue: m08 (Python + CI workflow), m13 (PHP) and m18 (Python +
+    // Kotlin) contain no JS at all and no package.json, and knip exits 2 on
+    // each with `Unable to find package.json`. Counting them as read is what
+    // made `--sut knip` abort on m01 rather than produce a score.
     let repo = scratch("knip-present");
     let bin = scratch("knip-present-path");
     shim(bin.path(), "npx", KNIP_EMPTY_SARIF_SHIM);
@@ -1616,9 +1627,7 @@ fn knip_is_run_and_its_unread_classes_are_counted_out_of_the_score() {
     run.expect_code(0, "an analyzer that claims nothing has no false removals")
         .expect_says("knip")
         .expect_says("[NOT READ by this SUT]")
-        // Six of nineteen classes are TypeScript or Polyglot; the other
-        // thirteen are Python, Rust or Go, and knip opened no file in them.
-        .expect_says("not measured: 13 of 19 classes")
+        .expect_says("not measured: 16 of 19 classes")
         .expect_says("decoy recall:");
     expect_every_class_is_reported(&run);
 }
@@ -1727,27 +1736,189 @@ fn every_named_analyzer_discloses_its_capability_envelope_before_the_rows() {
     }
 }
 
+/// Shims reproducing each analyzer's **measured** behaviour on both sides of
+/// its own ecosystem boundary: the real refusal when its manifest is absent,
+/// the real empty report when it is present.
+///
+/// The refusal half is captured, not invented. Measured 2026-08-01 against the
+/// materialized catalogue:
+///
+/// | Tool | Outside its ecosystem | Exit |
+/// | --- | --- | --- |
+/// | knip 6.31.0 | `ERROR: Unable to find package.json` | 2 |
+/// | cargo-shear | ``error: could not find `Cargo.toml` `` | 2 |
+/// | deadcode (x/tools) | `deadcode: packages contain errors` | 1 |
+///
+/// Each of those codes is shared with a genuine analysis failure whose stdout
+/// is equally empty, so none of them may be declared healthy (§6.20) — which is
+/// precisely why a class outside the analyzer's languages has to be skipped
+/// before the tool is spawned rather than tolerated afterwards.
+///
+/// The last argument is the repository, because
+/// [`judged_mutants::sut::CommandSut`] appends it; deadcode's arrives as the
+/// package pattern `<repo>/...`, so the `/...` is stripped back off.
+#[cfg(unix)]
+const KNIP_ECOSYSTEM_AWARE_SHIM: &str = concat!(
+    "#!/bin/sh\nfor a in \"$@\"; do dir=\"$a\"; done\n",
+    "if [ ! -f \"$dir/package.json\" ]; then\n",
+    "  echo 'ERROR: Unable to find package.json' >&2\n  exit 2\nfi\n",
+    "cat <<'SARIF'\n",
+    r#"{"$schema":"https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"knip","version":"6.31.0","semanticVersion":"6.31.0","informationUri":"https://knip.dev","rules":[]}},"results":[]}]}"#,
+    "\nSARIF\nexit 0\n"
+);
+
+#[cfg(unix)]
+const DEADCODE_ECOSYSTEM_AWARE_SHIM: &str = concat!(
+    "#!/bin/sh\nfor a in \"$@\"; do dir=\"$a\"; done\ndir=${dir%/...}\n",
+    "if [ ! -f \"$dir/go.mod\" ]; then\n",
+    "  echo 'deadcode: packages contain errors' >&2\n  exit 1\nfi\n",
+    "printf 'null'\nexit 0\n"
+);
+
+#[cfg(unix)]
+const SHEAR_ECOSYSTEM_AWARE_SHIM: &str = concat!(
+    "#!/bin/sh\nfor a in \"$@\"; do dir=\"$a\"; done\n",
+    "if [ ! -f \"$dir/Cargo.toml\" ]; then\n",
+    "  echo 'error: could not find `Cargo.toml`' >&2\n  exit 2\nfi\n",
+    "cat <<'JSON'\n",
+    "{\n  \"summary\": {\n    \"errors\": 0,\n    \"warnings\": 0,\n    \"fixed\": 0\n  },\n",
+    "  \"findings\": []\n}\n",
+    "JSON\nexit 0\n"
+);
+
 #[cfg(unix)]
 #[test]
-fn an_analyzer_that_refuses_a_repository_outside_its_own_language_says_so() {
-    // Measured, and the finding this round produced: none of the three
-    // ecosystem-specific analyzers *tolerates* a repository outside its
-    // ecosystem the way vulture does. Vulture finds no `.py` files and exits 0;
-    // knip exits 2 with `Unable to find package.json`, cargo-shear exits 2 with
-    // `could not find Cargo.toml`, deadcode exits 1 with `packages contain
-    // errors`. The suite runs every class against the selected SUT, so the
-    // first such class stops the run.
+fn a_language_specific_analyzer_completes_because_foreign_classes_are_skipped() {
+    // THE defect this build fixes. `run_suite` used to hand all nineteen
+    // fixtures to whichever analyzer was selected, and a language-specific tool
+    // given a repository in the wrong language exits non-zero — knip 2,
+    // cargo-shear 2, deadcode 1. `CommandSut` correctly refuses to call those
+    // exit codes healthy, because each is shared with a genuine analysis
+    // failure whose output is equally empty (§6.20), so the whole run aborted
+    // on the first foreign class and `judged mutants` could grade exactly one
+    // of the four analyzers it has adapters for.
     //
-    // Refusing is the correct behaviour — the alternative is declaring those
-    // exit codes healthy, and each of them is shared with a genuine analysis
-    // failure whose stdout is equally empty. What is under test here is that
-    // the refusal says which ecosystem the tool reads, so the reader is not
-    // left debugging an install that is fine.
+    // The fix is a declaration, not a wider exit-code list: a SUT says which
+    // ecosystems it can read, and a class outside them is never materialized
+    // and never handed over. What is asserted here is that the run now
+    // *completes* — reaches a gate line for every one of the nineteen classes —
+    // against shims that refuse a foreign repository exactly as the real tools
+    // were measured doing.
     //
-    // The shim reproduces cargo-shear's measured out-of-ecosystem behaviour
-    // rather than requiring it to be installed.
-    let repo = scratch("shear-foreign");
-    let bin = scratch("shear-foreign-path");
+    // The unread counts are the second half of the assertion and they are not
+    // cosmetic: they are what stops a skipped class being read as a passed one.
+    for (sut, binary, body, unread) in [
+        ("knip", "npx", KNIP_ECOSYSTEM_AWARE_SHIM, 16),
+        ("deadcode", "deadcode", DEADCODE_ECOSYSTEM_AWARE_SHIM, 18),
+        ("shear", "cargo-shear", SHEAR_ECOSYSTEM_AWARE_SHIM, 13),
+    ] {
+        let repo = scratch(&format!("{sut}-skips-foreign"));
+        let bin = scratch(&format!("{sut}-skips-foreign-path"));
+        shim(bin.path(), binary, body);
+
+        let run = judged_with_path(
+            repo.path(),
+            &["mutants", "--sut", sut],
+            Some(Path::new(&path_with(bin.path()))),
+        );
+
+        run.expect_code(
+            0,
+            "the analyzer completed every class it can read and claimed nothing in them",
+        )
+        .expect_says("[NOT READ by this SUT]")
+        .expect_says(&format!("not measured: {unread} of 19 classes"))
+        .expect_says("false removals: 0");
+        // Every class still appears. A skipped class that vanished from the
+        // report would be indistinguishable from one that was never in the
+        // catalogue.
+        expect_every_class_is_reported(&run);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_skipped_class_is_never_counted_as_a_pass() {
+    // The whole risk of the skipping feature, stated as arithmetic. If "not
+    // read" quietly became "passed", then narrowing an adapter's declared
+    // languages would be a way to raise a green — and the narrowest possible
+    // declaration would score a perfect run (§6.20: no data is not zero
+    // findings).
+    //
+    // deadcode reads Go, and the catalogue holds exactly one Go class, so the
+    // summary line must account for eighteen classes it did not attempt and
+    // must not fold them into either column.
+    let repo = scratch("deadcode-arithmetic");
+    let bin = scratch("deadcode-arithmetic-path");
+    shim(bin.path(), "deadcode", DEADCODE_ECOSYSTEM_AWARE_SHIM);
+
+    let run = judged_with_path(
+        repo.path(),
+        &["mutants", "--sut", "deadcode"],
+        Some(Path::new(&path_with(bin.path()))),
+    );
+
+    run.expect_code(0, "the one class it read produced no false removal");
+
+    // The summary must be over the classes that were graded, not over all
+    // nineteen. `1 class graded` is the honest denominator when eighteen were
+    // never opened.
+    let summary = run
+        .stdout
+        .lines()
+        .find(|line| line.starts_with("19 classes:"))
+        .unwrap_or_else(|| panic!("no class summary line. Report was:\n{}", run.stdout));
+    assert!(
+        summary.contains("1 graded"),
+        "the summary must say how many classes were actually graded, or eighteen \
+         unattempted classes are read as results. Got `{summary}`"
+    );
+    assert!(
+        summary.contains("18 not read"),
+        "the skipped classes must be counted in their own column, never in the \
+         passed or failed one. Got `{summary}`"
+    );
+    // And the rows themselves must not claim a verdict they did not reach.
+    // Read out of the verdict column rather than by searching the whole row:
+    // several mechanisms are described in prose containing the word "passed"
+    // (m02's is "…passed to importlib"), and a substring search over the row
+    // would find those and pass for the wrong reason.
+    let mut unread_rows = 0;
+    for row in class_rows(&run.stdout) {
+        if !row.contains("[NOT READ by this SUT]") {
+            continue;
+        }
+        unread_rows += 1;
+        let verdict = row
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_else(|| panic!("row has no verdict column: `{row}`"));
+        assert_eq!(
+            verdict, "----",
+            "a class the analyzer never opened carries the verdict `{verdict}`: `{row}`"
+        );
+    }
+    assert_eq!(
+        unread_rows, 18,
+        "eighteen classes are outside Go and every one must be marked on its own row"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_analyzer_that_fails_inside_its_own_language_still_stops_the_run() {
+    // The other direction, and the one that keeps skipping honest. Once foreign
+    // classes are skipped, every class the analyzer is actually handed is one it
+    // declared it can read — so a non-zero exit there is a genuine analysis
+    // failure and must still abort the run rather than be waved through as
+    // another skip.
+    //
+    // The shim refuses every repository, cargo-shear's measured
+    // out-of-ecosystem message and exit code. Since the Python and polyglot
+    // classes are now skipped, the class it stops on is the first Rust one,
+    // m04 — not m01, which is where the pre-skip build died.
+    let repo = scratch("shear-broken");
+    let bin = scratch("shear-broken-path");
     shim(
         bin.path(),
         "cargo-shear",
@@ -1765,10 +1936,10 @@ fn an_analyzer_that_refuses_a_repository_outside_its_own_language_says_so() {
         // The tool and the class it stopped on, which `CommandSut` already
         // supplies.
         .expect_says("cargo-shear")
-        .expect_says("m01")
-        // What this build adds: the language the SUT declares it reads, and how
-        // many of the nineteen classes are outside it. Without that the reader
-        // sees `exited with status 2` and goes to check their installation.
+        .expect_says("m04")
+        // And the language it declares, so the reader can see that this failure
+        // is *inside* the analyzer's own ecosystem and is therefore not a
+        // language mismatch to be shrugged off.
         .expect_says("rust")
         .expect_says("13 of 19");
     expect_no_gate_result(&run);

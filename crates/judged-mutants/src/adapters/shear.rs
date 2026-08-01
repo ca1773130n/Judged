@@ -96,6 +96,7 @@ use std::path::PathBuf;
 
 use judged_core::{Error, Result};
 
+use crate::mutant::Ecosystem;
 use crate::sut::SutVerdict;
 
 /// What running cargo-shear does to the repository, which is not nothing.
@@ -135,6 +136,17 @@ the tool; this constant exists so the layer that does cannot miss it.";
 /// is dead, and it equally cannot say it is live. Its silence about m17 and m19
 /// is therefore not a result about link-time registries or ABI exports; it is
 /// the tool never having been asked a question it can answer.
+/// The ecosystems cargo-shear can load a repository from, for
+/// [`crate::sut::CommandSut::with_reads`].
+///
+/// cargo-shear asks `cargo metadata` for the workspace and reads the crate
+/// sources it points at. With no `Cargo.toml` there is nothing for `cargo
+/// metadata` to answer with and it never opens a file: measured 2026-08-01,
+/// ``error: could not find `Cargo.toml` in <dir> or any parent directory`` and
+/// exit 2. Exit 2 is also what a *broken* manifest produces, so it cannot be
+/// declared healthy (§6.20).
+pub const READS: &[Ecosystem] = &[Ecosystem::Rust];
+
 pub const CAPABILITY_ENVELOPE: &str = "\
 cargo-shear answers two questions and no others: is this dependency key used \
 anywhere in this workspace's source, and is this .rs file reached by a `mod` \

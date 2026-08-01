@@ -92,6 +92,47 @@ pub trait Mutant {
     /// The ecosystem the mutant is written in.
     fn ecosystem(&self) -> Ecosystem;
 
+    /// The language toolchains that can load this mutant's repository at all.
+    ///
+    /// Distinct from [`ecosystem`](Self::ecosystem), which names the class's
+    /// *character* and may be `Polyglot`. This names what an analyzer needs to
+    /// be able to parse in order to have any opinion, and it is what
+    /// [`crate::runner::run_suite`] matches against [`crate::sut::Sut::reads`]
+    /// to decide whether a class is graded or skipped.
+    ///
+    /// # Why the two cannot be the same method
+    ///
+    /// `Polyglot` is not a toolchain. Five classes in the catalogue carry it
+    /// and they contain five different mixtures: m02 is Python plus
+    /// TypeScript, m10 Python plus JavaScript, m08 Python plus shell and CI
+    /// YAML, m18 Python plus Kotlin, m13 PHP plus checked-in media. Measured
+    /// 2026-08-01, knip 6.31.0 loads m02, m10 and m14 and exits 2 with
+    /// `Unable to find package.json` on m08, m13 and m18 — so a SUT that
+    /// matched on `Polyglot` would be handed three repositories it cannot read
+    /// in order to be handed the two it can. Collapsing the distinction in
+    /// either direction costs something real: too wide aborts the run, too
+    /// narrow drops a class the tool genuinely reads, and a dropped class is a
+    /// false removal that never gets counted.
+    ///
+    /// # The default, and why `Polyglot` defaults to nothing
+    ///
+    /// A single-language class is loadable by its own toolchain and no other,
+    /// so it does not repeat itself. A polyglot class has an answer that cannot
+    /// be derived, and the default is therefore the empty set: read by no
+    /// language-specific analyzer at all. That is the conservative reading —
+    /// silence rather than a guess — and it is deliberately not silent about
+    /// being wrong, because `runner_capability.rs` pins every fixture's answer
+    /// as a matrix that a missing override fails.
+    fn languages(&self) -> &'static [Ecosystem] {
+        match self.ecosystem() {
+            Ecosystem::Python => &[Ecosystem::Python],
+            Ecosystem::TypeScript => &[Ecosystem::TypeScript],
+            Ecosystem::Rust => &[Ecosystem::Rust],
+            Ecosystem::Go => &[Ecosystem::Go],
+            Ecosystem::Polyglot => &[],
+        }
+    }
+
     /// The single mechanism by which the live artifact is reachable. One
     /// mechanism per mutant is the whole methodology — a mutant reachable two
     /// ways cannot tell you which signal caught it.

@@ -182,6 +182,14 @@ impl Mutant for CiManifestRef {
     fn ecosystem(&self) -> Ecosystem {
         Ecosystem::Polyglot
     }
+    /// Polyglot by mechanism — a GitHub Actions step and a Dockerfile `COPY`
+    /// referencing a shell script — but the only *language* toolchain that can
+    /// load the tree is Python's. There is no `package.json`, no manifest of
+    /// any other ecosystem, and shell and YAML have no analyzer here. Measured
+    /// 2026-08-01: knip 6.31.0 exits 2 with `Unable to find package.json`.
+    fn languages(&self) -> &'static [Ecosystem] {
+        &[Ecosystem::Python]
+    }
     fn mechanism(&self) -> &str {
         "script invoked only from a CI workflow, Dockerfile or k8s manifest"
     }

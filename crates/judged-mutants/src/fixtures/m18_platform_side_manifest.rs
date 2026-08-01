@@ -236,6 +236,13 @@ impl Mutant for PlatformSideManifest {
     fn ecosystem(&self) -> Ecosystem {
         Ecosystem::Polyglot
     }
+    /// A Python package plus a Kotlin/Gradle Android half. Kotlin has no
+    /// analyzer in this build, and there is no `package.json` — measured
+    /// 2026-08-01, knip 6.31.0 exits 2 here — so Python is the whole of what
+    /// can be read.
+    fn languages(&self) -> &'static [Ecosystem] {
+        &[Ecosystem::Python]
+    }
     fn mechanism(&self) -> &str {
         "entry point declared only in a platform manifest the platform reads"
     }

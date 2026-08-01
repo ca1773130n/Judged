@@ -66,7 +66,7 @@ judged mutants --sut naive|refusing|vulture|knip|deadcode|shear [--json]
 judged mutants --sut command [--json] -- <analyzer> [args...]
 ```
 
-Nineteen mutants, each materialized into a temporary repository, each planting
+Nineteen mutants, each materialized into a temporary repository when graded, each planting
 an artifact that is genuinely live but reachable through exactly one mechanism:
 a class named only in a YAML string, a plugin found by scanning a directory, a
 `//go:linkname` alias, a worker named only in a job payload already sitting in
@@ -92,16 +92,22 @@ Everything below `refusing` is how a real analyzer gets in: four by name, and
 is run once per fixture repository, from inside it, and its stdout is read —
 that is the entire interaction.
 
-**Today only `--sut vulture` produces a graded result for the whole catalogue.**
-The suite runs all 19 classes as one unit, and knip, deadcode and cargo-shear
-exit non-zero when handed a repository in the wrong language — an exit code each
-of them shares with a genuine analysis failure, so it cannot be declared healthy
-without scoring a crashed run as a clean one. All three therefore exit 2 and
-grade nothing. Vulture finds no Python and exits 0, so its run completes and the
-classes it cannot read are marked *not measured* per row. Until the runner can
-skip a class its analyzer declares it cannot read, the per-class numbers for the
-other three come from driving `run_suite` one class at a time; the eval write-up
-says so and shows the cross-check.
+**A SUT declares the ecosystems it reads, and the suite skips the rest.** A
+language-specific analyzer handed a repository in the wrong language exits
+non-zero, and that exit code is one it shares with a genuine analysis failure —
+so it cannot be waved through without also scoring a crashed run as a clean one.
+The runner instead never builds those fixtures. A class outside the SUT's
+declared ecosystems is **not read**: a third state beside pass and fail, counted
+on its own line, excluded from both halves of the decoy ratio, and incapable of
+being scored as a pass. The summary line carries all three numbers:
+
+```
+19 classes: 10 graded — 3 passed, 7 failed; 9 not read
+```
+
+Skipping moves the denominator, not the grade. All four named analyzers produce
+a graded result — over 10, 3, 1 and 6 of the 19 classes respectively — and the
+decoy ratio is computed only over what each one actually read.
 
 Judged never passes an analyzer a `--fix` mode: a deletion-shaped flag is
 refused wherever it appears, including inside the argv after `--`. That is a
@@ -129,7 +135,8 @@ before the fixtures are built:
 $ judged mutants --sut vulture
 REFUSED — the analyzer `vulture` is not installed (exit 2)
 
-  Looked for `vulture` in the 45 directories on PATH; it is in none of them.
+  Looked for `vulture` in the 47 directories on PATH; it is in none of them.
+  (The directory count is read from the running PATH, so it differs per machine.)
   Install it with `pipx install vulture`, or `pip install vulture` into the environment judged runs in. It needs Python.
 
 No verdict was reached and no class was graded. This is a refusal rather than a result on purpose: an analyzer that never ran claims nothing dead, which is zero false removals, which is the number that clears the release gate. Grading it would certify a tool that was not here (§3.7, §6.20).
@@ -150,7 +157,7 @@ below are verbatim; the nineteen per-class lines above each are elided.
 
 ```
 $ judged mutants --sut refusing
-19 classes: 0 passed, 19 failed
+19 classes: 19 graded — 0 passed, 19 failed; 0 not read
 decoy recall: 0 of 31 genuinely-dead files found
 false removals: 0 — GATE PASSED (§10 E2 gates releases on this number, and on nothing else)
 note: this SUT removed nothing at all, so it cleared the gate without demonstrating it can find anything. Zero false removals is also the score of a tool that refuses to answer.
@@ -158,7 +165,7 @@ $ echo $?
 0
 
 $ judged mutants --sut naive
-19 classes: 7 passed, 12 failed
+19 classes: 19 graded — 7 passed, 12 failed; 0 not read
 decoy recall: 31 of 31 genuinely-dead files found
 false removals: 20 — GATE FAILED (§11 R1: if this is not zero, the auto-act tier is deleted from the design rather than tuned)
 classes with false removals: m01, m02, m03, m08, m09, m10, m12, m13, m14, m16, m18, m19
@@ -178,43 +185,56 @@ analyzers, so what has been measured is the harness: it catches both failure
 directions, the cleaner that over-deletes and the cleaner that never speaks, and
 its 19 classes are discriminating enough to separate them.
 
-**Four third-party analyzers have now been graded**, spanning every ecosystem the
-catalogue injects into — vulture 2.16 (Python), knip 6.31.0 (JS/TS), `x/tools`
-deadcode v0.48.0 (Go) and cargo-shear 1.13.3 (Rust):
+**Four third-party analyzers have now been graded** — vulture 2.16 (Python),
+knip 6.31.0 (JS/TS), `x/tools` deadcode v0.48.0 (Go) and cargo-shear 1.13.3
+(Rust). That is four of the ecosystems the catalogue injects into, not all of
+them:
 
-| Tool | Classes it completed on | False removals | Decoy recall |
-| --- | --- | --- | --- |
-| vulture 2.16 | 19 (11 in its languages) | **6** — m01, m10, m11, m16 | 11/31 |
-| knip 6.31.0 | 3 | **2** — m02, m14 | 4/6 |
-| deadcode v0.48.0 | 1 | **2** — m12 | 2/2 |
-| cargo-shear 1.13.3 | 6 | **0** | 9/9 |
+| Tool | Graded | Not read | Passed | False removals | Decoy recall | Exit |
+| --- | --- | --- | --- | --- | --- | --- |
+| vulture 2.16 | 10 | 9 | 3 | **6** — m01, m10, m11, m16 | 11/16 | 1 |
+| knip 6.31.0 | 3 | 16 | 0 | **2** — m02, m14 | 4/6 | 1 |
+| deadcode v0.48.0 | 1 | 18 | 0 | **2** — m12 | 2/2 | 1 |
+| cargo-shear 1.13.3 | 6 | 13 | 6 | **0** | 9/9 | 0 |
 
 **Ten false removals across the four. Five classes — m01, m11, m12, m14, m16 —
 are false-removed by every tool that can read them.** Full write-up, with raw
 output, the configuration sweep and the limits, in
 [`docs/evals/2026-08-01-four-analyzers-e2.md`](docs/evals/2026-08-01-four-analyzers-e2.md).
 
-Read the zero with more suspicion than the sixes. cargo-shear clears every class
-it reads, and it clears them because it answers two questions — is a declared
-dependency unused, is a file unreachable by `mod` declaration — neither of which
-can produce the claim that would be wrong. On m17 and m19 it names the decoy
-correctly and stays silent about the live artifact, but the live artifact is
-`mod`-declared and cargo-shear never asks whether a symbol has callers. A tool
-scores zero on this catalogue either by being right about reachability or by
-never claiming anything about it, and the decoys do not separate those two.
+**And one class, m13, is read by none of the four.** Its live artifact is PHP
+rescued from a broad ignore rule by a `!` negation, beside a `composer.json` and
+a checked-in media file, and no adapter here covers PHP. The union of all four
+analyzers grades 18 of the 19 classes, so the catalogue currently measures 18 of
+the 19 mechanisms it defines — the nineteenth has no reader at all.
 
-Read each row with its denominator. 55 of the 76 tool×class cells are not
-results: 47 runs never completed, and 8 more are vulture completing without
-opening a file. §4.1's prior figure for vulture on other corpora — 44 true
-positives against 644 false positives across 9 projects, 59 of them on httpx,
-which contains no dead code at all — is a different experiment and is not this
-number.
+cargo-shear is the one tool that clears the gate, and both halves of that need
+saying. The decoy recall is real competence: 9 of 9 genuinely-dead files found
+inside its scope, so this is not the refusing control's degenerate zero. But it
+answers two questions — is a declared dependency unused, is a file unreachable
+by `mod` declaration — and neither can produce the claim that would be wrong on
+the classes it read. On m17 and m19 it names the decoy correctly and stays
+silent about the live artifact, which is `mod`-declared; cargo-shear never asks
+whether a symbol has callers. A catalogue of mostly symbol-level mechanisms, a
+tool that reads declared dependencies and module linkage, and 6 of the 19
+classes graded: an exit 0 here is a fact about its capability envelope before it
+is a fact about the mechanisms, and it says nothing about whether an auto-act
+tier could exist.
+
+Read each row with its denominator. Only 20 of the 76 tool×class cells are
+graded results; the other 56 were never read, because the class is outside the
+analyzer's declared ecosystems. Every per-tool false-removal count is a count
+over a small, language-determined subset. §4.1's prior figure for vulture on
+other corpora — 44 true positives against 644 false positives across 9 projects,
+59 of them on httpx, which contains no dead code at all — is a different
+experiment and is not this number.
 
 A bad score is a result, not a bug to tune out. Nothing in the fixtures, the
 adapter or the grading was adjusted after seeing it, and §11 R1's consequence is
-pre-committed in both directions. One analyzer over mostly one language does not
-resolve R1; it establishes that the harness grades reality rather than only the
-two SUTs we wrote ourselves.
+pre-committed in both directions. Four off-the-shelf analyzers at their defaults
+are not "no signal combination", so nothing here discharges R1; what they
+establish is that the harness grades reality rather than only the two SUTs we
+wrote ourselves.
 
 ## Layout
 

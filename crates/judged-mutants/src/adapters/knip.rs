@@ -86,6 +86,7 @@ use judged_core::sarif::{
 };
 use judged_core::{Error, Result};
 
+use crate::mutant::Ecosystem;
 use crate::sut::SutVerdict;
 
 /// The tool name every error and every notification from this module carries.
@@ -115,6 +116,28 @@ pub const RECOMMENDED_ARGS: &[&str] = &["--reporter", "sarif", "--no-progress"];
 /// for, since knip also exits **1** when it refuses to run and prints its help
 /// text instead.
 pub const SUCCESS_EXIT_CODES: &[i32] = &[0, 1];
+
+/// The ecosystems knip can load a repository from, for
+/// [`crate::sut::CommandSut::with_reads`].
+///
+/// Knip builds a JavaScript/TypeScript module graph rooted in `package.json`
+/// and `tsconfig.json`. Without a `package.json` it does not analyze badly — it
+/// does not start: measured 2026-08-01 against knip 6.31.0 on the materialized
+/// catalogue, `ERROR: Unable to find package.json` and exit 2 on m08, m13 and
+/// m18, against a SARIF log and exit 1 on m02, m10 and m14.
+///
+/// `Ecosystem::TypeScript` is this enum's name for the whole JS/TS ecosystem,
+/// so a fixture whose JavaScript half is untyped (m10) declares it too.
+///
+/// Note what is **not** here, because it was here and it was wrong. An earlier
+/// build claimed knip reads `Polyglot`, on the reasoning that every polyglot
+/// fixture contains a JS or TS half. Three of the five do not — m08 is Python
+/// with a CI workflow, m13 is PHP, m18 is Python with Kotlin — and the claim
+/// was what made `--sut knip` abort on the first of them. `Polyglot` is a
+/// property of a liveness mechanism, not a toolchain; the two polyglot fixtures
+/// knip really does read declare `TypeScript` in
+/// [`crate::mutant::Mutant::languages`] and are graded through that.
+pub const READS: &[Ecosystem] = &[Ecosystem::TypeScript];
 
 /// What Knip can and cannot say, in the form §9.2 requires of every adapter.
 ///

@@ -7,6 +7,27 @@ use crate::mutant::{Ecosystem, GroundTruth, Mutant};
 use crate::sut::{Sut, SutVerdict};
 use judged_core::{Error, Result};
 
+/// What happened to one class under one SUT.
+///
+/// Three states, not two, and the third is the whole point. §6.20: *"'no data'
+/// must be a distinct state from 'zero executions,' and it must never flow into
+/// a deadness score."* A class the SUT cannot read produces exactly what a
+/// class it read and correctly kept produces — no claims — so without a
+/// separate state the two are the same row, and declaring a narrower language
+/// set becomes a way to raise a green.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grade {
+    /// Analyzed: zero false removals **and** every decoy found.
+    Passed,
+    /// Analyzed: a false removal, a missed decoy, or both.
+    Failed,
+    /// Not analyzed. The SUT declared it cannot read this class's languages
+    /// ([`crate::sut::Sut::reads`]), so the repository was never built and the
+    /// tool was never spawned. **Not a pass**: nothing was attempted, so there
+    /// is nothing to have got right.
+    NotRead,
+}
+
 /// How one SUT did on one mutant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutantReport {
@@ -14,9 +35,11 @@ pub struct MutantReport {
     pub mutant_id: String,
     /// Its ecosystem, carried so a report can be read without the catalogue.
     pub ecosystem: Ecosystem,
-    /// Passed means zero false removals **and** at least the decoys the suite
-    /// requires. Both halves are necessary; see [`crate::sut::RefusingSut`].
-    pub passed: bool,
+    /// Passed, failed, or never attempted. Held as one field rather than as a
+    /// `passed` flag beside a `not_read` flag so that "passed and not read"
+    /// cannot be spelled at all — that combination is the bug this state exists
+    /// to prevent, and a shape that can express it will eventually express it.
+    pub grade: Grade,
     /// Live paths and symbols the SUT claimed were dead. Any entry here is a
     /// hard failure — §10 E2: "any 'dead' verdict is a hard failure."
     pub false_removals: Vec<String>,
@@ -27,7 +50,25 @@ pub struct MutantReport {
     /// Decoy **files** planted by this mutant — the denominator of decoy
     /// recall. Not paths plus symbols: the grading rule in `grade` records why
     /// the unit is the file.
+    ///
+    /// Zero for a [`Grade::NotRead`] class, because the fixture was never
+    /// materialized and therefore never declared any ground truth. A skipped
+    /// class is in neither the numerator nor the denominator of decoy recall:
+    /// scoring a Go tool's silence about a PHP repository's decoys is the same
+    /// category error as scoring its silence about their liveness.
     pub decoys_total: usize,
+}
+
+impl MutantReport {
+    /// Passed means zero false removals **and** at least the decoys the suite
+    /// requires. Both halves are necessary; see [`crate::sut::RefusingSut`].
+    ///
+    /// False for [`Grade::NotRead`] — it was not passed, it was not attempted —
+    /// and derived from [`MutantReport::grade`] rather than stored beside it,
+    /// so the two cannot drift.
+    pub fn passed(&self) -> bool {
+        self.grade == Grade::Passed
+    }
 }
 
 /// How one SUT did on the whole catalogue.
@@ -35,27 +76,103 @@ pub struct MutantReport {
 pub struct SuiteReport {
     /// The SUT that was graded.
     pub sut_name: String,
-    /// One report per mutant, in catalogue order.
+    /// One report per mutant, in catalogue order. Every mutant appears,
+    /// including the skipped ones: a class that vanished from the report could
+    /// not be told apart from one that was never in the catalogue.
     pub reports: Vec<MutantReport>,
-    /// Total false removals across the catalogue.
+    /// Total false removals across the **graded** classes.
     ///
     /// Kept at the top level because it is the release gate: §10 E2 requires
     /// releases be gated on zero failures, and §11 R1 pre-commits that if this
     /// number is not zero, the auto-act tier is **deleted from the design
     /// rather than tuned**. A number that decides that deserves to be
     /// impossible to miss.
+    ///
+    /// Skipped classes cannot change it — by construction, since a class that
+    /// was never analyzed carries no claims. Which is exactly why it must never
+    /// be read on its own: zero here says "nothing was wrong in what was
+    /// measured", and [`SuiteReport::graded_count`] is what says how much that
+    /// was. A gate that consults only this number certifies a SUT that read
+    /// nothing (§6.20).
     pub false_removal_count: usize,
 }
 
-/// Materialize every mutant, run the SUT over each, and grade it.
+impl SuiteReport {
+    /// How many classes were actually analyzed — the denominator of everything
+    /// else in this report.
+    ///
+    /// **A gate must require this to be non-zero.** A run over zero graded
+    /// classes has a false-removal count of zero, and those are the same bytes
+    /// as a clean run. §6.20: no data is not zero findings.
+    pub fn graded_count(&self) -> usize {
+        self.reports.len() - self.not_read_count()
+    }
+
+    /// Graded classes with zero false removals and full decoy recall.
+    pub fn passed_count(&self) -> usize {
+        self.count(Grade::Passed)
+    }
+
+    /// Graded classes that failed on either half.
+    pub fn failed_count(&self) -> usize {
+        self.count(Grade::Failed)
+    }
+
+    /// Classes the SUT declared it cannot read, which were therefore never
+    /// built and never handed over.
+    ///
+    /// Its own column, never folded into passed or failed. §6.20's rule made
+    /// arithmetic: if this were added to the passed count, narrowing an
+    /// adapter's [`crate::sut::Sut::reads`] would raise a green.
+    pub fn not_read_count(&self) -> usize {
+        self.count(Grade::NotRead)
+    }
+
+    /// All four counts are computed from the rows rather than stored beside
+    /// them. A cached total is a second source of truth for the one piece of
+    /// arithmetic this whole build exists to keep honest, and the failure it
+    /// would allow — a `not_read_count` that disagrees with the rows — is
+    /// exactly the "skipped read as passed" bug in a different spelling.
+    fn count(&self, grade: Grade) -> usize {
+        self.reports.iter().filter(|row| row.grade == grade).count()
+    }
+}
+
+/// Materialize every mutant the SUT can read, run the SUT over each, and grade
+/// it.
 ///
-/// Each mutant gets its own throwaway repository; a mutant that fails to
+/// Each graded mutant gets its own throwaway repository; a mutant that fails to
 /// materialize is an error, never a skip, because a silently skipped mutant
 /// turns into a pass the SUT did not earn.
+///
+/// A class the SUT declares it cannot read ([`Sut::reads`]) is the one thing
+/// that *is* skipped, and it is skipped loudly: [`Grade::NotRead`], counted in
+/// [`SuiteReport::not_read_count`] and in no other column. The distinction
+/// between that and a pass is the whole of §6.20 — see [`Grade`].
 pub fn run_suite(sut: &dyn Sut, mutants: &[Box<dyn Mutant>]) -> Result<SuiteReport> {
     let mut reports = Vec::with_capacity(mutants.len());
 
     for mutant in mutants {
+        // Before the temp directory, before materialization, before the tool.
+        // Building a tree the SUT will never be shown is work whose only
+        // product is a directory nobody reads — and it would leave the verdict
+        // one line of code away from being collected anyway.
+        if !reads_mutant(sut, mutant.as_ref()) {
+            reports.push(MutantReport {
+                mutant_id: mutant.id().to_string(),
+                ecosystem: mutant.ecosystem(),
+                grade: Grade::NotRead,
+                // Empty and zero throughout, and these are not "no findings":
+                // they are the absence of a measurement. `Grade::NotRead` is
+                // what carries that, which is why it exists rather than being
+                // inferred from a row that looks clean.
+                false_removals: Vec::new(),
+                decoys_found: 0,
+                decoys_total: 0,
+            });
+            continue;
+        }
+
         // `TempDir` is held for exactly this iteration: §10 E2's methodology
         // depends on each mutant exercising *one* mechanism, and a repository
         // reused across mutants would let one mutant's files satisfy another
@@ -122,6 +239,35 @@ pub fn run_suite(sut: &dyn Sut, mutants: &[Box<dyn Mutant>]) -> Result<SuiteRepo
         reports,
         false_removal_count,
     })
+}
+
+/// Whether `sut` can load `mutant`'s repository at all — the predicate
+/// [`run_suite`] skips on.
+///
+/// A SUT that declares no language set reads everything; otherwise the class is
+/// read when at least one of the languages actually present in its repository
+/// ([`Mutant::languages`]) is one the SUT declared ([`Sut::reads`]).
+///
+/// **Any overlap, not every language.** A polyglot fixture is graded by a tool
+/// that can parse one of its halves, because the tool really did open files and
+/// really did have an opinion; requiring it to read the whole tree would drop
+/// classes it genuinely analyzes, and a dropped class is a false removal that
+/// never gets counted. m02 is the concrete case: knip reads its TypeScript half
+/// and false-removes a dynamically imported transport there (measured
+/// 2026-08-01), which is a finding, not a language mismatch.
+///
+/// Public because a caller that wants to say *how many* classes this run will
+/// skip — the CLI's refusal message does — must ask the same question the same
+/// way. A second copy of this predicate could report a different number from
+/// the one the runner acted on.
+pub fn reads_mutant(sut: &dyn Sut, mutant: &dyn Mutant) -> bool {
+    match sut.reads() {
+        None => true,
+        Some(declared) => mutant
+            .languages()
+            .iter()
+            .any(|language| declared.contains(language)),
+    }
 }
 
 /// Grade one SUT verdict against one mutant's ground truth.
@@ -231,7 +377,11 @@ fn grade(
         // Both halves are required. Zero false removals alone is the score of a
         // tool that refuses to answer, which is safe and worthless; full decoy
         // recall alone is the score of a tool that deletes the repository.
-        passed: false_removals.is_empty() && decoys_found == decoy_paths.len(),
+        grade: if false_removals.is_empty() && decoys_found == decoy_paths.len() {
+            Grade::Passed
+        } else {
+            Grade::Failed
+        },
         false_removals: false_removals.into_iter().collect(),
         decoys_found,
         decoys_total: decoy_paths.len(),

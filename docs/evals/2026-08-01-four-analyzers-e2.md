@@ -3,13 +3,27 @@
 **Date:** 2026-08-01 · **Tools:** vulture 2.16, knip 6.31.0, `x/tools` deadcode v0.48.0, cargo-shear 1.13.3
 
 **Result: 10 false removals across the four tools. Five of the nineteen classes are
-false-removed by every tool that can read them. One tool — cargo-shear — has a clean sheet,
-and the reason it is clean is that it cannot make the claim that would be wrong.**
+false-removed by every tool that can read them, and a sixth — m13 — is read by none of them,
+so this round measures 18 of the 19 classes the catalogue defines. One tool, cargo-shear,
+clears the gate at 0 false removals with 9/9 decoy recall; it earns that inside its scope,
+and its scope excludes every claim that would have been wrong.**
 
 This supersedes [`2026-08-01-vulture-e2-baseline.md`](2026-08-01-vulture-e2-baseline.md),
-which measured one Python tool against a catalogue that is 7/19 not-Python. Read this one.
-The vulture numbers here differ from that document in one respect — decoy recall is 11/31
-rather than 0/31 — because the decoys now carry symbols; nothing about vulture changed.
+which measured one Python tool against the whole 19-class catalogue, because the runner of the
+day handed every class to every analyzer. Under the current runner vulture is handed the 10
+classes it can read. Read this one.
+That file is kept only as the record of the first run against a shipped analyzer; every
+number in it was produced by an earlier runner and none of them reproduce today.
+
+Vulture itself did not change between the two runs — two things around it did. The decoys
+now carry symbols, so vulture, a symbol-level tool, gets credit for finding them. And the
+runner now skips classes outside a SUT's declared ecosystems instead of grading them, which
+moves the denominator: vulture is graded on 10 of the 19 classes here, and its decoy recall
+is **11 of 16** counted over those 10. The older document's 0 of 31 was counted over all
+nineteen classes, including the nine vulture never opens, so the two ratios are not
+comparable in either direction and neither is evidence about the other. The number that *is*
+comparable, because it is counted the same way in both runs, is the false-removal count: 6,
+on m01, m10, m11 and m16, unchanged.
 
 ---
 
@@ -43,13 +57,17 @@ experiment.
 
 ---
 
-## 2. Verbatim headlines from `judged mutants`, and why three of them are refusals
+## 2. Verbatim headlines from `judged mutants`
+
+All four tools run through the shipped CLI and all four produce a graded result. Each block
+below is the tail of `judged mutants --sut <tool>`, verbatim, with the nineteen per-class
+lines above it elided. Exit codes were read from `$?` on a run with no pipe in it.
 
 ```
 $ judged mutants --sut vulture
-19 classes: 3 passed, 16 failed
-not measured: 8 of 19 classes are outside this SUT's languages — it opened no file in them, so neither its passes nor its failures there are results
-decoy recall: 11 of 31 genuinely-dead files found
+19 classes: 10 graded — 3 passed, 7 failed; 9 not read
+not measured: 9 of 19 classes are outside this SUT's languages — they were never built and never handed to it, so they are in neither column above and in neither half of the decoy line below
+decoy recall: 11 of 16 genuinely-dead files found
 false removals: 6 — GATE FAILED (§11 R1: if this is not zero, the auto-act tier is deleted from the design rather than tuned)
 classes with false removals: m01, m10, m11, m16
 ```
@@ -57,35 +75,60 @@ classes with false removals: m01, m10, m11, m16
 Exit code **1**.
 
 ```
-$ judged mutants --sut deadcode
-REFUSED — the E2 suite did not complete (exit 2)
-  … `sh` exited with status 1 … Last stderr line: deadcode: packages contain errors
-
-$ judged mutants --sut shear
-REFUSED — the E2 suite did not complete (exit 2)
-  … `cargo-shear` exited with status 2 … Last stderr line: error: could not find `Cargo.toml` in `…`
-
 $ judged mutants --sut knip
-REFUSED — the E2 suite did not complete (exit 2)
-  … `npx` exited with status 2 … Last stderr line: ERROR: Unable to find package.json
+19 classes: 3 graded — 0 passed, 3 failed; 16 not read
+not measured: 16 of 19 classes are outside this SUT's languages — they were never built and never handed to it, so they are in neither column above and in neither half of the decoy line below
+decoy recall: 4 of 6 genuinely-dead files found
+false removals: 2 — GATE FAILED (§11 R1: if this is not zero, the auto-act tier is deleted from the design rather than tuned)
+classes with false removals: m02, m14
 ```
 
-Exit code **2** for all three.
+Exit code **1**.
 
-**This is the shipped CLI's honest answer, and it is a real limitation of the harness, not a
-broken install.** `run_suite` runs the whole catalogue as one unit and treats any class the
-analyzer refuses as a failure of the run. Vulture finds no Python and exits 0, so its run
-completes and the unreadable classes are marked *not measured*. knip, cargo-shear and
-deadcode instead exit non-zero on a repository in the wrong language, and those exit codes
-are deliberately not declared healthy because each is shared with a genuine analysis failure
-whose output is equally empty. So **`judged mutants` can currently produce a graded result
-only for an analyzer that exits 0 on foreign repositories — one of the four.**
+```
+$ judged mutants --sut deadcode
+19 classes: 1 graded — 0 passed, 1 failed; 18 not read
+not measured: 18 of 19 classes are outside this SUT's languages — they were never built and never handed to it, so they are in neither column above and in neither half of the decoy line below
+decoy recall: 2 of 2 genuinely-dead files found
+false removals: 2 — GATE FAILED (§11 R1: if this is not zero, the auto-act tier is deleted from the design rather than tuned)
+classes with false removals: m12
+```
 
-The per-class numbers in §4 were therefore obtained by driving `judged_mutants::run_suite`
-one class at a time, from a throwaway driver outside the repository, using the same
-`CommandSut`, the same argv, the same declared success exit codes and the same adapters the
-CLI uses. Cross-checked: driving vulture that way reproduces the CLI's report exactly —
-3 passed, 16 failed, 11/31 decoys, 6 false removals on m01/m10/m11/m16.
+Exit code **1**.
+
+```
+$ judged mutants --sut shear
+19 classes: 6 graded — 6 passed, 0 failed; 13 not read
+not measured: 13 of 19 classes are outside this SUT's languages — they were never built and never handed to it, so they are in neither column above and in neither half of the decoy line below
+decoy recall: 9 of 9 genuinely-dead files found
+false removals: 0 — GATE PASSED (§10 E2 gates releases on this number, and on nothing else)
+```
+
+Exit code **0** — the first third-party analyzer to clear the gate. §5 and §7 are where that
+gets read carefully; it is a narrower result than the exit code makes it look.
+
+### What "not read" means, and why it is a third state
+
+A SUT declares the ecosystems it reads. `run_suite` never builds a fixture outside them, so
+those classes are neither passed nor failed but **not read**, counted on their own line.
+A not-read class contributes to neither half of the decoy ratio and can never be scored as a
+pass, which is the property that matters: a tool cannot improve its score by being unable to
+open a file.
+
+This is why the denominators here are smaller than in any earlier write-up. Vulture's decoy
+recall is **11 of 16**, where earlier versions of this document reported 11 of 31. The
+numerator did not move; the 15 decoys that left the denominator are the ones planted in the
+nine classes vulture is never handed. A drop in that ratio's denominator is not a change in
+what any tool found, and neither ratio is evidence about the other.
+
+Before this, `run_suite` handed every class to the analyzer, and a language-specific tool
+exits non-zero on a repository in the wrong language — an exit code it shares with a genuine
+analysis failure, which is exactly why it could not simply be declared healthy. `--sut knip`,
+`--sut deadcode` and `--sut shear` therefore exited 2 and graded nothing, and their per-class
+numbers had to be obtained from a scratch driver calling `run_suite` one class at a time
+outside the repository. That is history, recorded here because an earlier version of this
+document reported it as the current state. Every number in this document now comes from the
+CLI.
 
 ---
 
@@ -93,7 +136,9 @@ CLI uses. Cross-checked: driving vulture that way reproduces the CLI's report ex
 
 Before this round, deadcode returned `deadcode: no packages` on **m12, the only Go class**,
 and `deadcode: packages contain errors` on the other eighteen. Both are exit 1 with empty
-stdout.
+stdout. (The other eighteen are no longer handed to it at all — they are outside its declared
+ecosystem and are now *not read*. The defect below concerned m12, and would have survived the
+skip feature untouched.)
 
 The cause was in Judged, not in deadcode. `tempfile::TempDir::new()` names its directory
 with the default prefix `.tmp`, so every fixture repository was handed to every analyzer as
@@ -122,44 +167,57 @@ Go-specific hazard.
 
 ## 4. Per class, per analyzer
 
-`FR n` = n false removals, a hard failure. `clean` = read it, claimed nothing live dead.
-`—` = the run did not complete on this class (the tool refused the repository). Vulture never
-refuses, so its unreadable classes are marked `not read` on the strength of its declared
-ecosystems rather than its exit code. `d` = decoys found / decoys planted.
+`FR n` = n false removals, a hard failure. `clean` = read it, claimed nothing live dead, but
+missed at least one decoy. `pass` = clean *and* full decoy recall. `—` = **not read**: the
+class is outside the tool's declared ecosystems, so its fixture was never built and never
+handed to the tool. `d` = decoys found / decoys planted, counted only where the tool read.
 
 | # | Eco | Mechanism | vulture | knip | deadcode | cargo-shear |
 | --- | --- | --- | --- | --- | --- | --- |
 | m01 | python | dotted class path only in a YAML app list | **FR 1** `DunningConfig` d2/2 | — | — | — |
 | m02 | polyglot | module name computed at runtime, `importlib`/`require` | clean d1/2 | **FR 1** `src/transports/websocketTransport.ts` d1/2 | — | — |
 | m03 | python | plugin found by directory scan | **pass** d1/1 | — | — | — |
-| m04 | rust | subcommand reachable only when a human types it | not read d0/1 | — | — | **pass** d1/1 |
+| m04 | rust | subcommand reachable only when a human types it | — | — | — | **pass** d1/1 |
 | m05 | python | recovery handler on the failure path | **pass** d2/2 | — | — | — |
-| m06 | rust | lock helper used only under contention | not read d0/2 | — | — | **pass** d2/2 |
-| m07 | rust | guard clause inert until input is hostile | not read d0/2 | — | — | **pass** d2/2 |
+| m06 | rust | lock helper used only under contention | — | — | — | **pass** d2/2 |
+| m07 | rust | guard clause inert until input is hostile | — | — | — | **pass** d2/2 |
 | m08 | polyglot | script invoked only from CI / Dockerfile / k8s | clean d0/2 | — | — | — |
-| m09 | rust | API exercised only by a README example CI runs | not read d0/2 | — | — | **pass** d2/2 |
+| m09 | rust | API exercised only by a README example CI runs | — | — | — | **pass** d2/2 |
 | m10 | polyglot | framework convention: AppConfig, `__mocks__` | **FR 1** `ReportingConfig` d1/2 | clean d1/2 | — | — |
 | m11 | python | model field enumerated reflectively | **FR 3** `legal_hold_until`, `retention_days`, `tenant_slug` d1/1 | — | — | — |
-| m12 | go | symbol bound through `//go:linkname` | not read d0/2 | — | **FR 2** `TelemetryFlush`, `drain` d2/2 | — |
-| m13 | polyglot | file rescued by an explicit `!` negation | clean d0/2 | — | — | — |
-| m14 | typescript | committed build output consumed by a CDN path | not read d0/2 | **FR 1** `dist/widget.7f3a91c.js` d2/2 | — | — |
+| m12 | go | symbol bound through `//go:linkname` | — | — | **FR 2** `TelemetryFlush`, `drain` d2/2 | — |
+| m13 | polyglot | file rescued by an explicit `!` negation | — | — | — | — |
+| m14 | typescript | committed build output consumed by a CDN path | — | **FR 1** `dist/widget.7f3a91c.js` d2/2 | — | — |
 | m15 | python | worker named only in a queued job payload | **pass** d1/1 | — | — | — |
 | m16 | python | type named only in a pickled blob | **FR 1** `RateSnapshot` d1/1 | — | — | — |
-| m17 | rust | `inventory::submit!`, empty call graph | not read d0/1 | — | — | **pass** d1/1 |
+| m17 | rust | `inventory::submit!`, empty call graph | — | — | — | **pass** d1/1 |
 | m18 | polyglot | entry point only in a platform manifest | clean d1/2 | — | — | — |
-| m19 | rust | `#[no_mangle]` export consumed outside the repo | not read d0/1 | — | — | **pass** d1/1 |
+| m19 | rust | `#[no_mangle]` export consumed outside the repo | — | — | — | **pass** d1/1 |
+
+**m13 is the one row with no entry in any column.** No analyzer here reads it. §5 and §7
+return to that.
 
 | | vulture | knip | deadcode | cargo-shear |
 | --- | --- | --- | --- | --- |
-| classes the run completed on | 19 (11 in its languages) | 3 | 1 | 6 |
+| classes graded | 10 | 3 | 1 | 6 |
+| classes not read | 9 | 16 | 18 | 13 |
 | **false removals** | **6** | **2** | **2** | **0** |
 | classes with a false removal | m01, m10, m11, m16 | m02, m14 | m12 | none |
-| decoy recall over completed classes | 11/31 | 4/6 | 2/2 | 9/9 |
+| decoy recall over graded classes | 11/16 | 4/6 | 2/2 | 9/9 |
 | passed | 3 | 0 | 0 | 6 |
+| exit code | 1 | 1 | 1 | **0** |
+
+Both tables are read from `judged mutants --sut <tool> --json`, which reports the grade, the
+per-class decoy pair and the false-removal list for every class.
 
 ### The evidence behind the three non-Python rows
 
-**deadcode on m12** — `deadcode -json` output, verbatim, reduced to names:
+The blocks below are each tool's own output, captured from the tool rather than from Judged.
+What the CLI independently confirms is the graded outcome — which live artifacts were claimed
+dead, and how many decoys were found — and it agrees with every one of them.
+
+**deadcode on m12** — the `deadcode -json` findings, rendered by hand for legibility (this
+block is a summary, not verbatim stdout):
 
 ```
 PKG example.com/m12/telemetry/cmd/libtelemetry
@@ -208,8 +266,7 @@ is a fact about its capability envelope, not about the mechanisms.**
 
 ### Is there a class no tool survives?
 
-Yes — **five**, taking "survives" as *some tool completed on it and claimed nothing live
-dead*:
+Yes — **five**, taking "survives" as *some tool graded it and claimed nothing live dead*:
 
 **m01** (YAML string reference), **m11** (reflective model field), **m12** (`//go:linkname`),
 **m14** (committed build output), **m16** (pickled blob).
@@ -219,20 +276,32 @@ Nothing here is redundancy: with four tools spanning four ecosystems, most class
 exactly one possible reader, so "no tool survives" and "the only reader failed" are the same
 sentence for m01, m11, m12, m14 and m16.
 
-A stricter reading tightens this. Two further classes have a tool that stayed clean but
-found **zero** of the planted decoys there — vulture on **m08** and **m13**, both 0/2. A
-tool that found nothing dead in a repository that contains two genuinely-dead files has not
-demonstrated it read anything, and its silence is not evidence (that is the first clause of
-vulture's own capability envelope). Counting those as unsurvived too gives **seven of
-nineteen**: m01, m08, m11, m12, m13, m14, m16.
+And **m13 is not survived either, for a different and worse reason: no tool reads it.** It is
+the only one of the nineteen with an empty row. Its live artifact is PHP — rescued from a
+broad ignore rule by an explicit `!` negation, beside a `composer.json` and a checked-in
+media file — and none of the four adapters covers PHP. m13 is not a class the analyzers
+failed; it is a class they were never asked about.
+
+A stricter reading tightens this further. One class has a tool that stayed clean but found
+**zero** of the decoys planted there: vulture on **m08**, 0/2. A tool that found nothing dead
+in a repository containing two genuinely-dead files has not demonstrated it read anything,
+and its silence is not evidence (that is the first clause of vulture's own capability
+envelope). Counting m08 alongside m13 gives **seven of nineteen** classes with no result that
+means anything: m01, m08, m11, m12, m13, m14, m16.
 
 ### Is there a tool with zero false removals across the classes it can read?
 
-**Yes: cargo-shear. 0 false removals across 6 Rust classes, with 9/9 decoy recall** — so it
-is not the refusing-SUT degenerate case; it demonstrably found every genuinely-dead file
-planted in front of it.
+**Yes: cargo-shear. 0 false removals across the 6 Rust classes it grades, with 9/9 decoy
+recall, and `judged mutants --sut shear` exits 0 — GATE PASSED.** It is the first
+third-party analyzer to clear the gate, and the 9/9 is what makes that worth something: it is
+not the refusing-SUT degenerate case, because it demonstrably found every genuinely-dead file
+planted in front of it. Within its scope that is competence, and it should be credited as
+competence.
 
-That is the strongest single result in this round and it should be read narrowly. cargo-shear
+It should also not be read as "cargo-shear is the safest of the four". The gate is a
+per-tool result over whatever that tool read, and cargo-shear read 6 of 19 classes. It is not
+being compared with vulture over the same 19 classes; there is no class that both of them
+grade. Read narrowly, then. cargo-shear
 answers two questions — is a declared dependency unused, and is a file unreachable by `mod`
 declaration — and neither question can produce the claim that fails m04, m06, m07, m09, m17
 or m19. It is not that it evaluated the guard clause, the contention path, the README
@@ -249,14 +318,15 @@ removals, the auto-act tier is deleted from the design rather than tuned.**
 
 What the evidence supports:
 
-- No single tool here clears the catalogue. The union of all four completes on all 19
-  classes (vulture 11 + knip's m14 + deadcode's m12 + shear's 6), and that union carries
-  **10 false removals across 7 distinct classes** (m01, m02, m10, m11, m12, m14, m16).
-  Combining signals by union of claims cannot
+- No single tool here clears the catalogue. The union of all four grades **18 of the 19
+  classes** (vulture 10 + knip's m14 + deadcode's m12 + shear's 6; m13 is read by none of
+  them), and that union carries **10 false removals across 7 distinct classes** (m01, m02,
+  m10, m11, m12, m14, m16). Combining signals by union of claims cannot
   reduce a false removal — every claim any member makes is a claim the union makes — so
-  **no subset of these four clears all 19 at zero false removals.** The only zero-false-removal
-  subset is `{cargo-shear}`, which reads 6 of 19 and leaves m01, m11, m12, m14 and m16 with
-  no reader at all.
+  **no subset of these four clears even the 18 it can reach at zero false removals.** The only
+  zero-false-removal subset is `{cargo-shear}`, which reads 6 of 19 — leaving all thirteen
+  classes it does not read, among them every class another tool false-removed (m01, m02, m10,
+  m11, m12, m14, m16), with no reader at all. Whatever the union does, m13 stays unmeasured.
 - The one tool with a clean sheet is clean because of what it structurally cannot say. That
   is evidence *against* the hypothesis that precision comes free from picking a better
   analyzer, and it is the second time this catalogue has produced that shape: the same
@@ -275,6 +345,9 @@ What the evidence does **not** support:
 - Nothing here measures whether a *combination* would clear the catalogue, because no
   combination was run. The union argument above is arithmetic on claims already collected,
   not an experiment.
+- **The catalogue was not fully measured.** m13 has no reader, so R1's condition is being
+  evaluated against 18 of the 19 classes it is defined over. That cuts against a clean
+  verdict in either direction.
 
 The honest summary: **this round supplies no counterexample to R1's deletion condition and
 several results consistent with it, on the strongest evidence the project has so far. It is
@@ -301,6 +374,13 @@ code as it stood, deadcode could not read m12 at all.
 **2 — SPLIT.** *Configuration-sensitive:* confirmed sharply. The same repository, same tool,
 same version, four configurations:
 
+*Provenance:* this sweep was run by hand against a scratch copy of the m14 fixture, varying
+`knip.json` between runs. Only the first row is re-derivable from a shipped command
+(`judged mutants --sut knip`, which uses knip's defaults and false-removes
+`dist/widget.7f3a91c.js` on m14); the other four rows are recorded as observed and cannot
+be reproduced from this repository as it stands. Treat them as supporting detail, not as a
+measurement anyone can check.
+
 | Config | files claimed unused |
 | --- | --- |
 | default (no `knip.json`) | `dist/widget.0c9e142.js`, **`dist/widget.7f3a91c.js`**, `src/unusedFeatureFlags.ts` |
@@ -309,11 +389,14 @@ same version, four configurations:
 | `entry: [src/main.ts, dist/*.js]` | `src/unusedFeatureFlags.ts` |
 | `entry: [src/main.ts]`, `project: [src/**/*.ts]` | `src/unusedFeatureFlags.ts` |
 
-*Degrades rather than being wrong:* refuted where it matters. knip degrades loudly only when
-it cannot start at all — 16 of 19 classes have no `package.json` and it exits 2 with
-`ERROR: Unable to find package.json`, which is unambiguous and correct behaviour. But on all
-three classes it **could** read it produced a confident SARIF log, and on two of them that
-log named a live file dead, at exit 1, with nothing marking the answer as degraded.
+*Degrades rather than being wrong:* refuted where it matters. knip does degrade loudly when
+it cannot start at all: handed one of the 16 classes with no `package.json` it exits 2 with
+`ERROR: Unable to find package.json`, unambiguous and correct — that is what the suite saw
+before it stopped handing knip those classes, and it is why knip's refusal could not be
+waved through as a clean run. But on all three classes it **can** read it produced a
+confident SARIF log, and on two of them that log named a live file dead, at exit 1, with
+nothing marking the answer as degraded. Loud refusal outside its ecosystem buys nothing
+inside it.
 
 The configuration sweep adds a finding the prediction does not anticipate and which is worse
 than either half of it: **no configuration tested both keeps the live file and finds the dead
@@ -331,9 +414,15 @@ emits a `shear/unlinked_files` finding on each, correctly naming the decoy, with
 `help: delete this file`. The distinction matters because "silent" and "correct about
 something else" grade identically here and are different tools to trust.
 
-**4 — CONFIRMED.** 11 of 31, against 0 of 31 in the superseded baseline. Vulture is
-unchanged; the decoys now carry symbols and vulture is a symbol-level tool. All 11 come from
-classes with Python decoys.
+**4 — CONFIRMED.** Vulture now finds 11 decoys where it previously found none: **11 of 16**,
+counted over the 10 classes it grades. Vulture is unchanged; the decoys carry symbols now and
+vulture is a symbol-level tool. All 11 are in classes with Python decoys.
+
+Note what is *not* being compared. The superseded baseline's 0 of 31 counted every decoy in
+the catalogue, including the 15 planted in the nine classes vulture is never handed; the 16
+here counts only the decoys it was actually shown. The two ratios have different denominators
+and putting them side by side would overstate the change. What settles the prediction is the
+numerator, which is counted identically in both: 0 became 11.
 
 ---
 
@@ -341,24 +430,27 @@ classes with Python decoys.
 
 Read this section before quoting any number above.
 
-1. **Three of the four tools cannot be run by the shipped CLI against this catalogue.**
-   `judged mutants --sut knip|deadcode|shear` exits 2 and grades nothing. The per-class
-   numbers come from a scratch driver calling `run_suite` one class at a time with the same
-   SUT construction. It is verified to reproduce the CLI exactly for vulture, which is the
-   only tool where both paths produce a result — so the cross-check covers the driver's
-   fidelity but not, independently, the three tools it was written for.
+1. **One of the nineteen classes has no analyzer coverage at all.** m13 — a PHP file rescued
+   from a broad ignore rule by an explicit `!` negation, beside a `composer.json` and a
+   checked-in media asset — is read by none of the four tools, because no adapter here covers
+   PHP. Every other class is graded by at least one of them. **This round therefore measures
+   18 of the 19 mechanisms the catalogue defines**, and nothing above — which classes survive,
+   what a union of the four would do, what any of it bears on R1 — extends to m13. That is a
+   gap in the evaluation rather than a footnote to it, and closing it needs a PHP adapter, not
+   a rerun of these four.
 
-2. **"Not read" is most of this table.** Of 76 tool×class cells, 47 are runs that did not
-   complete at all (knip 16, deadcode 18, cargo-shear 13), and a further 8 are vulture runs
-   that completed without opening a file in the class. **55 of 76 cells are not results.**
-   Every per-tool false-removal count is a count over a small, language-determined subset:
-   deadcode's entire result is one class.
+2. **"Not read" is most of this table.** Of the 76 tool×class cells, only **20 are graded
+   results**; the other **56 were never read** (vulture 9, knip 16, deadcode 18,
+   cargo-shear 13), because the class falls outside that tool's declared ecosystems and its
+   fixture was never built. Every per-tool false-removal count is a count over a small,
+   language-determined subset: deadcode's entire result is one class.
 
-3. **A zero is not a pass.** cargo-shear's 0/6 and vulture's clean cells on m08 and m13 are
-   produced by tools that could not make the failing claim. E2 grades what a tool claims;
-   it does not grade what a tool declined to think about. The capability envelopes exist
-   precisely to stop a zero being read as competence, and they should be read alongside
-   every row here.
+3. **A zero is not a pass, and an exit 0 is not a clean bill of health.** cargo-shear's 0
+   false removals over 6 classes, and vulture's clean cell on m08, are produced by tools that
+   could not make the failing claim. E2 grades what a tool claims; it does not grade what a
+   tool declined to think about. The capability envelopes exist precisely to stop a zero being
+   read as competence, and they should be read alongside every row here — most of all the row
+   that passed the gate.
 
 4. **Single configuration, single platform, single point in time.** darwin/arm64, one
    GOOS/GOARCH — deadcode's own help text notes its analysis is valid for one build
@@ -381,3 +473,12 @@ Read this section before quoting any number above.
 8. **The knip configuration sweep is not part of the graded run.** It was done on a scratch
    copy to test prediction 2. No fixture in the repository was modified, and the graded knip
    numbers are all at default configuration.
+
+9. **Vulture's 6 is a lower bound, not a total.** The adapter maps vulture's findings to
+   symbol claims and never to file claims, because vulture reports names and never names a
+   file — its `MAPPING_DECISION`, printed above every run, states this and calls the resulting
+   count a lower bound. A finding that lands inside a file the ground truth declares LIVE goes
+   ungraded whenever the class's live artifact is a file rather than a symbol, and
+   `unreachable code after 'return'` produces no claim at all because it names a keyword. The
+   superseded baseline works through where that happens, class by class. No equivalent
+   analysis exists for the other three tools.

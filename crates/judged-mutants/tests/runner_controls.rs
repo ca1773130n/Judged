@@ -102,7 +102,7 @@ fn refusing_sut_still_fails_the_suite_because_it_finds_no_decoys() {
          scores a perfect suite. Fixtures must plant decoys."
     );
     assert!(
-        report.reports.iter().any(|r| !r.passed),
+        report.reports.iter().any(|r| !r.passed()),
         "the do-nothing control passed the whole catalogue; decoy recall is not \
          being required"
     );

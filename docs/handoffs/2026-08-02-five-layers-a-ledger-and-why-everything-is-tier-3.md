@@ -128,6 +128,15 @@ warned that a bigger, less accurate root set is not an improvement.
   close, preserving the reason it is explicit — a discarded error is a leaked tree per mutant,
   nineteen per run.
 
+  **It does not only surface there, and the second face is unrecognisable as the first.** When it
+  fires under the CLI it makes `run_suite` return `Err`, the command renders a *refusal*, a refusal
+  renders as JSON too, and a refusal document's `sut` is the bare choice. So
+  `cli::roots_rescue_independently_of_the_veto_and_each_layer_is_named` fails with
+  `left: "naive"`, `right: "naive+roots"` — which reads exactly like a layer-naming bug and has
+  nothing to do with naming. That assertion now prints the whole document it got, and the first
+  line of it is the refusal headline. **Read that before touching any layer code.** Diagnosing it
+  as a real defect cost several turns.
+
 Both pass on re-run. Neither is caused by any change here.
 
 **A gate that does not fire on the class it was built for is invisible.** Gate 3f's queue condition

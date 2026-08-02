@@ -48,6 +48,18 @@
 //! a gate that refuses everything measures exactly as much as one that refuses
 //! nothing (§3.7 makes the same point about a positive control that always
 //! passes).
+//!
+//! **The serializable condition has the same gap, and it is the same sentence
+//! that opens it.** §6.24's counter-signal reads *"Detect a job framework … **or
+//! a serializer** (`pickle`, `Marshal`, `BinaryFormatter`, `Serializable`,
+//! `serialize()`) anywhere in the repo → every class reachable from a job /
+//! serializable base type is ineligible"*. So a repository that pickles anything
+//! anywhere should refuse every class reachable from a serializable base, and
+//! what is implemented instead is the marker appearing in the candidate's own
+//! declaring file. A type that inherits a `Serializable` base three files away
+//! is missed, exactly as a job class three files away is. Recorded here rather
+//! than only for the queue condition, because a gap documented in one place and
+//! silent in the other reads as a decision about the second.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -365,7 +377,7 @@ impl Gate3f {
             let number = index + 1;
 
             for marker in SERIALIZATION_MARKERS {
-                if line.contains(marker) {
+                if marker_matches(line, marker) {
                     findings.push(self.finding(Condition::Serializable, marker, relative, number));
                 }
             }
@@ -379,7 +391,7 @@ impl Gate3f {
             }
 
             for marker in ABI_MARKERS {
-                if !line.contains(marker) {
+                if !marker_matches(line, marker) {
                     continue;
                 }
                 // For a symbol claim the marker only counts if it is plausibly
@@ -479,7 +491,7 @@ impl Gate3f {
                     continue;
                 }
                 for name in JOB_FRAMEWORKS {
-                    if seen.contains(name) || !contains_word(&lowered, name) {
+                    if seen.contains(name) || !contains_component(&lowered, name) {
                         continue;
                     }
                     seen.insert(name);
@@ -492,6 +504,26 @@ impl Gate3f {
             }
         }
         Ok(found)
+    }
+}
+
+/// Whether `marker` occurs in `line`, using the matcher the marker's own shape
+/// calls for.
+///
+/// A marker made only of identifier characters — `readObject`, `soname`,
+/// `serialVersionUID` — is matched at word boundaries, so it cannot fire inside
+/// a longer name. A marker carrying punctuation is self-delimiting already:
+/// `#[no_mangle]`, `extern "C"` and `pickle.load` cannot occur inside an
+/// identifier, and requiring boundaries around them would only fail on the
+/// bracket.
+///
+/// Decided from the marker rather than declared per entry, so a marker added to
+/// either list later cannot be given the wrong matcher by omission.
+fn marker_matches(line: &str, marker: &str) -> bool {
+    if marker.bytes().all(is_identifier_byte) {
+        contains_word(line, marker)
+    } else {
+        line.contains(marker)
     }
 }
 
@@ -538,7 +570,7 @@ fn names_symbol_nearby(lines: &[&str], marker_index: usize, name: &str) -> bool 
 /// it: an import, a decorator, or a base class.
 fn references_framework(lowered_text: &str, framework: &str) -> bool {
     lowered_text.lines().any(|line| {
-        (is_import_line(line) || is_binding_line(line)) && contains_word(line, framework)
+        (is_import_line(line) || is_binding_line(line)) && contains_component(line, framework)
     })
 }
 
@@ -563,10 +595,36 @@ fn is_binding_line(lowered: &str) -> bool {
         || lowered.contains("include ")
 }
 
+/// Whether `needle` is one of `haystack`'s identifier **components**, splitting
+/// on every non-alphanumeric character.
+///
+/// This is the rule for framework names, and the distinction from
+/// [`contains_word`] is not academic. `from .celery_app import app` is how the
+/// canonical §6.24 queue-payload shape actually spells its dependency — m15's
+/// own fixture — and a word-boundary test rejects it, because `_` is an
+/// identifier character so `celery` inside `celery_app` is not a whole word.
+/// The gate that exists for that class missed that class.
+///
+/// Splitting on non-alphanumerics instead keeps the property the boundary rule
+/// was added for: `torque` is one component and does not contain `rq`,
+/// `bulletin` is one component and does not contain `bull`. §6.24 lists both of
+/// those two-and-four-character names, and a plain substring test for them
+/// matches most of an English dictionary.
+fn contains_component(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    haystack
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token.eq_ignore_ascii_case(needle))
+}
+
 /// Whether `needle` occurs in `haystack` bounded by non-identifier characters.
 ///
-/// The whole reason `rq` and `bull` are usable at all: a substring test would
-/// match them inside ordinary words, and §6.24 lists both.
+/// The rule for identifier-shaped **markers**, where a component split would be
+/// wrong: `__reduce__` is mostly separators, and splitting it would compare the
+/// empty string. Word boundaries are what stop `readObject` matching
+/// `readObjectFromCache` and `soname` matching `sonames`.
 fn contains_word(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;

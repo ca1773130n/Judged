@@ -455,7 +455,8 @@ USAGE:
                                      [--expected-targets <n>]
     judged mutants [--sut <sut>] [--gate1] [--gate3f] [--veto [--needles <strategy>]]
                    [--roots] [--coverage [--coverage-artifact <path>]] [--json]
-    judged mutants --sut command [--gate1] [--veto] [--roots] [--coverage] [--json]
+    judged mutants --sut command [--gate1] [--gate3f] [--veto] [--roots] [--coverage]
+                   [--json]
                    -- <analyzer> [args...]
     judged show-roots [--json] [<path>]
     judged explain [--json] <path>

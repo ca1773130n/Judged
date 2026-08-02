@@ -1,6 +1,6 @@
 # The ban ledger and the tier model — building the thing that authorizes deletion
 
-**Date:** 2026-08-02 · **Status:** decided, implemented in the same change · **Supersedes:** nothing
+**Date:** 2026-08-02 · **Status:** decided and implemented; see §5.1 for two defects review found and §5.2 for what it discovered · **Supersedes:** nothing
 
 Everything shipped so far only ever *removes* claims. Gate 1 refuses, Gate 2 vetoes, the root set
 rescues, coverage rescues, Gate 3f refuses. Nothing in the codebase computes a ban, and nothing
@@ -117,6 +117,33 @@ false statements. The command's own closing section says those gates were not ru
 inversion committed inside the module written to prevent it. `GateState` is tri-state now, its
 `Default` is "nothing evaluated", and `explain` assigns no tier at all: it prints what §9.6 *would*
 require and how much of it this build can evaluate.
+
+---
+
+## 5.2 What the tier model found that nobody had listed: Gate 0a–0f does not exist
+
+Wiring §9.5's R evidence surfaced this, and it is the most useful thing the ledger has produced.
+
+§9.3's Gate 0 has seven conjuncts. **Only 0g is implemented.** 0a (never traverse a symlink), 0b
+(refuse to descend into a nested repository), 0c (reject a candidate whose realpath escapes the
+repo), 0d (refuse to auto-act during a rebase, with a dirty tree, with no remote, in a shallow
+clone), 0e (never touch `.git/`), 0f (acquire an advisory lock, refuse while a build runs) — none of
+them is anywhere in `crates/`. `judged explain` lists them under `gates_not_run` and that listing is
+the whole of their presence.
+
+The consequence is arithmetic. §9.6 makes Tier 2 conditional on *"Gates 0–2 pass"*, so with 0a–0f
+unimplemented **no candidate can reach Tier 2 either — every candidate is Tier 3.** The cap is one
+tier lower than §5's pre-commitment assumed, and for a reason that pre-commitment did not know
+about.
+
+This is not on the R1 determination's §7 list. That list has eight items and none of them is "Gate
+0 barely exists", because until something tried to *assign a tier* nothing had to ask whether its
+preconditions were computable. A gap in the gap-list is exactly what a scoreboard that refuses to
+credit unevaluated criteria is for.
+
+Two of those conjuncts also read as the cheapest safety work outstanding anywhere in the project:
+0e (never touch `.git/`) and 0a (never traverse a symlink) are refusals with no measurement behind
+them, and their absence is the difference between a bug and an unrecoverable one.
 
 ---
 

@@ -25,6 +25,7 @@ pub mod fingerprint;
 pub mod gate1;
 pub mod gate3f;
 pub mod git;
+pub mod ledger;
 pub mod roots;
 pub mod sarif;
 pub mod veto;

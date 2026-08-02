@@ -33,6 +33,7 @@
 use std::path::{Path, PathBuf};
 
 use judged_core::git::RecoverabilityClass;
+use judged_core::ledger::{assign, GateState, Ledger, Outcome};
 use judged_mutants::gate1::{Gate1, Gate1Trace, IgnoreRule};
 use serde_json::{json, Value};
 
@@ -256,6 +257,8 @@ fn render_text(trace: &Gate1Trace, root: &Path) -> String {
          A gate this command did not run is not a gate that abstained. Nothing above is\n  \
          evidence that this path is unused (§6.20).\n",
     );
+    out.push('\n');
+    out.push_str(&tier_section(trace));
     out
 }
 
@@ -323,8 +326,113 @@ fn wrap(text: &str, indent: usize) -> String {
 // JSON
 // ---------------------------------------------------------------------------
 
+/// What §9.6 would assign this path today, and everything stopping it going
+/// higher.
+///
+/// `explain` runs Gate 0g and Gate 1 and spawns no analyzer, so the ledger it
+/// builds is **empty** — no family accuses, because nothing here accused. That
+/// is the honest input, and printing the result anyway is the point: it shows a
+/// reader how far this build is from being allowed to act on anything, as a
+/// count rather than as a claim.
+fn tier_section(trace: &Gate1Trace) -> String {
+    let ledger = Ledger::new();
+    let assignment = assign(
+        &ledger,
+        GateState {
+            // Gate 1 is the only gate `explain` runs. A refusal from it is
+            // enough to answer; anything it did not object to is reported as
+            // un-refused rather than as passed, which is why Gate 2 and the root
+            // set are not consulted here.
+            gates_0_to_2_pass: !trace.is_ineligible(),
+            gate_3f_clear: true,
+        },
+    );
+
+    let mut out = String::from("TIER (§9.6)\n");
+    out.push_str(&format!(
+        "  Tier {} — {}\n\n",
+        assignment.tier(),
+        assignment.tier().action()
+    ));
+    out.push_str(&format!(
+        "  accumulated bans {:.2} (prior {:.2}); families accusing: {}\n\n",
+        assignment.total_bans(),
+        assignment.prior(),
+        if assignment.accusing().is_empty() {
+            "none — `explain` runs no analyzer, so nothing accused".to_string()
+        } else {
+            assignment
+                .accusing()
+                .iter()
+                .map(|f| f.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    ));
+    out.push_str(&format!(
+        "  {}\n\n",
+        wrap(
+            &format!(
+                "{} of §9.6's criteria could not be evaluated by this build AT ALL, and \
+                 every one of them demotes exactly as a failure does. A tier here is a \
+                 CAP, not a score.",
+                assignment.not_evaluable()
+            ),
+            2
+        )
+    ));
+    for blocker in assignment.blockers() {
+        out.push_str(&format!(
+            "  {} {}\n      {}\n",
+            match blocker.outcome {
+                Outcome::NotEvaluable => "[not evaluable]",
+                _ => "[failed]       ",
+            },
+            blocker.name,
+            wrap(&blocker.detail, 6)
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+/// The §9.6 assignment as JSON, with every criterion — including the ones this
+/// build cannot evaluate, which are the ones a consumer most needs to see.
+fn tier_json(trace: &Gate1Trace) -> Value {
+    let assignment = assign(
+        &Ledger::new(),
+        GateState {
+            gates_0_to_2_pass: !trace.is_ineligible(),
+            gate_3f_clear: true,
+        },
+    );
+    json!({
+        "tier": assignment.tier().as_str(),
+        "action": assignment.tier().action(),
+        "total_bans": assignment.total_bans(),
+        "prior_log10_odds": assignment.prior(),
+        "accusing_families": assignment.accusing().iter().map(|f| f.as_str()).collect::<Vec<_>>(),
+        // The honesty number. A tier assigned with most of §9.6 unevaluated is a
+        // cap and not a score, and a consumer that does not read this cannot
+        // tell which it is holding.
+        "criteria_not_evaluable": assignment.not_evaluable(),
+        "criteria": assignment.criteria().iter().map(|c| json!({
+            "name": c.name,
+            "outcome": match c.outcome {
+                Outcome::Satisfied => "satisfied",
+                Outcome::Failed => "failed",
+                Outcome::NotEvaluable => "not_evaluable",
+            },
+            "detail": c.detail,
+        })).collect::<Vec<Value>>(),
+    })
+}
+
 fn render_json(trace: &Gate1Trace, root: &Path) -> String {
     let document = json!({
+        // Top level, beside the gate trace rather than inside it: §9.6's
+        // assignment is about the candidate, not about a piece of evidence.
+        "tier": tier_json(trace),
         "path": trace.path.display().to_string(),
         "repository": root.display().to_string(),
         "exists": trace.exists,
@@ -354,7 +462,7 @@ fn render_json(trace: &Gate1Trace, root: &Path) -> String {
                 "label": signal.label(),
                 "kind": signal_kind(signal),
             })),
-            "ignore_rule": trace.ignore_rule.as_ref().map(|rule| json!({
+        "ignore_rule": trace.ignore_rule.as_ref().map(|rule| json!({
                 "source": rule.source.display().to_string(),
                 "line": rule.line,
                 "pattern": rule.pattern,

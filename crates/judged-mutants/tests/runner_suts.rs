@@ -19,6 +19,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use judged_core::{Error, Result};
 use judged_mutants::sut::{CommandSut, NaiveSut, RefusingSut, Sut, SutVerdict, SymbolClaim};
@@ -366,13 +367,69 @@ mod command_sut {
     use super::*;
 
     /// Write an executable `/bin/sh` script into `dir` and return its path.
+    /// Serializes writing a script against spawning one, anywhere in this test
+    /// binary.
+    ///
+    /// # The race, and why a lock is the fix rather than a retry
+    ///
+    /// `fs::write` closes its descriptor before `script` returns. But a
+    /// *different* test thread calling `Command::spawn` in that instant forks,
+    /// and the child inherits a copy of every open descriptor — including ours —
+    /// holding it until its own `exec`. During that window our `exec` of the
+    /// file we just wrote returns `ETXTBSY`: "Text file busy".
+    ///
+    /// Nothing is wrong with either thread. It is a property of fork/exec, it
+    /// only reproduces under load, and it cost three CI cycles across one day
+    /// before being fixed rather than re-run.
+    ///
+    /// One mutex covering both sides makes the window impossible: no fork can
+    /// occur while a write descriptor is open, because the two cannot run at the
+    /// same time. Scoped to this binary, which is sufficient — every other test
+    /// binary is a separate *process* and never inherits these descriptors.
+    ///
+    /// A retry on `ETXTBSY` at the spawn was the alternative and was rejected:
+    /// the natural place for it is `CommandSut::run`, which is production code,
+    /// and a silent retry there would hide a genuine "somebody is rewriting this
+    /// analyzer" condition that §12 of AGENTS.md says should fail loudly.
+    static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take the lock, discarding a previous test's panic-poisoning.
+    ///
+    /// A poisoned lock here means some other test failed while holding it. That
+    /// is that test's failure to report, and turning it into a second, confusing
+    /// failure in every subsequent test would bury the original.
+    fn spawn_guard() -> std::sync::MutexGuard<'static, ()> {
+        SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
+        let _guard = spawn_guard();
         let path = dir.path().join(name);
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write script");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
         path
+    }
+
+    /// Run a SUT that spawns a process, under the same lock `script` writes
+    /// under. Every `.run(...)` in this module goes through here.
+    /// The same lock, reachable from the chained builder style the tests use.
+    ///
+    /// `CommandSut::new(..).with_args(..).run_locked(dir)` reads exactly as the
+    /// original did, so routing every spawn through the lock did not require
+    /// rewriting twenty tests into a shape they were not written in.
+    trait RunLocked {
+        fn run_locked(&self, dir: &Path) -> Result<SutVerdict>;
+    }
+
+    impl<T: Sut> RunLocked for T {
+        fn run_locked(&self, dir: &Path) -> Result<SutVerdict> {
+            let _guard = spawn_guard();
+            self.run(dir)
+        }
     }
 
     /// Every non-blank line of stdout is a claimed dead path. Blank stdout is a
@@ -448,7 +505,7 @@ mod command_sut {
         let sut = CommandSut::new("clean", script(&bin, "clean.sh", "exit 0"), parse_paths);
 
         let verdict = sut
-            .run(dir.path())
+            .run_locked(dir.path())
             .expect("a clean exit-0 run must succeed");
 
         assert_eq!(
@@ -468,7 +525,7 @@ mod command_sut {
             parse_paths,
         );
 
-        let verdict = sut.run(dir.path()).expect("sut runs");
+        let verdict = sut.run_locked(dir.path()).expect("sut runs");
 
         assert_eq!(claimed(&verdict), vec!["a/b.py", "c/d.py"]);
         assert_eq!(sut.name(), "finder");
@@ -484,7 +541,7 @@ mod command_sut {
             parse_symbols,
         );
 
-        let verdict = sut.run(dir.path()).expect("sut runs");
+        let verdict = sut.run_locked(dir.path()).expect("sut runs");
 
         let here = real(&dir);
         assert_eq!(
@@ -510,7 +567,7 @@ mod command_sut {
         )
         .with_args(["--json", "--quiet"]);
 
-        let verdict = sut.run(dir.path()).expect("sut runs");
+        let verdict = sut.run_locked(dir.path()).expect("sut runs");
 
         assert_eq!(
             claimed_symbols(&verdict),
@@ -540,7 +597,7 @@ mod command_sut {
             parse_paths,
         );
 
-        let verdict = sut.run(dir.path()).expect("sut runs");
+        let verdict = sut.run_locked(dir.path()).expect("sut runs");
 
         assert_eq!(
             claimed(&verdict),
@@ -569,7 +626,7 @@ mod command_sut {
                 parse_paths,
             );
 
-            match sut.run(dir.path()) {
+            match sut.run_locked(dir.path()) {
                 Ok(verdict) => panic!(
                     "{label} was accepted instead of rejected: {:?}",
                     verdict.claimed_dead_paths
@@ -600,7 +657,7 @@ mod command_sut {
         );
 
         let error = sut
-            .run(dir.path())
+            .run_locked(dir.path())
             .expect_err("deleting the whole repo is not an empty verdict");
 
         let text = error.to_string();
@@ -626,7 +683,7 @@ mod command_sut {
         );
 
         let error = sut
-            .run(dir.path())
+            .run_locked(dir.path())
             .expect_err("a non-zero exit must not be graded");
 
         let text = error.to_string();
@@ -659,7 +716,7 @@ mod command_sut {
         );
 
         let error = sut
-            .run(dir.path())
+            .run_locked(dir.path())
             .expect_err("parseable stdout does not redeem a failed run");
 
         let text = error.to_string();
@@ -684,7 +741,7 @@ mod command_sut {
         let sut = CommandSut::new("absent", missing, parse_paths);
 
         let error = sut
-            .run(dir.path())
+            .run_locked(dir.path())
             .expect_err("an uninstalled tool must not grade as claiming nothing");
 
         let text = error.to_string();
@@ -708,7 +765,7 @@ mod command_sut {
         );
 
         let error = sut
-            .run(dir.path())
+            .run_locked(dir.path())
             .expect_err("a killed analyzer must not be graded");
 
         let text = error.to_string();
@@ -740,7 +797,7 @@ mod command_sut {
         );
 
         let error = sut
-            .run(dir.path())
+            .run_locked(dir.path())
             .expect_err("a non-zero exit is still an error");
 
         let text = error.to_string();
@@ -767,7 +824,7 @@ mod command_sut {
         );
 
         let error = sut
-            .run(dir.path())
+            .run_locked(dir.path())
             .expect_err("unreadable stdout must not degrade to an empty verdict");
 
         let text = error.to_string();
@@ -792,7 +849,7 @@ mod command_sut {
         );
 
         let error = sut
-            .run(dir.path())
+            .run_locked(dir.path())
             .expect_err("undecodable stdout must not be parsed");
 
         let text = error.to_string();
@@ -820,13 +877,13 @@ mod command_sut {
         assert_eq!(
             claimed(
                 &declared
-                    .run(dir.path())
+                    .run_locked(dir.path())
                     .expect("exit 3 was declared healthy")
             ),
             vec!["a/b.py"]
         );
         assert!(
-            undeclared.run(dir.path()).is_err(),
+            undeclared.run_locked(dir.path()).is_err(),
             "an undeclared non-zero exit stays an error; the allowance must be \
              opt-in per SUT and never inferred"
         );
@@ -844,7 +901,7 @@ mod command_sut {
         .with_success_exit_codes([0, 1, 2, 3]);
 
         assert!(
-            sut.run(dir.path()).is_err(),
+            sut.run_locked(dir.path()).is_err(),
             "a process that never reached an exit status cannot have declared one"
         );
     }
@@ -861,7 +918,7 @@ mod command_sut {
 
         let clean = CommandSut::new("clean", script(&bin, "ok.sh", "exit 0"), parse_paths);
         assert_eq!(
-            clean.run(dir.path()).expect("clean run"),
+            clean.run_locked(dir.path()).expect("clean run"),
             SutVerdict::default(),
             "the legitimate empty verdict"
         );
@@ -898,7 +955,7 @@ mod command_sut {
         ];
 
         for (label, sut) in &failures {
-            match sut.run(dir.path()) {
+            match sut.run_locked(dir.path()) {
                 Err(_) => {}
                 Ok(verdict) => panic!(
                     "{label} produced a verdict instead of an error: {verdict:?} — \
@@ -943,7 +1000,7 @@ mod command_sut {
             script(&bin, "r.sh", "printf 'a.py\\n'"),
             parse_paths,
         );
-        sut.run(dir.path()).expect("sut runs");
+        sut.run_locked(dir.path()).expect("sut runs");
 
         assert_eq!(
             fs::read_dir(dir.path()).expect("read repo").count(),

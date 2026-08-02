@@ -444,3 +444,94 @@ fn printseeds_labels_every_root_with_its_tier_and_prints_the_gaps() {
         "the Tier B AppConfig root is the whole point of this class:\n{dump}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// In-source Tier A roots (§5.2, determination §7 item 4)
+//
+// Asserted per class, at fixture level, and that shape is a lesson rather than a
+// preference. Gate 3f's queue condition shipped without firing on m15 — the very
+// class it was built for — because the naive SUT never claims m15's live
+// artifacts, so every catalogue measurement ran straight past it and the suite
+// stayed green. A rule that silently does not fire on the class it exists for is
+// invisible to any measurement that never asks about that class. So each new
+// root source is asked directly, about the class §5.2 names it for.
+// ---------------------------------------------------------------------------
+
+/// m12 is `//go:linkname` in fixture form, and §4.1 records that directive as
+/// exactly why `x/tools/cmd/deadcode` reports a symbol *"spuriously as dead"*.
+#[test]
+fn go_linkname_and_export_are_roots_in_m12() {
+    let fixture = fixture("m12");
+    let set = roots::materialize(&fixture.root, &[] as &[String]);
+
+    for symbol in ["drain", "TelemetryFlush"] {
+        let root = set
+            .rescues_symbol(symbol)
+            .unwrap_or_else(|| panic!("{symbol} is declared a root by a §5.2 Go directive"));
+        assert_eq!(root.tier(), Tier::A, "a directive is not a guess");
+        assert!(
+            root.rule().starts_with("go/"),
+            "{symbol} was rescued by {} rather than by the directive that declares it",
+            root.rule()
+        );
+    }
+}
+
+/// §2.6.4 of the R1 determination records that m18's `.pth` was *"rescued only
+/// by an extension collision inside a cost gate, on one control SUT"*. It is a
+/// declared root now, which is what §5.2 says it always was.
+#[test]
+fn the_pth_file_in_m18_is_a_declared_root_rather_than_an_accident() {
+    let fixture = fixture("m18");
+    let pth = "vendor/site-packages/zzz_ledger_bootstrap.pth";
+    let set = roots::materialize(&fixture.root, &[pth.to_string()]);
+
+    let root = set
+        .rescues_path(pth)
+        .expect("a .pth file is an entry point with no caller anywhere (§5.2)");
+    assert_eq!(root.tier(), Tier::A);
+    assert_eq!(root.rule(), "python/pth");
+
+    // And the module its `import` line names, which is the other half of the
+    // `site` semantics and the reason the file matters at all.
+    assert!(
+        set.rescues_symbol("ledger_startup_hook").is_some(),
+        "the module a .pth imports is executed at interpreter start"
+    );
+}
+
+/// m19's `#[no_mangle]` export, whose only consumer is outside the repository.
+#[test]
+fn the_no_mangle_export_in_m19_is_a_root() {
+    let fixture = fixture("m19");
+    let set = roots::materialize(&fixture.root, &[] as &[String]);
+
+    let root = set
+        .rescues_symbol("ledger_amortize")
+        .expect("#[no_mangle] instructs the linker to emit it under that name");
+    assert_eq!(root.tier(), Tier::A);
+    assert_eq!(root.rule(), "rust/no-mangle");
+}
+
+/// The mirror, and the one that keeps the three above from being vacuous: the
+/// new sources must not materialize roots for a class that declares none.
+///
+/// m05 is Python with no `.pth`, no `sitecustomize.py` and no directives.
+#[test]
+fn a_class_with_no_in_source_markers_gains_no_in_source_roots() {
+    let fixture = fixture("m05");
+    let set = roots::materialize(&fixture.root, &[] as &[String]);
+
+    let in_source: Vec<&str> = set
+        .roots()
+        .iter()
+        .map(roots::Root::rule)
+        .filter(|rule| {
+            rule.starts_with("go/") || rule.starts_with("rust/") || rule.starts_with("python/")
+        })
+        .collect();
+    assert!(
+        in_source.is_empty(),
+        "m05 declares no §5.2 in-source root and must gain none: {in_source:?}"
+    );
+}

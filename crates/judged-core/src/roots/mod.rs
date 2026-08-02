@@ -36,4 +36,5 @@
 
 pub mod convention;
 pub mod declared;
+pub mod insource;
 pub mod manifest;

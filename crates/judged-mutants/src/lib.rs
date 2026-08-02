@@ -15,6 +15,7 @@ pub mod adapters;
 pub mod coverage;
 pub mod fixtures;
 pub mod gate1;
+pub mod gate3f;
 pub mod mutant;
 pub mod roots;
 pub mod runner;

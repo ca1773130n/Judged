@@ -1127,7 +1127,43 @@ pub struct VetoRun {
     ///
     /// Populated only for claims that survived **every** sub-gate, because a
     /// claim rescued by 2b/2c/2e is rescued and has no accusation left to weigh.
-    pub complete_search_survivors: Vec<String>,
+    pub complete_search_survivors: Vec<SurvivingClaim>,
+}
+
+/// One claim that survived Gate 2, kept in the shape it was made in.
+///
+/// **Typed, and that is the fix rather than a tidy-up.** This was a
+/// `Vec<String>` with a `evidence_for(&str)` lookup beside it, and paths and
+/// symbols were chained into the same list — so a surviving *path* named `foo`
+/// answered an evidence query about an unrelated *symbol* `foo`, and attached a
+/// +1.0 accusation to a claim Gate 2 had rescued.
+///
+/// That is the only direction of error this file has ever been able to make
+/// that MANUFACTURES a ban rather than withholding one, which is why the lookup
+/// is gone entirely rather than given a `ClaimKind` argument: an API that takes
+/// a bare string will be called with one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SurvivingClaim {
+    Path(PathBuf),
+    Symbol(SymbolClaim),
+}
+
+impl SurvivingClaim {
+    /// Whether this was a path or a symbol.
+    pub fn kind(&self) -> ClaimKind {
+        match self {
+            SurvivingClaim::Path(_) => ClaimKind::Path,
+            SurvivingClaim::Symbol(_) => ClaimKind::Symbol,
+        }
+    }
+
+    /// The claim as the analyzer spelled it, for a report.
+    pub fn claim(&self) -> String {
+        match self {
+            SurvivingClaim::Path(path) => path.display().to_string(),
+            SurvivingClaim::Symbol(symbol) => symbol.name().to_string(),
+        }
+    }
 }
 
 /// Any [`Sut`], with §9.3's Gate 2 run over every claim it makes.
@@ -1549,30 +1585,41 @@ fn from_reachability(
 }
 
 impl VetoRun {
-    /// §9.5 R-family evidence for one claim this run let through.
+    /// §9.5 R-family evidence, paired with the claim that earned it.
     ///
-    /// `None` for a claim that was rescued or that this run never saw. The
-    /// +1.0 row is the only one Gate 2a can license: the +1.5 row additionally
-    /// requires *"zero dynamism detected"*, which needs the per-repo dynamism
-    /// density §2.2 describes and nothing here measures, and the +0.4/+0.5 rows
-    /// describe the **analyzer's** depth rather than the search's completeness.
+    /// Returns pairs rather than answering a lookup, so evidence is never
+    /// separable from the typed claim it belongs to. The previous shape — a
+    /// `Vec<String>` of survivors and an `evidence_for(&str)` beside it —
+    /// answered a query about a *symbol* with a *path*'s survival whenever the
+    /// two shared a spelling, which attached an accusation to a claim Gate 2
+    /// had rescued. See [`SurvivingClaim`].
+    ///
+    /// The +1.0 row is the only one Gate 2a can license: the +1.5 row
+    /// additionally requires *"zero dynamism detected"*, which needs the
+    /// per-repo dynamism density §2.2 describes and nothing here measures, and
+    /// the +0.4/+0.5 rows describe the **analyzer's** depth rather than the
+    /// search's completeness.
     ///
     /// So this is the R family's whole contribution in this build, and it is
     /// worth being plain that it is a floor rather than a score: an analyzer
     /// whose own analysis is compiler-index-backed earns nothing extra here,
     /// because the row that would recognise it carries a qualifier nobody
     /// computes.
-    pub fn evidence_for(&self, claim: &str) -> Option<Evidence> {
+    pub fn evidence(&self) -> Vec<(SurvivingClaim, Evidence)> {
         self.complete_search_survivors
             .iter()
-            .any(|survivor| survivor == claim)
-            .then(|| {
-                Evidence::new(
-                    Family::R,
-                    "zero textual occurrences, complete non-truncated search",
-                    1.0,
+            .cloned()
+            .map(|claim| {
+                (
+                    claim,
+                    Evidence::new(
+                        Family::R,
+                        "zero textual occurrences, complete non-truncated search",
+                        1.0,
+                    ),
                 )
             })
+            .collect()
     }
 }
 
@@ -1648,13 +1695,15 @@ impl Sut for VetoedSut {
         // Every survivor reached here by a Gate 2a search that returned
         // `Verdict::Clear`, which is the complete-corpus, zero-hit case and
         // nothing else — see `VetoRun::complete_search_survivors`.
-        let complete_search_survivors: Vec<String> = claimed_dead_paths
+        let complete_search_survivors: Vec<SurvivingClaim> = claimed_dead_paths
             .iter()
-            .map(|path| path.display().to_string())
+            .cloned()
+            .map(SurvivingClaim::Path)
             .chain(
                 claimed_dead_symbols
                     .iter()
-                    .map(|symbol| symbol.name().to_string()),
+                    .cloned()
+                    .map(SurvivingClaim::Symbol),
             )
             .collect();
         self.runs.borrow_mut().push(VetoRun {

@@ -20,7 +20,9 @@ use judged_core::Result;
 use judged_mutants::fixtures;
 use judged_mutants::mutant::{GroundTruth, Mutant};
 use judged_mutants::runner::run_suite;
-use judged_mutants::sut::{Gate, GateSet, NaiveSut, Sut, SutVerdict, SymbolClaim, VetoedSut};
+use judged_mutants::sut::{
+    ClaimKind, Gate, GateSet, NaiveSut, SurvivingClaim, Sut, SutVerdict, SymbolClaim, VetoedSut,
+};
 
 /// A SUT that claims exactly what it was handed, whatever repository it is
 /// pointed at.
@@ -632,7 +634,8 @@ fn a_symbol_declared_in_one_file_is_vetoed_only_by_a_second_file_naming_it() {
 // finish is blocked rather than cleared.
 // ---------------------------------------------------------------------------
 
-/// A survivor earns the +1.0 row; a rescued claim earns nothing.
+/// A survivor earns the +1.0 row; a rescued claim earns nothing; and the
+/// evidence is inseparable from the typed claim it belongs to.
 #[test]
 fn only_a_claim_that_survived_a_complete_search_earns_r_family_evidence() {
     let mutants = fixtures::all();
@@ -653,41 +656,72 @@ fn only_a_claim_that_survived_a_complete_search_earns_r_family_evidence() {
         "the fixture must exercise both sides for this test to mean anything"
     );
 
-    for survivor in &run.complete_search_survivors {
-        let evidence = run
-            .evidence_for(survivor)
-            .unwrap_or_else(|| panic!("{survivor} survived, so it earned the +1.0 row"));
-        assert_eq!(evidence.family(), judged_core::ledger::Family::R);
-        assert!((evidence.bans() - 1.0).abs() < 1e-9);
+    let evidence = run.evidence();
+    assert_eq!(
+        evidence.len(),
+        run.survived,
+        "one row per survivor, no more"
+    );
+    for (_, row) in &evidence {
+        assert_eq!(row.family(), judged_core::ledger::Family::R);
+        assert!((row.bans() - 1.0).abs() < 1e-9);
     }
 
-    for blocked in &run.blocked {
-        assert!(
-            run.evidence_for(&blocked.claim).is_none(),
-            "{} was rescued, so there is no accusation left to weigh",
-            blocked.claim
-        );
-    }
-
-    // The survivor list and the returned claim set are the same population,
-    // which is what makes the evidence attributable to a claim the caller holds.
-    let returned: BTreeSet<String> = after
+    // The survivors are exactly the claims handed back, compared as the TYPED
+    // claims they are. Comparing rendered strings would pass while a path and a
+    // symbol of the same spelling were confused for each other, which is the
+    // defect this shape exists to prevent.
+    let earned: BTreeSet<SurvivingClaim> = evidence.into_iter().map(|(claim, _)| claim).collect();
+    let returned: BTreeSet<SurvivingClaim> = after
         .claimed_dead_paths
         .iter()
-        .map(|p| p.display().to_string())
+        .cloned()
+        .map(SurvivingClaim::Path)
         .chain(
             after
                 .claimed_dead_symbols
                 .iter()
-                .map(|s| s.name().to_string()),
+                .cloned()
+                .map(SurvivingClaim::Symbol),
         )
         .collect();
-    assert_eq!(
-        run.complete_search_survivors
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<String>>(),
-        returned
+    assert_eq!(earned, returned);
+
+    // And nothing Gate 2 rescued appears among them.
+    for blocked in &run.blocked {
+        assert!(
+            !earned
+                .iter()
+                .any(|claim| claim.claim() == blocked.claim && claim.kind() == blocked.kind),
+            "{} was rescued, so there is no accusation left to weigh",
+            blocked.claim
+        );
+    }
+}
+
+/// A path and a symbol that share a spelling must not answer for each other.
+///
+/// Found by review. Survivors were a `Vec<String>` chaining both kinds, and the
+/// lookup beside it compared bare strings — so a surviving path `drain` handed
+/// +1.0 of accusation to a symbol `drain` that Gate 2 had rescued. The only
+/// error this file can make that MANUFACTURES a ban rather than withholding
+/// one.
+#[test]
+fn a_surviving_path_does_not_earn_evidence_for_a_symbol_of_the_same_name() {
+    let survivors = [
+        SurvivingClaim::Path(PathBuf::from("drain")),
+        SurvivingClaim::Symbol(SymbolClaim::unattributed("kept")),
+    ];
+
+    let paths: BTreeSet<&SurvivingClaim> = survivors
+        .iter()
+        .filter(|claim| claim.kind() == ClaimKind::Path)
+        .collect();
+    assert!(paths.contains(&SurvivingClaim::Path(PathBuf::from("drain"))));
+    assert!(
+        !paths.contains(&SurvivingClaim::Symbol(SymbolClaim::unattributed("drain"))),
+        "the path `drain` is not the symbol `drain`, and no lookup exists that could \
+         confuse them"
     );
 }
 
@@ -707,12 +741,13 @@ fn gate_2a_evidence_alone_never_reaches_a_quorum() {
     layer.run(&materialized.root).expect("the veto runs");
     let run = &layer.runs()[0];
 
-    let survivor = run
-        .complete_search_survivors
-        .first()
+    let (_, row) = run
+        .evidence()
+        .into_iter()
+        .next()
         .expect("at least one claim survived");
     let mut ledger = judged_core::ledger::Ledger::new();
-    ledger.record(run.evidence_for(survivor).expect("evidence"));
+    ledger.record(row);
 
     assert!(
         ledger.accuses(judged_core::ledger::Family::R),

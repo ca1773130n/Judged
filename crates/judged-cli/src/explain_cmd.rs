@@ -258,7 +258,7 @@ fn render_text(trace: &Gate1Trace, root: &Path) -> String {
          evidence that this path is unused (§6.20).\n",
     );
     out.push('\n');
-    out.push_str(&tier_section(trace));
+    out.push_str(&tier_section());
     out
 }
 
@@ -326,57 +326,53 @@ fn wrap(text: &str, indent: usize) -> String {
 // JSON
 // ---------------------------------------------------------------------------
 
-/// What §9.6 would assign this path today, and everything stopping it going
-/// higher.
+/// What §9.6 would require of any candidate, and how much of it this build can
+/// evaluate.
 ///
-/// `explain` runs Gate 0g and Gate 1 and spawns no analyzer, so the ledger it
-/// builds is **empty** — no family accuses, because nothing here accused. That
-/// is the honest input, and printing the result anyway is the point: it shows a
-/// reader how far this build is from being allowed to act on anything, as a
+/// Takes no path, and that is the honest shape rather than an oversight.
+/// `explain` runs Gate 0g and Gate 1 and spawns no analyzer, so there is no
+/// accusation and no evaluated precondition — nothing about *this* path feeds
+/// the assignment. Printing the requirement anyway is the point: it shows a
+/// reader how far the build is from being allowed to act on anything, as a
 /// count rather than as a claim.
-fn tier_section(trace: &Gate1Trace) -> String {
+///
+/// It previously took the trace and passed Gate 1's verdict as though it were
+/// "gates 0-2 pass", which reported Tier 2 for candidates whose Gate 0a-0f and
+/// Gate 2 had never run — in a report whose closing section says those gates
+/// were not run.
+fn tier_section() -> String {
     let ledger = Ledger::new();
     let assignment = assign(
         &ledger,
-        GateState {
-            // Gate 1 is the only gate `explain` runs. A refusal from it is
-            // enough to answer; anything it did not object to is reported as
-            // un-refused rather than as passed, which is why Gate 2 and the root
-            // set are not consulted here.
-            gates_0_to_2_pass: !trace.is_ineligible(),
-            gate_3f_clear: true,
-        },
+        // `explain` runs Gate 0g and Gate 1 and NOTHING ELSE. It does not run
+        // Gate 0a-0f, it does not run Gate 2, and it does not run Gate 3f — the
+        // report says so in its own closing section. Claiming a pass for any of
+        // them here would make this command assert the thing §6.20 forbids, in
+        // the middle of a report whose last paragraph is about not doing that.
+        GateState::default(),
     );
 
-    let mut out = String::from("TIER (§9.6)\n");
+    let mut out = String::from("TIER (§9.6) — NOT ASSIGNED BY THIS COMMAND\n");
     out.push_str(&format!(
-        "  Tier {} — {}\n\n",
-        assignment.tier(),
-        assignment.tier().action()
-    ));
-    out.push_str(&format!(
-        "  accumulated bans {:.2} (prior {:.2}); families accusing: {}\n\n",
-        assignment.total_bans(),
-        assignment.prior(),
-        if assignment.accusing().is_empty() {
-            "none — `explain` runs no analyzer, so nothing accused".to_string()
-        } else {
-            assignment
-                .accusing()
-                .iter()
-                .map(|f| f.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
+        "  {}\n\n",
+        wrap(
+            "`explain` runs Gate 0g and Gate 1. It does not run Gate 0a-0f, Gate 2, Gate 3f, \
+             or any analyzer — so no family accused, no gate precondition was evaluated, and \
+             there is nothing here to assign a tier from. What follows is what §9.6 WOULD \
+             require, and how much of it this build can evaluate at all.",
+            2
+        )
     ));
     out.push_str(&format!(
         "  {}\n\n",
         wrap(
             &format!(
-                "{} of §9.6's criteria could not be evaluated by this build AT ALL, and \
-                 every one of them demotes exactly as a failure does. A tier here is a \
-                 CAP, not a score.",
-                assignment.not_evaluable()
+                "{} of §9.6's {} criteria could not be evaluated by this build AT ALL, and \
+                 every one of them demotes exactly as a failure does. No candidate can reach \
+                 Tier 0 or Tier 1 here, and that is a property of the code rather than of \
+                 this repository.",
+                assignment.not_evaluable(),
+                assignment.criteria().len()
             ),
             2
         )
@@ -398,13 +394,15 @@ fn tier_section(trace: &Gate1Trace) -> String {
 
 /// The §9.6 assignment as JSON, with every criterion — including the ones this
 /// build cannot evaluate, which are the ones a consumer most needs to see.
-fn tier_json(trace: &Gate1Trace) -> Value {
+fn tier_json() -> Value {
     let assignment = assign(
         &Ledger::new(),
-        GateState {
-            gates_0_to_2_pass: !trace.is_ineligible(),
-            gate_3f_clear: true,
-        },
+        // `explain` runs Gate 0g and Gate 1 and NOTHING ELSE. It does not run
+        // Gate 0a-0f, it does not run Gate 2, and it does not run Gate 3f — the
+        // report says so in its own closing section. Claiming a pass for any of
+        // them here would make this command assert the thing §6.20 forbids, in
+        // the middle of a report whose last paragraph is about not doing that.
+        GateState::default(),
     );
     json!({
         "tier": assignment.tier().as_str(),
@@ -432,7 +430,7 @@ fn render_json(trace: &Gate1Trace, root: &Path) -> String {
     let document = json!({
         // Top level, beside the gate trace rather than inside it: §9.6's
         // assignment is about the candidate, not about a piece of evidence.
-        "tier": tier_json(trace),
+        "tier": tier_json(),
         "path": trace.path.display().to_string(),
         "repository": root.display().to_string(),
         "exists": trace.exists,

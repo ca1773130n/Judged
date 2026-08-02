@@ -3048,3 +3048,55 @@ fn gate_one_publishes_which_claim_it_refused_and_under_which_class() {
         run.stdout
     );
 }
+
+/// `explain` must not assign a tier, because it does not run the gates a tier
+/// requires.
+///
+/// Codex found the opposite shipped in review: the command reported **Tier 2**
+/// while its own closing section said Gate 0a-0f and Gate 2 had not been run.
+/// That is §6.20's inversion inside the module written to prevent it, so the
+/// assertion is on the words a reader sees.
+#[test]
+fn explain_declines_to_assign_a_tier_and_says_why() {
+    let repo = repo_for_explaining("explain-tier");
+
+    let run = judged(repo.path(), &["explain", "scratch-notes"]);
+    run.expect_says("NOT ASSIGNED BY THIS COMMAND");
+    // Short fragments, because the paragraph is wrapped to terminal width and a
+    // longer literal would assert on where the wrap happened to fall.
+    run.expect_says("does not run Gate 0a-0f");
+    run.expect_says("Tier 0 or Tier 1");
+}
+
+/// The same, machine-readable: a consumer must be able to see that the gate
+/// preconditions were never evaluated rather than inferring it from a tier.
+#[test]
+fn explain_json_reports_every_criterion_it_could_not_evaluate() {
+    let repo = repo_for_explaining("explain-tier-json");
+
+    let run = judged(repo.path(), &["explain", "--json", "scratch-notes"]);
+    let document: Value = serde_json::from_str(run.stdout.trim()).expect("JSON");
+    let tier = &document["tier"];
+
+    assert_eq!(
+        tier["tier"],
+        json!("3"),
+        "no gate was evaluated, so not even Tier 2"
+    );
+    assert_eq!(tier["accusing_families"], json!([]));
+    let criteria = tier["criteria"].as_array().expect("criteria");
+    let not_evaluable = criteria
+        .iter()
+        .filter(|c| c["outcome"] == json!("not_evaluable"))
+        .count();
+    assert_eq!(
+        tier["criteria_not_evaluable"].as_u64().expect("count") as usize,
+        not_evaluable,
+        "the summary count and the rows must agree"
+    );
+    assert!(
+        criteria.iter().any(|c| c["name"] == json!("gates 0-2 pass")
+            && c["outcome"] == json!("not_evaluable")),
+        "a gate this command never ran is reported as unevaluated, never as passed"
+    );
+}

@@ -18,13 +18,15 @@
 //!
 //! # The granularity is `FNDA`, and line granularity here is theatre
 //!
-//! §2.3, and it is the difference between a control and a decoration. In Python,
-//! Ruby and JavaScript the `def`, `class` and module-level lines execute at
-//! **import**. So under every documented failure mode above — a runner that
-//! booted and then died, an instrumenter that attached for one process and no
-//! others — you get *boot-only coverage*: a health-check handler's `def` line
-//! **is** covered, while every function body in the repository reads dead. A
-//! control asserting "line 4 of `handlers.py` was executed" passes on exactly
+//! §2.3, and it is the difference between a control and a decoration. Under
+//! every documented failure mode above — a runner that booted and then died, an
+//! instrumenter that attached for one process and no others — you get
+//! *boot-only coverage*: the module-level lines of a repository are covered
+//! while every function body in it reads dead. In Python this extends to the
+//! `def` line itself, which really does execute at import: measured against
+//! Coverage.py 7.15.2, a function nothing ever called carries `DA:7,1` on its
+//! definition and `DA:8,0` on its body (`tests/coverage_real_artifacts.rs`). A
+//! control asserting "line 7 of `handlers.py` was executed" passes on exactly
 //! the artifact it exists to reject.
 //!
 //! So a control names **functions**, and they are checked against `FNDA`, which

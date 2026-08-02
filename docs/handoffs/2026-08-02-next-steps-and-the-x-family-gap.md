@@ -2,6 +2,14 @@
 
 **Date:** 2026-08-02 · **HEAD:** `8ce8cad` · **Tests:** 819 · **CI:** green
 
+> **Partly answered since.** §2 and §7 — wire lcov ingestion as a fourth rescue layer with an
+> `FNDA`-granularity positive control — are implemented; the layer ships and rescues nothing,
+> because the fixtures carry no artifacts. §2.4's open question, how the catalogue produces
+> coverage, is settled in
+> [`docs/decisions/2026-08-02-e2-coverage-artifacts.md`](../decisions/2026-08-02-e2-coverage-artifacts.md).
+> Everything else here — §3's tripwire, §4's toolchain notes, §5's traps, §6's backlog — still
+> stands and is still the thing to read first.
+
 Read [`docs/decisions/2026-08-02-r1-determination.md`](../decisions/2026-08-02-r1-determination.md)
 first. It is the standing determination on §11 R1 and it constrains what the next session is
 allowed to do. Its §7 is an ordered list of what remains; this document does not repeat it. What

@@ -12,7 +12,14 @@
 //! - [`git`] — recoverability classification, i.e. Gate 0g (defined in §9.3,
 //!   proved in §8.1): "the single most consequential finding in the document"
 //!   per §0 item 10.
+//!
+//! [`coverage`] is the one module that is not shared vocabulary in that sense.
+//! It reads an artifact somebody else produced, which makes it an adapter — but
+//! it is the workspace's only Family X signal (§9.5), and every layer that wants
+//! to ask "was this executed" has to agree on the same answer, so it lives here
+//! rather than beside one consumer.
 
+pub mod coverage;
 pub mod error;
 pub mod fingerprint;
 pub mod gate1;

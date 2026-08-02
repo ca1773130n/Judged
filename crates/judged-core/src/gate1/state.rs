@@ -113,6 +113,8 @@ use std::path::{Component, Path, PathBuf};
 
 use aho_corasick::AhoCorasick;
 
+use crate::git::Repo;
+
 /// Bytes read from the head of a candidate file.
 ///
 /// §2.1 costs the sniff at one 32-byte `pread`. This reads 64, for one measured
@@ -855,6 +857,24 @@ impl StateGate {
     /// error channel a caller could mistake for "no effectors here". A failure
     /// becomes a scan gap, and a scan gap makes the tree ineligible.
     pub fn survey(root: &Path) -> StateGate {
+        StateGate::survey_in(root, None)
+    }
+
+    /// [`StateGate::survey`], told which repository it is surveying.
+    ///
+    /// **The entry point production must use.** §6.13's git-annex and git-lfs
+    /// stores live inside the git directory, and locating that directory needs
+    /// git — `<root>/.git` is a regular *file* in a linked worktree and in a
+    /// submodule, and does not exist at all under `--separate-git-dir`.
+    ///
+    /// `None` means the caller has no working tree, which is a definite answer
+    /// about a directory that is not a repository rather than a failed probe:
+    /// there is no git directory, so nothing can be inside one. A caller that
+    /// *has* a repository and passes `None` would silently downgrade a real
+    /// probe into that answer, which is why the production call site passes it
+    /// and this shim is documented as being for callers that genuinely have
+    /// none.
+    pub fn survey_in(root: &Path, repo: Option<&Repo>) -> StateGate {
         let mut gate = StateGate {
             root: root.to_path_buf(),
             effectors: Vec::new(),
@@ -863,14 +883,22 @@ impl StateGate {
             gaps: Vec::new(),
         };
 
-        // Probed directly, because the walk deliberately does not descend into
-        // .git — and these two live inside it.
-        if root.join(".git/annex").exists() {
-            gate.note_store(DataStore::GitAnnex);
-        }
-        if root.join(".git/lfs").exists() {
-            gate.note_store(DataStore::GitLfs);
-        }
+        // Probed through git, because the walk deliberately does not descend into
+        // the git directory — and these two live inside it.
+        //
+        // Through `git rev-parse --git-common-dir`, never `<root>/.git`. Three
+        // ordinary layouts make the literal path wrong, and this probe was
+        // silently false in all of them: a linked worktree and a submodule both
+        // write `.git` as a regular FILE holding `gitdir: …` (verified — `git
+        // worktree add` produces 63 bytes), and `--separate-git-dir` puts the
+        // directory somewhere with no `.git` component at all. In an annexed
+        // repository checked out as a worktree, §6.13's store went undetected
+        // and the tree was judged as though no annex existed.
+        //
+        // A failure to locate it is a GAP, never an absence. "There is no annex
+        // here" and "I could not find out" are the §6.20 pair, and only the
+        // first licenses anything.
+        gate.probe_git_stores(repo);
         if root.join(".dvc").exists() {
             gate.note_store(DataStore::Dvc);
         }
@@ -1209,6 +1237,41 @@ impl StateGate {
             < MARKERS_PER_SYSTEM
         {
             self.effectors.push(EffectorMarker { system, path, kind });
+        }
+    }
+
+    /// §6.13's stores, located through git rather than through `<root>/.git`.
+    ///
+    /// This probe used to read `root.join(".git/annex")` and was **silently
+    /// false in three ordinary layouts**: a linked worktree and a submodule
+    /// both write `.git` as a regular FILE holding `gitdir: …` (verified — `git
+    /// worktree add` produces 63 bytes), and `--separate-git-dir` leaves no
+    /// `.git` component in the path at all. An annexed repository checked out
+    /// as a worktree reported no annex, and §6.13's whole class of hazard went
+    /// unseen.
+    ///
+    /// A failure to locate the directory is a **gap**, never an absence. "There
+    /// is no annex here" and "I could not find out" are §6.20's pair, and only
+    /// the first licenses anything.
+    fn probe_git_stores(&mut self, repo: Option<&Repo>) {
+        let Some(repo) = repo else {
+            // No working tree, so no git directory, so nothing inside one. A
+            // definite answer rather than an unexamined one.
+            return;
+        };
+        match repo.common_dir() {
+            Ok(git_dir) => {
+                if git_dir.join("annex").exists() {
+                    self.note_store(DataStore::GitAnnex);
+                }
+                if git_dir.join("lfs").exists() {
+                    self.note_store(DataStore::GitLfs);
+                }
+            }
+            Err(source) => self.gaps.push(format!(
+                "could not locate the git directory, so no git-annex or git-lfs store was \
+                 looked for: {source}. That is not evidence that neither is present (§6.13)."
+            )),
         }
     }
 

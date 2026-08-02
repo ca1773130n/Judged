@@ -29,6 +29,7 @@ use judged_core::gate1::state::{
     sniff, DataStore, Ecosystem, Evidence, StateClass, StateFinding, StateGate, StateVerdict,
     HEAD_BYTES,
 };
+use judged_core::git::Repo;
 
 // ---------------------------------------------------------------------------
 // scaffolding
@@ -848,14 +849,22 @@ fn an_lfs_pointer_is_130_bytes_and_still_ineligible() {
 #[test]
 fn the_three_content_stores_of_6_13_are_detected() {
     let tree = Tree::new("stores");
-    tree.dir(".git/annex/objects");
     tree.dir(".dvc/cache");
     tree.file(
         ".gitattributes",
         b"*.psd filter=lfs diff=lfs merge=lfs -text\n",
     );
 
-    let gate = StateGate::survey(tree.root());
+    // A real repository, because the annex store is located through git now
+    // rather than by joining `.git` onto the root. This test previously wrote
+    // `.git/annex/objects` into a plain directory and passed — which it could
+    // only do because the probe was wrong in the way the worktree test below
+    // demonstrates.
+    let repo = Repo::init(tree.root()).expect("init");
+    let git_dir = repo.common_dir().expect("common dir");
+    fs::create_dir_all(git_dir.join("annex/objects")).expect("annex");
+
+    let gate = StateGate::survey_in(tree.root(), Some(&repo));
     let mut stores = gate.data_stores().to_vec();
     stores.sort();
     assert_eq!(
@@ -963,4 +972,76 @@ fn a_missing_path_is_refused_rather_than_cleared() {
     let gate = StateGate::survey(tree.root());
     let verdict = gate.judge(&tree.root().join("gone.txt"));
     assert!(verdict.is_ineligible(), "{verdict:?}");
+}
+
+/// §6.13's stores live inside the git directory, and `<root>/.git` is not it in
+/// three ordinary layouts.
+///
+/// The probe used to read `root.join(".git/annex")`. In a **linked worktree**
+/// `.git` is a regular file holding `gitdir: …`, so an annexed repository
+/// checked out as a worktree reported no annex and §6.13's whole class of
+/// hazard went unseen. Found while designing Gate 0; verified here.
+#[test]
+fn the_annex_store_is_found_through_the_common_git_dir_not_through_root_dot_git() {
+    let main = tempfile::Builder::new()
+        .prefix("judged-store-main-")
+        .tempdir()
+        .expect("scratch");
+    let repo = Repo::init(main.path()).expect("init");
+    std::fs::write(main.path().join("README.md"), "x\n").expect("write");
+    repo.add_all().expect("add");
+    repo.commit("initial").expect("commit");
+
+    // The store, where git-annex actually keeps it.
+    let git_dir = repo.common_dir().expect("common dir");
+    std::fs::create_dir_all(git_dir.join("annex/objects")).expect("annex");
+
+    assert!(
+        StateGate::survey_in(main.path(), Some(&repo))
+            .data_stores()
+            .contains(&DataStore::GitAnnex),
+        "the main working tree must see its own annex"
+    );
+
+    // And the case the old probe was blind to.
+    let linked = main
+        .path()
+        .parent()
+        .expect("parent")
+        .join("judged-store-wt");
+    let added = std::process::Command::new("git")
+        .args(["worktree", "add", "-q"])
+        .arg(&linked)
+        .arg("HEAD")
+        .current_dir(main.path())
+        .output()
+        .expect("spawn git");
+    if !added.status.success() {
+        // Never a silent skip: a probe that could not be set up is not a probe
+        // that passed.
+        panic!(
+            "could not create a linked worktree, so the regression this test exists for was \
+             never exercised: {}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+    }
+
+    assert!(
+        linked.join(".git").is_file(),
+        "a linked worktree's .git is a FILE — that is the whole defect"
+    );
+    let worktree = Repo::discover(&linked).expect("the worktree is a repository");
+    assert!(
+        StateGate::survey_in(&linked, Some(&worktree))
+            .data_stores()
+            .contains(&DataStore::GitAnnex),
+        "the annex is in the COMMON git dir, and the worktree must still see it"
+    );
+
+    std::process::Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(&linked)
+        .current_dir(main.path())
+        .output()
+        .expect("cleanup");
 }

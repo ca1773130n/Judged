@@ -620,3 +620,107 @@ fn a_symbol_declared_in_one_file_is_vetoed_only_by_a_second_file_naming_it() {
          side"
     );
 }
+
+// ---------------------------------------------------------------------------
+// §9.5 R-family evidence (§9.4, §9.6)
+//
+// Gate 2a is the only thing in this build that can license a §9.5 R row, and it
+// licenses exactly one: "zero textual occurrences, complete non-truncated
+// search", +1.0. The qualifier is not re-checked here because the type system
+// already carries it — `Verdict::Clear` IS the complete-corpus zero-hit case,
+// and an incomplete search is a veto (§6.20), so a claim whose scan did not
+// finish is blocked rather than cleared.
+// ---------------------------------------------------------------------------
+
+/// A survivor earns the +1.0 row; a rescued claim earns nothing.
+#[test]
+fn only_a_claim_that_survived_a_complete_search_earns_r_family_evidence() {
+    let mutants = fixtures::all();
+    let mutant = mutants
+        .iter()
+        .find(|m| m.id() == "m05")
+        .expect("the catalogue contains m05");
+    let materialized = materialize(mutant.as_ref());
+    let before = claim_everything(&materialized.truth, &materialized.root);
+    let layer = VetoedSut::new(Box::new(FixedSut {
+        claims: before.clone(),
+    }));
+    let after = layer.run(&materialized.root).expect("the veto runs");
+    let run = &layer.runs()[0];
+
+    assert!(
+        !run.blocked.is_empty() && run.survived > 0,
+        "the fixture must exercise both sides for this test to mean anything"
+    );
+
+    for survivor in &run.complete_search_survivors {
+        let evidence = run
+            .evidence_for(survivor)
+            .unwrap_or_else(|| panic!("{survivor} survived, so it earned the +1.0 row"));
+        assert_eq!(evidence.family(), judged_core::ledger::Family::R);
+        assert!((evidence.bans() - 1.0).abs() < 1e-9);
+    }
+
+    for blocked in &run.blocked {
+        assert!(
+            run.evidence_for(&blocked.claim).is_none(),
+            "{} was rescued, so there is no accusation left to weigh",
+            blocked.claim
+        );
+    }
+
+    // The survivor list and the returned claim set are the same population,
+    // which is what makes the evidence attributable to a claim the caller holds.
+    let returned: BTreeSet<String> = after
+        .claimed_dead_paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .chain(
+            after
+                .claimed_dead_symbols
+                .iter()
+                .map(|s| s.name().to_string()),
+        )
+        .collect();
+    assert_eq!(
+        run.complete_search_survivors
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<String>>(),
+        returned
+    );
+}
+
+/// One family accusing is not a quorum, so the evidence Gate 2a produces cannot
+/// promote anything on its own — §9.5's rule, arriving here as arithmetic.
+#[test]
+fn gate_2a_evidence_alone_never_reaches_a_quorum() {
+    let mutants = fixtures::all();
+    let mutant = mutants
+        .iter()
+        .find(|m| m.id() == "m05")
+        .expect("the catalogue contains m05");
+    let materialized = materialize(mutant.as_ref());
+    let layer = VetoedSut::new(Box::new(FixedSut {
+        claims: claim_everything(&materialized.truth, &materialized.root),
+    }));
+    layer.run(&materialized.root).expect("the veto runs");
+    let run = &layer.runs()[0];
+
+    let survivor = run
+        .complete_search_survivors
+        .first()
+        .expect("at least one claim survived");
+    let mut ledger = judged_core::ledger::Ledger::new();
+    ledger.record(run.evidence_for(survivor).expect("evidence"));
+
+    assert!(
+        ledger.accuses(judged_core::ledger::Family::R),
+        "1.0 >= the +0.5 floor"
+    );
+    assert_eq!(
+        ledger.accusing().len(),
+        1,
+        "and one family is not the two §9.5 requires"
+    );
+}

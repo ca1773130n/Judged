@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use judged_core::git::Repo;
+use judged_core::ledger::{Evidence, Family};
 use judged_core::veto::{literal, reachability, recency};
 use judged_core::{Error, Result};
 
@@ -1111,6 +1112,22 @@ pub struct VetoRun {
     /// made them, never sorted by anything that would flatter the gate (§9.13
     /// invariant 3).
     pub blocked: Vec<BlockedClaim>,
+    /// Claims that survived a Gate 2a search which **completed over the whole
+    /// corpus and found nothing** — §9.5's R row *"zero textual occurrences,
+    /// complete non-truncated search"*, worth **+1.0 bans**.
+    ///
+    /// # The type system already encodes the qualifier
+    ///
+    /// §9.5's row is only earned by a *complete* search, and
+    /// [`literal::Verdict::Clear`] is documented as exactly that. Its
+    /// counterpart cannot leak in: an incomplete search is a **hit** (§6.20), so
+    /// a claim whose scan truncated, errored or timed out was vetoed and is in
+    /// [`Self::blocked`] rather than here. There is no path by which a search
+    /// that did not finish produces evidence of absence.
+    ///
+    /// Populated only for claims that survived **every** sub-gate, because a
+    /// claim rescued by 2b/2c/2e is rescued and has no accusation left to weigh.
+    pub complete_search_survivors: Vec<String>,
 }
 
 /// Any [`Sut`], with §9.3's Gate 2 run over every claim it makes.
@@ -1531,6 +1548,34 @@ fn from_reachability(
     }
 }
 
+impl VetoRun {
+    /// §9.5 R-family evidence for one claim this run let through.
+    ///
+    /// `None` for a claim that was rescued or that this run never saw. The
+    /// +1.0 row is the only one Gate 2a can license: the +1.5 row additionally
+    /// requires *"zero dynamism detected"*, which needs the per-repo dynamism
+    /// density §2.2 describes and nothing here measures, and the +0.4/+0.5 rows
+    /// describe the **analyzer's** depth rather than the search's completeness.
+    ///
+    /// So this is the R family's whole contribution in this build, and it is
+    /// worth being plain that it is a floor rather than a score: an analyzer
+    /// whose own analysis is compiler-index-backed earns nothing extra here,
+    /// because the row that would recognise it carries a qualifier nobody
+    /// computes.
+    pub fn evidence_for(&self, claim: &str) -> Option<Evidence> {
+        self.complete_search_survivors
+            .iter()
+            .any(|survivor| survivor == claim)
+            .then(|| {
+                Evidence::new(
+                    Family::R,
+                    "zero textual occurrences, complete non-truncated search",
+                    1.0,
+                )
+            })
+    }
+}
+
 impl Sut for VetoedSut {
     fn name(&self) -> &str {
         &self.name
@@ -1600,11 +1645,24 @@ impl Sut for VetoedSut {
         }
 
         let survived = claimed_dead_paths.len() + claimed_dead_symbols.len();
+        // Every survivor reached here by a Gate 2a search that returned
+        // `Verdict::Clear`, which is the complete-corpus, zero-hit case and
+        // nothing else — see `VetoRun::complete_search_survivors`.
+        let complete_search_survivors: Vec<String> = claimed_dead_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .chain(
+                claimed_dead_symbols
+                    .iter()
+                    .map(|symbol| symbol.name().to_string()),
+            )
+            .collect();
         self.runs.borrow_mut().push(VetoRun {
             repo: handle.root().to_path_buf(),
             claimed,
             survived,
             blocked,
+            complete_search_survivors,
         });
 
         Ok(SutVerdict {

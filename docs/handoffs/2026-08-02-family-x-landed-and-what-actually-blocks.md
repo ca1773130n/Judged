@@ -1,4 +1,4 @@
-# Handoff — Family X exists now, and Family B is the only thing left in the way
+# Handoff — Family X exists now, and what actually blocks a quorum
 
 **Date:** 2026-08-02 · **HEAD:** `4eb0a40` on `feat/x-family-lcov-ingest` ·
 **PR:** [#3](https://github.com/ca1773130n/Judged/pull/3), green, unmerged · **Tests:** 866
@@ -21,16 +21,33 @@ That is a smaller number than it sounds, and §2 is why.
 
 ---
 
-## 2. Family B is now the blocking item, in the place the X gap held
+## 2. What is actually blocking — corrected
 
-§9.5 needs a quorum of two of {B, R, X}. There is now one X. There is still no B — no build-system
-or deploy-time evidence of any kind — so **Tier 0 is still unreachable by construction, and §11 R1
-still stands where the determination left it.** Nothing measured this session changes that, and no
-amount of improving the coverage layer will.
+**This section originally said "Family B is the only thing left in the way." That was wrong, and
+it was wrong in a way worth spelling out, because it would have sent the next session to build the
+wrong thing.** Reading §9.5's definitions properly gives three corrections:
 
-If you only do one thing: find the cheapest honest B signal and build it the way this one was
-built — ingest rather than collect, rescue rather than accuse, positive control in the same commit,
-and the fixture declarations written before anything is measured.
+**There is more than one route to a quorum.** §9.5 definition 1 ends: *"the only two-family
+combinations that exist are {B,R}, {B,X}, {R,X}."* `{R,X}` is available in principle, so Family B
+is not uniquely required.
+
+**But this X cannot take it.** A family ACCUSES only when its maximum accuse-polarity evidence
+reaches **+0.5 bans**. The X table gives +0.5 to *"zero hits, full window, **production profiling
+present**"* — and test coverage is pinned at **0.0**, veto only, by the resolved contradiction at
+§9.5. What shipped this session is test coverage. It can rescue forever and never accuse, so it can
+never be one of the two families. Reaching `{R,X}` means production-sourced evidence with a declared
+window and expiry, not a better lcov parser.
+
+**And underneath both: nothing can accuse yet at all.** There is no ban ledger and no §9.6 tier
+model in this codebase — no `+0.5`, no accumulation, no tier assignment. `grep` for accuse-polarity
+in `crates/*/src` finds only doc comments saying Gate 1 does *not* accuse. The `Tier` enum that
+exists is §5.1 root provenance (A/B/C), unrelated. So "which two families accuse" is not a question
+the code can answer today, for any family, and building a second signal does not change that.
+
+Which means the next step is not "add a signal". It is the determination's §7 order, whose item 1
+— *an X-family signal, at all* — this session discharged. **Item 2 is Gate 3, and 3f specifically:
+the only specified gate that does not exist, and the one §7 says would speak to m11 and to classes
+15–19 as a group.** Family B is item 3; root-set completion for the §5.2 sources is item 4.
 
 ---
 
@@ -126,7 +143,14 @@ cargo run -q -p judged-cli -- mutants --sut knip --gate1 --veto --roots --covera
 
 ## 7. Backlog, unchanged except where noted
 
-- **Family B.** §2. The only blocking item.
+- **Gate 3, and 3f.** The determination's §7 item 2, and the only specified gate that does
+  not exist. See §2.
+- **A ban ledger and the §9.6 tier model.** Nothing computes bans, so no family can accuse. §7
+  item 8 depends on it: until a tier is assigned to anything, none of §10's headline metrics is
+  computable.
+- **Family B** (§7 item 3, regenerate-and-diff) and **root-set completion** for the §5.2 sources
+  the implementation lacks (§7 item 4: `//go:linkname`, `//export`, `.pth`, `#[no_mangle]`,
+  `AndroidManifest.xml`, `composer.json`).
 - The lcov 2.x index form (`FNL`/`FNA`) is not parsed. Such an artifact yields zero functions, fails
   the control's floor, and is discarded whole — the safe failure. Widening the parser is recall,
   not correctness.

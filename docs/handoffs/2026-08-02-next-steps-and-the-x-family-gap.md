@@ -4,7 +4,7 @@
 
 > **Answered since; superseded in part.** §2, §2.4 and §7 are done — the layer ships, the nineteen
 > declarations exist, and the suite has been re-measured. See
-> [`2026-08-02-family-x-landed-family-b-is-next.md`](./2026-08-02-family-x-landed-family-b-is-next.md)
+> [`2026-08-02-family-x-landed-and-what-actually-blocks.md`](./2026-08-02-family-x-landed-and-what-actually-blocks.md)
 > for what happened and what to do next, and
 > [`docs/decisions/2026-08-02-e2-coverage-artifacts.md`](../decisions/2026-08-02-e2-coverage-artifacts.md)
 > for the rule the fixtures were generated under and the measurement.

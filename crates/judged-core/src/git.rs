@@ -540,6 +540,39 @@ impl Repo {
     /// unrecoverable and a slow one is not — but a whole-tree scan should grow
     /// a batched entry point (`ls-files` and `check-ignore --stdin` both accept
     /// many paths at once) rather than calling this in a loop.
+    /// This worktree's own git directory, absolute.
+    ///
+    /// `git rev-parse --absolute-git-dir`. Distinct from
+    /// [`Repo::common_dir`] and both are needed: in a linked worktree this is
+    /// `<common>/worktrees/<name>` while the common dir is the main repository's,
+    /// and in a submodule this is `<super>/.git/modules/<name>`. Protecting only
+    /// one of them leaves the other writable.
+    ///
+    /// `--absolute-git-dir` rather than `--path-format=absolute`: verified to
+    /// give identical answers on git 2.50.1, and it exists since git 2.13 (2017)
+    /// where `--path-format` needs 2.31 (2021) — which would silently exclude
+    /// e.g. Ubuntu 20.04's git 2.25.
+    pub fn absolute_git_dir(&self) -> Result<PathBuf> {
+        let run = GitRun::new(&self.root, ["rev-parse", "--absolute-git-dir"], None)?
+            .require_success()?;
+        Ok(PathBuf::from(run.stdout_trimmed()?))
+    }
+
+    /// A single git config value, or `None` when it is unset.
+    ///
+    /// Unset is an answer — `git config --get` exits 1 for it — while any other
+    /// non-zero exit is a failure the caller must not read as "unset".
+    pub fn config(&self, key: &str) -> Result<Option<String>> {
+        let run = GitRun::new(&self.root, ["config", "--get", key], None)?;
+        match run.code() {
+            Some(0) => Ok(Some(run.stdout_trimmed()?.to_string())),
+            Some(1) => Ok(None),
+            other => Err(Error::Git(format!(
+                "`git config --get {key}` exited {other:?}"
+            ))),
+        }
+    }
+
     pub fn recoverability(&self, path: &Path) -> Result<RecoverabilityClass> {
         let rel = self.relative(path)?;
         if self.is_tracked_rel(&rel)? {

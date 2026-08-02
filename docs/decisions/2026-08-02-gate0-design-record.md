@@ -157,7 +157,19 @@ code at the end of a long session, which is precisely how the three defects exte
 today got in. The contract in §1 and the corpus in §3 are what make the next attempt cheap; writing
 the code now would spend them.
 
-**Start here:** 0e and 0a first — the handoff's reasoning still holds, they are refusals with no
+**0e is built** — `judged_core::gate0e`, from this corpus: identity against `--absolute-git-dir`
+and `--git-common-dir` rather than a `.git/` prefix, `lfs.storage` read from config because the
+store is relocatable, the ancestor direction refused because `rm -rf repo/` is the shape that
+actually destroys an object database, and a three-state verdict whose `Unreadable` refuses.
+
+Two things it found that the design rounds did not. Git reports **canonical** paths, so comparing a
+candidate against them lexically protects nothing wherever the tree is reached through a symlink —
+on macOS every temp directory is `/var/…` behind a link to `/private/var/…`, and the first version
+cleared the working tree root for that reason alone. And both sides need the same treatment: a
+`lfs.storage` path is whatever the user wrote, so resolving only the candidate left the relocated
+store `Clear`.
+
+**Start here:** 0a next — the handoff's reasoning still holds, they are refusals with no
 measurement behind them and their absence is the difference between a bug and an unrecoverable one.
 But note that §3 shows 0e's "never touch `.git/`" is wrong as a *path string* on three verified
 layouts, so it must be implemented as an identity test against `--absolute-git-dir` and

@@ -1,5 +1,11 @@
 # Handoff — Family X exists now, and what actually blocks a quorum
 
+> **Superseded** by
+> [`2026-08-02-five-layers-a-ledger-and-why-everything-is-tier-3.md`](./2026-08-02-five-layers-a-ledger-and-why-everything-is-tier-3.md).
+> Kept as a record. §2's correction here was right as far as it went and still incomplete: the
+> ledger was built afterwards and found that **Gate 0a–0f does not exist**, so no candidate reaches
+> Tier 2 either. Read the newer document for what blocks and in what order.
+
 **Date:** 2026-08-02 · **HEAD:** `4eb0a40` on `feat/x-family-lcov-ingest` ·
 **PR:** [#3](https://github.com/ca1773130n/Judged/pull/3), green, unmerged · **Tests:** 866
 

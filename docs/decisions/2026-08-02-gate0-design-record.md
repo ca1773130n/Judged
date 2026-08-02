@@ -169,7 +169,17 @@ cleared the working tree root for that reason alone. And both sides need the sam
 `lfs.storage` path is whatever the user wrote, so resolving only the candidate left the relocated
 store `Clear`.
 
-**Start here:** 0a next — the handoff's reasoning still holds, they are refusals with no
+**0a is built** — `judged_core::gate0a`. The corpus's own finding drove the shape: `lstat("link/")`
+answers about the **target** with `is_symlink = false`, so every candidate is stripped lexically on
+its raw bytes before any syscall, and `Path::components` cannot be used for it because component
+iteration normalizes away the very thing being detected.
+
+Its reach is narrower than §6.13 implies and says so: DVC's default cache is copy/reflink, and
+git-annex stores content as "a symlink **or pointer file**", so the repository-level store probe is
+the load-bearing half and the per-link rule is the narrow one. A probe that could not run counts as
+a store being present.
+
+**Start here:** 0b, 0c, 0d, 0f remain — the handoff's reasoning still holds, they are refusals with no
 measurement behind them and their absence is the difference between a bug and an unrecoverable one.
 But note that §3 shows 0e's "never touch `.git/`" is wrong as a *path string* on three verified
 layouts, so it must be implemented as an identity test against `--absolute-git-dir` and

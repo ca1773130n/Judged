@@ -39,7 +39,7 @@ use std::path::Path;
 use judged_core::git::Repo;
 use judged_core::{Error, Result};
 
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// The site-directory manifest. §5.2: an entry point with no caller anywhere.
 const LIVE_PTH: &str = "vendor/site-packages/zzz_ledger_bootstrap.pth";
@@ -249,6 +249,13 @@ impl Mutant for PlatformSideManifest {
     fn research_ref(&self) -> &str {
         "§10 E2 class 18"
     }
+    /// Both manifests are read by the **platform** — CPython's `site` module at
+    /// interpreter start, Android when a broadcast arrives. Neither happens inside
+    /// the repository's test process.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::nothing()
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         for (relative, body) in FILES {

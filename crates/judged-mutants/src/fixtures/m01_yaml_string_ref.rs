@@ -37,7 +37,7 @@ use std::path::Path;
 use judged_core::git::Repo;
 use judged_core::{Error, Result};
 
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// A Django `AppConfig` named only as a dotted string in a YAML app list. No
 /// import, no call site: the reference exists, but only as data, and only in a
@@ -191,6 +191,14 @@ impl Mutant for YamlStringRef {
     fn research_ref(&self) -> &str {
         "§10 E2 class 1"
     }
+    /// `settings.py` reads `apps.yaml` at import time and Django imports the module
+    /// to instantiate the class, so a test process that boots the app loads the
+    /// file. `DunningConfig` is a **class**, and a class has no `FNDA` record —
+    /// only functions do — so the symbol claim gets no coverage evidence at all.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::loaded(["ledger/dunning.py"])
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         for (relative, body) in FILES {

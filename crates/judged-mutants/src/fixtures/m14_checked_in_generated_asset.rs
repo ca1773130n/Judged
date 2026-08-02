@@ -33,7 +33,7 @@ use std::path::Path;
 use judged_core::git::Repo;
 use judged_core::{Error, Result};
 
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// It looks like build output, which is what makes it dangerous: the whole
 /// point is that the consumer is outside the repository.
@@ -165,6 +165,12 @@ impl Mutant for CheckedInGeneratedAsset {
     fn research_ref(&self) -> &str {
         "§10 E2 class 14"
     }
+    /// Committed build output whose only consumer is a CDN path. Never executed by
+    /// the repository's own tests.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::nothing()
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         for (relative, body) in FILES {

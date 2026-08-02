@@ -1,14 +1,17 @@
 # How the E2 catalogue gets coverage — and the rule that has to be fixed first
 
-**Date:** 2026-08-02 · **Status:** decided, not yet implemented · **Supersedes:** nothing
+**Date:** 2026-08-02 · **Status:** decided and implemented; measured in §6 · **Supersedes:** nothing
 
 The X-family layer landed today: lcov ingestion, an `FNDA`-granularity positive control, and a
-fourth rescue layer wired beside `--gate1`, `--veto` and `--roots`. It works, and it currently
-rescues nothing, because the nineteen fixtures ship no coverage artifacts. `judged mutants --sut
-naive --coverage` says so in the only way that is honest: **0 of 19 class(es) had an artifact that
-passed its control (19 no-artifact)**.
+fourth rescue layer wired beside `--gate1`, `--veto` and `--roots`. At the time this was written it
+rescued nothing, because the nineteen fixtures shipped no coverage artifacts, and `judged mutants
+--sut naive --coverage` said so in the only way that is honest: **0 of 19 class(es) had an artifact
+that passed its control (19 no-artifact)**.
 
-The handoff's §2.4 named this and asked for a deliberate decision. This is it.
+The handoff's §2.4 named that gap and asked for a deliberate decision. This is it. §§1–5 were
+written before anything was implemented and are left as they were, except where the work refuted
+them — those corrections are marked, because a premise that survived contact is worth telling apart
+from one that did not. §6 is what happened.
 
 ---
 
@@ -20,6 +23,12 @@ All three are live through a **runtime** mechanism — a reflective field read, 
 artifact. Which means a coverage artifact for those three would rescue exactly the three claims the
 project currently fails on. That is not a reason to write them; it is the reason to be careful about
 writing them.
+
+> **Corrected by §6.** The middle step is wrong for m11, and finding that out is most of what the
+> implementation was worth. A test really does execute the reflective read — but the live artifacts
+> are model *fields*, and `FNDA` records functions. There is no record for a field at any coverage
+> granularity, so the class an execution signal was most plausibly going to rescue is the one it
+> structurally cannot. The trap was real; it was just narrower than it looked.
 
 The determination's §5 draws the line. Implementing more of the specification is implementation;
 changing the instrument because m02, m11 or m12 failed is tuning, and the pre-commitment answers
@@ -58,12 +67,19 @@ Each fixture already declares `live_paths`, `live_symbols`, `decoy_dead_paths` a
 > **Of this fixture's live artifacts, which does a test suite exercising its documented entry point
 > actually enter?**
 
-That is a property of the injected mechanism, not a tuning knob. m11's reflective field is read at
-runtime, so a test enters it. m05's error path is entered by no test that does not inject a fault.
-m08's CI manifest reference names a script that runs in a pipeline and not in a test process. m18's
-platform branch does not execute on the platform the tests run on. m09's README block is executed
-by a human reading documentation. The answers differ per class **because the mechanisms differ**,
-and that difference is the whole content of the measurement.
+That is a property of the injected mechanism, not a tuning knob. m12's aliased function is called
+through at runtime, so a test enters it. m05's error path is entered by no test that does not inject
+a fault. m08's CI manifest reference names a script that runs in a pipeline and not in a test
+process. m18's entry points are read by the platform — CPython's `site` module, Android's broadcast
+dispatch — and not by anything inside the test process. The answers differ per class **because the
+mechanisms differ**, and that difference is the whole content of the measurement.
+
+> **Two examples here were wrong, and writing the declarations is what surfaced it.** m09's README
+> block is not "executed by a human reading documentation": `#![doc = include_str!("../README.md")]`
+> makes it a doctest, and `cargo test --doc` runs it — so it is one of only three classes whose live
+> symbol a test suite genuinely calls. And m11's reflective field is not entered in any sense
+> coverage can record, for the reason in §1. Deriving each answer from the fixture rather than from
+> memory is exactly what the rule was for.
 
 Three constraints on how it is done, and they are the point:
 
@@ -91,10 +107,10 @@ bounds the adapter, not the technique.
 
 **Not evidence that the adapter reads real artifacts.** A generated tracefile is written by the
 same project that parses it, so a shared misunderstanding of the format is invisible to the whole
-suite. The one thing that closes that gap is a tracefile produced by a real instrumenter, and that
-is the first thing to do after the fixtures — a single real `coverage.py`, `nyc` or `cargo-llvm-cov`
-run, committed as a parser fixture with its provenance recorded. Cheap, and it tests the half the
-generator cannot.
+suite. The one thing that closes that gap is a tracefile produced by a real instrumenter — done
+before the generator rather than after it, and it earned its place immediately: Coverage.py and c8
+turn out to use *different* `FN:` dialects, so guessing one would have lost every function record
+from half the ecosystem (`judged-core/tests/coverage_real_artifacts.rs`).
 
 **Not a Tier-0 clearance.** §9.5's quorum needs two of {B, R, X}. This adds the first X. Family B —
 build-system and deploy-time evidence — is still entirely absent, and R1 stays where the
@@ -119,10 +135,51 @@ Stated now, so it cannot be chosen afterwards:
 
 ---
 
-## 6. What this leaves undone
+## 6. The measurement
 
-- The nineteen declarations and the generator (§3). This is the next piece of work.
-- A real-instrumenter parser fixture (§4).
+Implemented the same day. Every prediction below was written into the fixtures, and the pinning
+table and its pre-commitment assertion were green, before any analyzer was run.
+
+**Two properties of coverage did most of the work, and neither is a property of this catalogue.**
+`FNDA` records **functions** — classes, model fields and module names have no function record
+however thoroughly they are exercised — and most of this catalogue's live symbols are classes.
+Import-time execution is **language-specific**: a Python or JavaScript module that is merely
+imported has executed lines, while a Rust or Go file whose functions are never entered has none.
+Seven of nineteen classes declare any execution; three of those declare a called symbol.
+
+Four analyzers, full stack (`--gate1 --veto --roots`), with and without the layer:
+
+| SUT | graded | false removals, no coverage | with coverage |
+| --- | ---: | --- | --- |
+| vulture 2.16 | 10 / 19 | 3 — m11 | 3 — m11 |
+| knip 6.31.0 | 3 / 19 | 1 — m02 | **0** |
+| deadcode v0.48.0 | 1 / 19 | 1 — m12 | 1 — m12 |
+| cargo-shear 1.13.3 | 6 / 19 | 0 | 0 |
+
+Five surviving false removals became four, no decoy was lost anywhere, and the three classes
+behaved exactly as declared:
+
+- **m02 cleared.** knip's false removal was a *path* claim on the dynamically imported transport.
+  The import runs, so the module loads, so the claim is dropped — and no Family-R layer could reach
+  it, which is why the class existed.
+- **m11 untouched.** It declares no live paths at all, and its three live symbols are model fields.
+  A field is not a function, so an execution signal has nothing to say about it at any granularity.
+  This is the honest half of the result: the class an execution signal was most plausibly going to
+  rescue is the one it structurally cannot.
+- **m12 halved.** `drain` is called through the `//go:linkname` alias and is rescued; the surviving
+  false removal is exactly `TelemetryFlush`, the ABI export whose consumer is outside the
+  repository — m19's situation, and it gets m19's answer.
+
+The prediction-to-outcome match is the load-bearing part. Not that the number improved, but that
+it improved *where the mechanism said it would* and stayed still where the mechanism said it would.
+
+---
+
+## 7. What this leaves undone
+
+- **Family B is still absent**, so §9.5's quorum is still unreachable and R1 still stands where the
+  determination left it. That is now the single blocking item, in the place §2 of the previous
+  handoff held.
 - The lcov 2.x index form — `FNL`/`FNA` — is not parsed. An artifact using it yields zero functions,
   fails the control's floor, and is discarded whole rather than believed. That is the safe failure,
   and widening the parser is a recall improvement rather than a correctness fix.

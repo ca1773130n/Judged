@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use judged_core::git::Repo;
 use judged_core::{Error, Result};
 
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// The hardest class to argue with, because under normal conditions the
 /// guard genuinely does nothing. That is what a guard is.
@@ -207,6 +207,14 @@ impl Mutant for GuardClause {
     fn research_ref(&self) -> &str {
         "§10 E2 class 7"
     }
+    /// The one Rust class coverage genuinely sees. The guard runs on **every**
+    /// input; what waits for a hostile input is its *effect*, not its execution.
+    /// So a test suite entering the surrounding path enters the guard, and
+    /// `FNDA` records it.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::default().calling("src/dot_entry.rs", "is_self_or_parent_link")
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         for (relative, body) in FILES {

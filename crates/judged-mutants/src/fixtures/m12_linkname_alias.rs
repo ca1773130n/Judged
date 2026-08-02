@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use judged_core::git::Repo;
 use judged_core::{Error, Result};
 
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// `//go:linkname` binds a name across package boundaries at link time. The
 /// Go call graph shows nothing; the program depends on it.
@@ -253,6 +253,16 @@ impl Mutant for LinknameAlias {
     fn research_ref(&self) -> &str {
         "§10 E2 class 12"
     }
+    /// `drain` is called through the `//go:linkname` alias at runtime, so a test
+    /// process enters it and Go's coverage records the call.
+    ///
+    /// `TelemetryFlush` in `cmd/libtelemetry/abi.go` is not declared: it is an ABI
+    /// export whose consumer is outside the repository, which is m19's situation
+    /// and gets m19's answer.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::default().calling("internal/sampler/drain.go", "drain")
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         for (relative, body) in FILES {

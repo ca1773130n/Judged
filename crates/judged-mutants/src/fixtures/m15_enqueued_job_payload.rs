@@ -38,7 +38,7 @@ use judged_core::git::Repo;
 use judged_core::Result;
 
 use crate::fixtures::write;
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// The job Celery would hand a worker, protocol 1, before base64.
 ///
@@ -68,6 +68,13 @@ impl Mutant for EnqueuedJobPayload {
     fn research_ref(&self) -> &str {
         "§10 E2 class 15"
     }
+    /// The payload naming the worker is **already sitting in the queue**. A test run
+    /// does not drain that queue, so nothing imports `worker/tasks.py` and nothing
+    /// constructs the class.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::nothing()
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         let root = repo.root().to_path_buf();

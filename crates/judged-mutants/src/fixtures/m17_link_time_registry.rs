@@ -41,7 +41,7 @@ use judged_core::git::Repo;
 use judged_core::Result;
 
 use crate::fixtures::write;
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// `inventory::submit!` / `linkme` / a self-registering `static Registrar` /
 /// `__attribute__((constructor))`. §10 E2 puts it exactly: the call graph is
@@ -82,6 +82,15 @@ impl Mutant for LinkTimeRegistry {
     fn research_ref(&self) -> &str {
         "§10 E2 class 17"
     }
+    /// The submission static runs before `main`, which is what §6.1 means by "the
+    /// item still runs". The **registered function** runs only when something
+    /// iterates the collection, and a test suite that does not dispatch the
+    /// registry never enters it. In Rust there is no import-time line execution to
+    /// fall back on, so the file has no coverage either.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::nothing()
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         let root = repo.root().to_path_buf();

@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use judged_core::git::Repo;
 use judged_core::{Error, Result};
 
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// Documentation that is also a test. §0.9 keeps docs out of the deletion
 /// path entirely; this mutant checks the tool honours that even when the
@@ -218,6 +218,18 @@ impl Mutant for ReadmeExecutedBlock {
     fn research_ref(&self) -> &str {
         "§10 E2 class 9"
     }
+    /// `#![doc = include_str!("../README.md")]` makes the README block a doctest, and
+    /// `cargo test --doc` runs it — so a test suite really does enter it.
+    ///
+    /// Worth knowing that the tooling lags the mechanism: `cargo-llvm-cov` only
+    /// instruments doctests behind `--doctests` on nightly, so a real artifact
+    /// often would not carry this record. That is a limit of the instrumenter, not
+    /// a fact about how the artifact is reached, and the declaration answers the
+    /// second question.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::default().calling("src/badge.rs", "render_badge")
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         for (relative, body) in FILES {

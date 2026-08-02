@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use judged_core::git::Repo;
 use judged_core::{Error, Result};
 
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// Single-threaded observation never touches it. Deleting it does not break
 /// the build or the tests; it corrupts data under load.
@@ -213,6 +213,12 @@ impl Mutant for ConcurrencyHelper {
     fn research_ref(&self) -> &str {
         "§10 E2 class 6"
     }
+    /// Exercised only when two threads contend. A test suite that does not force
+    /// the interleaving never enters it, which is why the class exists.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::nothing()
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         for (rel, body) in FILES {

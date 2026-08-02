@@ -29,7 +29,7 @@ use judged_core::git::Repo;
 use judged_core::Result;
 
 use crate::fixtures::write;
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// The root set is unknowable precisely because humans are in it (§0.1).
 /// This subcommand is registered, documented, and never called from
@@ -49,6 +49,11 @@ impl Mutant for HumanCliSubcommand {
     fn research_ref(&self) -> &str {
         "§10 E2 class 4"
     }
+    /// Reachable only when a human types the subcommand. No test process does.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::nothing()
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         let root = repo.root().to_path_buf();

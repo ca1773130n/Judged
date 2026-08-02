@@ -43,7 +43,7 @@ use judged_core::git::Repo;
 use judged_core::{Error, Result};
 
 use crate::fixtures::write;
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// A pickled cache entry on disk still names the class. Nothing in the
 /// source does.
@@ -116,6 +116,13 @@ impl Mutant for PersistedSerializedBlob {
     fn research_ref(&self) -> &str {
         "§10 E2 class 16"
     }
+    /// The class is the schema for bytes already written to disk. A test run does not
+    /// unpickle that blob, so the module is never imported — and even if it were,
+    /// `RateSnapshot` is a class and would carry no `FNDA` record.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::nothing()
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         let root = repo.root().to_path_buf();

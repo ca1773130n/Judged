@@ -43,7 +43,7 @@ use judged_core::git::Repo;
 use judged_core::Result;
 
 use crate::fixtures::write;
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// Unfalsifiable from inside the repository **by construction**, which is
 /// what makes it the right test: the only correct behaviour is to refuse,
@@ -82,6 +82,12 @@ impl Mutant for AbiConsumerExport {
     fn research_ref(&self) -> &str {
         "§10 E2 class 19"
     }
+    /// A `#[no_mangle]` export whose only consumer is outside the repository. Nothing
+    /// in this repository calls it, including its tests — that is the class.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::nothing()
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         let root = repo.root().to_path_buf();

@@ -32,7 +32,7 @@ use std::path::Path;
 use judged_core::git::Repo;
 use judged_core::{Error, Result};
 
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// The reference is real, executable, and written in a language no code
 /// analyzer for the project's ecosystem reads.
@@ -196,6 +196,12 @@ impl Mutant for CiManifestRef {
     fn research_ref(&self) -> &str {
         "§10 E2 class 8"
     }
+    /// Invoked from a CI workflow, a Dockerfile or a k8s manifest — none of which is
+    /// a test process, and none of which any instrumenter is attached to.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::nothing()
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         for (relative, body) in FILES {

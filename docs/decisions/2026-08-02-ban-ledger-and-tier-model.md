@@ -96,6 +96,30 @@ Written before the first run, so it cannot be chosen afterwards:
 
 ---
 
+## 5.1 Two defects review found, and what they were
+
+Codex reviewed the first version and found both. Recorded because neither was reachable by the
+tests as written, and both are shapes this project claims to be built against.
+
+**The family fold was order-dependent.** It folded evidence into one running slot with `max` for
+positive bans and `min` for negative ones, so H rows of `+0.5` then `-0.8` totalled `-0.6`, and the
+same two in the opposite order totalled `+0.5`. A deadness score that changes with the order a tool
+happened to emit its findings is exactly what `runner::grade` sorts to avoid, one layer up.
+
+**Positive history rows were entering the total at all.** §9.5 says twice that H *"may only
+subtract"* and that its positive rows ship at **0.0** pending §10's E4 calibration. The H test
+checked `accuses()` and never the total, so a `+0.5` age row silently inflated a deadness score
+while the suite stayed green.
+
+**And `explain` reported Tier 2 having run neither Gate 0a-0f nor Gate 2.** `GateState` carried
+booleans, which forces a caller that did not *run* a gate to answer `true` or `false` — and both are
+false statements. The command's own closing section says those gates were not run. That is §6.20's
+inversion committed inside the module written to prevent it. `GateState` is tri-state now, its
+`Default` is "nothing evaluated", and `explain` assigns no tier at all: it prints what §9.6 *would*
+require and how much of it this build can evaluate.
+
+---
+
 ## 6. What this leaves undone
 
 - **Every action.** Quarantine, the soak, the PR, the reaping. §9.6 attaches them to tiers; none is

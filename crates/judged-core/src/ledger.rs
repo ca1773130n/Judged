@@ -34,7 +34,6 @@
 //! **No candidate can reach Tier 0 or Tier 1 in this build.** The stability
 //! window alone guarantees it. A Tier 2 result here means *capped*, not *scored*.
 
-use std::collections::BTreeMap;
 use std::fmt;
 
 /// §2.2's correlation families.
@@ -251,33 +250,63 @@ impl Ledger {
     /// after the family cap, because a family that may only subtract still has
     /// to be able to.
     pub fn total_bans(&self) -> f64 {
-        let mut per_family: BTreeMap<Family, f64> = BTreeMap::new();
-        for evidence in self.evidence.iter().filter(|e| e.healthy()) {
-            let slot = per_family.entry(evidence.family).or_insert(0.0);
-            // MAX by magnitude in the accusing direction, and the most
-            // exculpating value in the other — a family contributes its single
-            // strongest statement, not the sum of its correlated ones.
-            if evidence.bans > 0.0 {
-                *slot = slot.max(evidence.bans);
-            } else {
-                *slot = slot.min(evidence.bans);
-            }
-        }
-        let total: f64 = per_family
+        [Family::B, Family::R, Family::X, Family::H]
             .into_iter()
-            .map(|(family, bans)| match family.cap() {
-                Some(cap) => bans.clamp(-cap, cap),
-                None => bans,
-            })
-            .sum();
-        // `clamp` can hand back a negative zero, and `{:.2}` renders that as
-        // `-0.00` — a minus sign on the one number a reader is looking at to
-        // decide whether anything accused. Normalized here rather than at each
-        // call site.
-        if total == 0.0 {
-            0.0
+            .map(|family| self.family_contribution(family))
+            .sum()
+    }
+
+    /// What one family contributes to the total: its single strongest
+    /// statement, and never the sum of its correlated ones.
+    ///
+    /// # Order independence is the property, not a nicety
+    ///
+    /// An earlier version folded evidence into one slot with `max` for positive
+    /// bans and `min` for negative ones, which made the answer depend on the
+    /// order the evidence arrived: H rows of `+0.5` then `-0.8` totalled `-0.6`,
+    /// and the same two in the opposite order totalled `+0.5`. A verdict that
+    /// changes with the order a tool happened to emit its findings is the defect
+    /// this codebase rejects everywhere else — `runner::grade` sorts for exactly
+    /// this reason — and here it was deciding a deadness score.
+    ///
+    /// # H may only subtract
+    ///
+    /// §9.5 is explicit twice over: family H *"may only subtract"*, and its
+    /// positive rows are unvalidated against §6.18's measurement that age is
+    /// anti-predictive, so the implementation rule is to **ship them at 0.0**
+    /// and let §10's E4 calibration set them. A positive H row is therefore
+    /// recorded — evidence is never dropped — and contributes nothing.
+    fn family_contribution(&self, family: Family) -> f64 {
+        let healthy = self
+            .evidence
+            .iter()
+            .filter(|e| e.family == family && e.healthy());
+
+        let contribution = if family.may_accuse() {
+            // MAX within family. Over every healthy row, so a family carrying
+            // only exculpating evidence contributes the least-negative of it
+            // rather than silently nothing. §9.5's table has no negative row
+            // outside H, so this is a definition rather than a behaviour.
+            healthy
+                .map(Evidence::bans)
+                .fold(None, |best: Option<f64>, bans| {
+                    Some(best.map_or(bans, |b| b.max(bans)))
+                })
         } else {
-            total
+            // H: the most exculpating statement it makes, and positive rows
+            // ignored outright.
+            healthy
+                .map(Evidence::bans)
+                .filter(|bans| *bans < 0.0)
+                .fold(None, |best: Option<f64>, bans| {
+                    Some(best.map_or(bans, |b: f64| b.min(bans)))
+                })
+        }
+        .unwrap_or(0.0);
+
+        match family.cap() {
+            Some(cap) => contribution.clamp(-cap, cap),
+            None => contribution,
         }
     }
 
@@ -428,16 +457,35 @@ impl Assignment {
 
 /// What the caller already knows about the candidate from the gate layers.
 ///
-/// Everything here is something this build genuinely computes. Anything §9.6
-/// requires and this struct does not carry is a [`Outcome::NotEvaluable`]
-/// criterion — deliberately, so that adding a field is the only way to promote a
-/// criterion out of that state.
-#[derive(Debug, Clone, Copy, Default)]
+/// **[`Outcome`] rather than `bool`, and that is the whole point.** A boolean
+/// forces a caller that did not *run* a gate to answer `true` or `false` about
+/// it, and both are lies: `false` reports a refusal nobody made, and `true`
+/// reports a pass nobody earned. `judged explain` runs Gate 0g and Gate 1 and
+/// nothing else, and with a boolean field it reported **Tier 2 for candidates
+/// whose Gate 0a-0f and Gate 2 had never been evaluated** — while the same
+/// report said, four lines above, that those gates had not been run.
+///
+/// That is §6.20's inversion committed inside the module written to prevent it,
+/// and a type that can express it will eventually express it. So the third state
+/// exists and demotes.
+#[derive(Debug, Clone, Copy)]
 pub struct GateState {
-    /// Gate 0–2 all passed for this candidate.
-    pub gates_0_to_2_pass: bool,
-    /// Gate 3f found nothing (§9.3: *"No ban count overrides this"*).
-    pub gate_3f_clear: bool,
+    /// Gate 0 (recoverability), Gate 1 (never-touch) and Gate 2 (reference
+    /// veto), as a single §9.6 precondition.
+    pub gates_0_to_2: Outcome,
+    /// Gate 3f (§9.3: *"No ban count overrides this"*).
+    pub gate_3f: Outcome,
+}
+
+impl Default for GateState {
+    /// Nothing evaluated. The only safe default: a caller that constructs a
+    /// `GateState` and forgets a field gets a demotion rather than a promotion.
+    fn default() -> GateState {
+        GateState {
+            gates_0_to_2: Outcome::NotEvaluable,
+            gate_3f: Outcome::NotEvaluable,
+        }
+    }
 }
 
 /// Assign a tier from a ledger and what the gates found.
@@ -453,21 +501,13 @@ pub fn assign(ledger: &Ledger, gates: GateState) -> Assignment {
     let mut criteria = vec![
         Criterion {
             name: "gates 0-2 pass",
-            outcome: if gates.gates_0_to_2_pass {
-                Outcome::Satisfied
-            } else {
-                Outcome::Failed
-            },
+            outcome: gates.gates_0_to_2,
             detail: "Gate 0 (recoverability), Gate 1 (never-touch) and Gate 2 (reference veto)"
                 .to_string(),
         },
         Criterion {
             name: "3f never waivable",
-            outcome: if gates.gate_3f_clear {
-                Outcome::Satisfied
-            } else {
-                Outcome::Failed
-            },
+            outcome: gates.gate_3f,
             detail: "§9.3: the candidate's type is not serializable, its name cannot appear in \
                      a queue payload, and its symbol is not exported across an ABI boundary"
                 .to_string(),
@@ -520,10 +560,16 @@ pub fn assign(ledger: &Ledger, gates: GateState) -> Assignment {
         Tier::Zero
     } else if base.criteria.iter().all(|c| c.outcome.holds()) && total >= TIER1_BANS {
         Tier::One
-    } else if gates.gates_0_to_2_pass {
+    } else if gates.gates_0_to_2.holds() {
         // §9.6 Tier 2: gates 0-2 pass, and at least one Gate-3 conjunct failed,
         // or a ceiling is active, or the ladder rung is below R2. In this build
-        // that is always true, because the rung cannot be computed at all.
+        // the second half is always true, because the rung cannot be computed at
+        // all.
+        //
+        // `holds()`, so a caller that did not RUN gates 0-2 lands in Tier 3
+        // rather than being credited with a pass. §9.6 makes Tier 3
+        // "everything else", and a candidate whose preconditions were never
+        // evaluated is squarely that.
         Tier::Two
     } else {
         Tier::Three

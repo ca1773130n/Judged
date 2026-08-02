@@ -14,8 +14,8 @@ use judged_core::ledger::{
 /// Everything the gates can currently say, at its most permissive.
 fn clean_gates() -> GateState {
     GateState {
-        gates_0_to_2_pass: true,
-        gate_3f_clear: true,
+        gates_0_to_2: Outcome::Satisfied,
+        gate_3f: Outcome::Satisfied,
     }
 }
 
@@ -210,8 +210,8 @@ fn a_failed_gate_demotes_and_gate_3f_is_named() {
     let refused = assign(
         &ledger,
         GateState {
-            gates_0_to_2_pass: true,
-            gate_3f_clear: false,
+            gates_0_to_2: Outcome::Satisfied,
+            gate_3f: Outcome::Failed,
         },
     );
     assert_eq!(
@@ -227,8 +227,8 @@ fn a_failed_gate_demotes_and_gate_3f_is_named() {
     let vetoed = assign(
         &ledger,
         GateState {
-            gates_0_to_2_pass: false,
-            gate_3f_clear: true,
+            gates_0_to_2: Outcome::Failed,
+            gate_3f: Outcome::Satisfied,
         },
     );
     assert_eq!(
@@ -288,4 +288,95 @@ fn an_empty_ledger_totals_positive_zero() {
     let mut capped = Ledger::new();
     capped.record(Evidence::new(Family::H, "90d-1y", 0.0));
     assert_eq!(format!("{:.2}", capped.total_bans()), "0.00");
+}
+
+/// **The answer must not depend on the order evidence arrived.**
+///
+/// Found by review. An earlier fold used `max` for positive bans and `min` for
+/// negative ones against a single running slot, so H rows of `+0.5` then `-0.8`
+/// totalled `-0.6`, and the same two in the opposite order totalled `+0.5`. A
+/// deadness score that changes with the order a tool happened to emit its
+/// findings is the defect this codebase rejects everywhere else.
+#[test]
+fn the_total_does_not_depend_on_the_order_evidence_was_recorded() {
+    let rows = [
+        Evidence::new(Family::H, "single commit ever AND <2y old", 0.5),
+        Evidence::new(Family::H, "single commit ever AND >4y old", -0.8),
+        Evidence::new(Family::R, "dynamic language", 0.4),
+        Evidence::new(Family::R, "zero textual occurrences", 1.0),
+    ];
+
+    let mut forwards = Ledger::new();
+    for row in rows.iter().cloned() {
+        forwards.record(row);
+    }
+    let mut backwards = Ledger::new();
+    for row in rows.iter().rev().cloned() {
+        backwards.record(row);
+    }
+
+    assert_eq!(forwards.total_bans(), backwards.total_bans());
+}
+
+/// §9.5 twice over: family H *"may only subtract"*, and its positive rows are
+/// unvalidated against §6.18's measurement that age is anti-predictive, so the
+/// implementation rule is to **ship them at 0.0**.
+///
+/// The previous H test only checked `accuses()`, so a positive H row was
+/// silently inflating the total while the suite stayed green.
+#[test]
+fn a_positive_history_row_contributes_nothing_to_the_total() {
+    let mut only_positive = Ledger::new();
+    only_positive.record(Evidence::new(Family::H, "last touched 1-2y", 0.3));
+    assert_eq!(
+        only_positive.total_bans(),
+        0.0,
+        "H may only subtract, so its positive rows ship at 0.0 (§9.5)"
+    );
+
+    let mut mixed = Ledger::new();
+    mixed
+        .record(Evidence::new(Family::R, "zero textual occurrences", 1.0))
+        .record(Evidence::new(
+            Family::H,
+            "single commit ever AND <2y old",
+            0.5,
+        ))
+        .record(Evidence::new(
+            Family::H,
+            "neighbours churn while it does not",
+            0.2,
+        ));
+    assert!(
+        (mixed.total_bans() - 1.0).abs() < 1e-9,
+        "R's 1.0 alone; two positive H rows add nothing"
+    );
+}
+
+/// **A gate nobody ran is not a gate that passed.**
+///
+/// Found by review, and it is §6.20's inversion committed inside the module
+/// written to prevent it: `explain` runs Gate 0g and Gate 1 only, and reported
+/// Tier 2 by passing Gate 1's verdict as though it answered for Gates 0-2.
+/// `GateState` is tri-state now, and its `Default` is "nothing evaluated" so a
+/// caller that forgets a field gets a demotion rather than a promotion.
+#[test]
+fn an_unrun_gate_demotes_rather_than_being_credited_with_a_pass() {
+    let mut ledger = Ledger::new();
+    ledger.record(Evidence::new(Family::R, "zero textual occurrences", 1.0));
+
+    let unrun = assign(&ledger, GateState::default());
+    assert_eq!(
+        unrun.tier(),
+        Tier::Three,
+        "gates 0-2 were never evaluated, so §9.6's Tier 2 precondition is not met"
+    );
+    assert!(unrun
+        .criteria()
+        .iter()
+        .any(|c| c.name == "gates 0-2 pass" && c.outcome == Outcome::NotEvaluable));
+
+    // And the contrast, so this is not just "everything is Tier 3".
+    let ran = assign(&ledger, clean_gates());
+    assert_eq!(ran.tier(), Tier::Two);
 }

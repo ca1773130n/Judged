@@ -2,13 +2,16 @@
 
 **Date:** 2026-08-02 · **HEAD:** `8ce8cad` · **Tests:** 819 · **CI:** green
 
-> **Partly answered since.** §2 and §7 — wire lcov ingestion as a fourth rescue layer with an
-> `FNDA`-granularity positive control — are implemented; the layer ships and rescues nothing,
-> because the fixtures carry no artifacts. §2.4's open question, how the catalogue produces
-> coverage, is settled in
-> [`docs/decisions/2026-08-02-e2-coverage-artifacts.md`](../decisions/2026-08-02-e2-coverage-artifacts.md).
-> Everything else here — §3's tripwire, §4's toolchain notes, §5's traps, §6's backlog — still
-> stands and is still the thing to read first.
+> **Answered since; superseded in part.** §2, §2.4 and §7 are done — the layer ships, the nineteen
+> declarations exist, and the suite has been re-measured. See
+> [`2026-08-02-family-x-landed-family-b-is-next.md`](./2026-08-02-family-x-landed-family-b-is-next.md)
+> for what happened and what to do next, and
+> [`docs/decisions/2026-08-02-e2-coverage-artifacts.md`](../decisions/2026-08-02-e2-coverage-artifacts.md)
+> for the rule the fixtures were generated under and the measurement.
+>
+> Everything else here still stands and is still worth reading first: §3's tuning tripwire, §4's
+> toolchain notes, §5's traps, §6's backlog. The blocking item named in §2 has moved rather than
+> disappeared — it is Family **B** now, for the same §9.5 reason.
 
 Read [`docs/decisions/2026-08-02-r1-determination.md`](../decisions/2026-08-02-r1-determination.md)
 first. It is the standing determination on §11 R1 and it constrains what the next session is

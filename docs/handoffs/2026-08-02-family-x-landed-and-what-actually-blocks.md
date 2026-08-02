@@ -49,6 +49,25 @@ Which means the next step is not "add a signal". It is the determination's §7 o
 the only specified gate that does not exist, and the one §7 says would speak to m11 and to classes
 15–19 as a group.** Family B is item 3; root-set completion for the §5.2 sources is item 4.
 
+### 2.1 Item 2, since: 3f built, and the rest of Gate 3 is blocked on the ledger
+
+3f shipped and it refuses m12's `//export`, m19's `#[no_mangle]`, m16's pickle and m15's Celery
+worker. deadcode went to zero. Only vulture's m11 survives across the whole catalogue.
+
+**Item 2 is not fully discharged, and the remainder is not more of the same work.** 3a–3d are
+directory conjuncts — a known build-artifact directory, its toolchain present, no Gate-1 content
+inside, no non-ignored file inside — and they are *Tier-0 promotion preconditions*. There is no tier
+assignment for them to be preconditions of, so building them now produces a gate with nothing to
+gate. 3e is the family quorum outright and needs the ban ledger by definition.
+
+3f was different, and that difference is the reason it was buildable alone: it is an absorbing
+refusal, so it stands on its own exactly as Gate 1 does. The rest of Gate 3 does not.
+
+So the honest reading of §7 after this session: the items with standalone value are **item 4**
+(root-set completion for the §5.2 sources — concrete, named, and it speaks to m18, m13 and m19) and
+**the ban ledger with §9.6's tier model**, which is not on §7's list in its own right but which item
+8 depends on entirely — *"until a tier is assigned to anything, none is computable at all."*
+
 ---
 
 ## 3. What the measurement actually showed
@@ -143,8 +162,13 @@ cargo run -q -p judged-cli -- mutants --sut knip --gate1 --veto --roots --covera
 
 ## 7. Backlog, unchanged except where noted
 
-- **Gate 3, and 3f.** The determination's §7 item 2, and the only specified gate that does
-  not exist. See §2.
+- **Gate 3a–3e.** 3f is built (§2.1). The rest are Tier-0 promotion preconditions and 3e is the
+  family quorum, so both wait on the ledger below.
+- **A finding-by-review lesson worth keeping.** 3f's queue condition missed m15 — the very class
+  it exists for — because the naive SUT never claims m15's live artifacts, so every measurement
+  ran past it and the catalogue stayed green. A gate that silently does not fire on the class it
+  was built for is invisible to a suite that never asks. Assert per-class, at fixture level, that
+  a gate fires where its specification says it should.
 - **A ban ledger and the §9.6 tier model.** Nothing computes bans, so no family can accuse. §7
   item 8 depends on it: until a tier is assigned to anything, none of §10's headline metrics is
   computable.

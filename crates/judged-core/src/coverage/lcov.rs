@@ -121,13 +121,21 @@ impl FileCoverage {
     /// entered.
     ///
     /// Line granularity is right *here* and wrong for a symbol, and the
-    /// difference is §2.3's whole point. In Python, Ruby and JavaScript the
-    /// `def`, `class` and module-level lines execute at **import**, so a module
-    /// that is merely imported reports covered lines while every function body
-    /// reads dead. For a file claim that is still proof: something loaded this
-    /// file, so it is not an orphan and the claim must be dropped. For a symbol
-    /// claim it proves nothing, which is why [`Coverage::called_function`] reads
-    /// `FNDA` and never touches a line.
+    /// difference is §2.3's whole point: a module that is merely imported
+    /// reports covered lines while every function body reads dead. For a file
+    /// claim that is still proof — something loaded this file, so it is not an
+    /// orphan and the claim must be dropped. For a symbol claim it proves
+    /// nothing, which is why [`Coverage::called_function`] reads `FNDA` and
+    /// never touches a line.
+    ///
+    /// Measured against real tracefiles rather than assumed, and the two
+    /// ecosystems get there differently — see
+    /// `tests/coverage_real_artifacts.rs`. Coverage.py records `DA:7,1` on a
+    /// `def` line whose body is `DA:8,0`, because the definition really does
+    /// execute at import. c8 records `DA:9,0` on the equivalent JavaScript
+    /// declaration, because a hoisted `function` is not an executed statement in
+    /// its model. Same conclusion by two mechanisms: a covered line is never
+    /// evidence that a function ran.
     pub fn was_executed(&self) -> bool {
         self.lines_hit > 0 || self.functions.iter().any(FunctionCoverage::was_called)
     }

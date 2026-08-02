@@ -2416,7 +2416,14 @@ fn walk(repo_root: &Path, rel_dir: &Path, files: &mut Vec<PathBuf>) -> ManifestR
             continue;
         }
         if meta.is_dir() {
-            if !SKIPPED_DIRECTORIES.contains(&name) {
+            // The name list is noise filtering (node_modules, target). §9.3 0b
+            // is a different question: a linked worktree and a submodule carry
+            // `.git` as a FILE and a bare `vendor/foo.git/` carries none, so a
+            // name match alone let Tier A read another repository's manifests
+            // and materialize roots from them.
+            if !SKIPPED_DIRECTORIES.contains(&name)
+                && !crate::boundary::classify(&repo_root.join(&rel)).stops_the_walk()
+            {
                 walk(repo_root, &rel, files)?;
             }
         } else {

@@ -126,10 +126,6 @@ pub const ENUMERATION_CONSTRUCTS: &[&str] = &[
     "getdirectories(",
 ];
 
-/// Never descended into: git's object store is not tracked content, and its
-/// packfiles are not references.
-const SKIPPED_DIRECTORY: &str = ".git";
-
 /// Characters that make a path component a pattern rather than a name.
 const GLOB_METACHARACTERS: [char; 4] = ['*', '?', '[', '{'];
 
@@ -424,9 +420,6 @@ impl Scan {
                 };
 
                 let name = entry.file_name();
-                if name == SKIPPED_DIRECTORY {
-                    continue;
-                }
                 let child = relative.join(&name);
 
                 let file_type = match entry.file_type() {
@@ -441,6 +434,18 @@ impl Scan {
                     continue;
                 }
                 if file_type.is_dir() {
+                    // §9.3 0b, through the shared classifier. A name comparison
+                    // missed a linked worktree, a submodule and a bare
+                    // `vendor/foo.git/`, so 2b/2c enumerated another
+                    // repository's directories as though they were this one's —
+                    // and an enumerated directory is what rescues a candidate.
+                    let boundary = crate::boundary::classify(&self.root.join(&child));
+                    if boundary.stops_the_walk() {
+                        if let crate::boundary::Boundary::Unreadable(why) = &boundary {
+                            self.incomplete_read(&child, why.clone());
+                        }
+                        continue;
+                    }
                     self.directories.insert(child.clone());
                     pending.push(child);
                 } else if file_type.is_file() {

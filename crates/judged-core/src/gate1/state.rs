@@ -1023,7 +1023,20 @@ impl StateGate {
                 }
 
                 if file_type.is_dir() {
-                    if child.file_name().is_some_and(|name| name == ".git") {
+                    // §9.3 0b, through the shared classifier. `name == ".git"`
+                    // misses a linked worktree and a submodule (.git is a FILE)
+                    // and a bare `vendor/foo.git/` (no .git at all). This gate
+                    // keeps a gap list, so an unreadable probe is recorded as
+                    // well as stopping the walk.
+                    let boundary = crate::boundary::classify(&child);
+                    if let crate::boundary::Boundary::Unreadable(why) = &boundary {
+                        gate.gaps.push(format!(
+                            "did not descend into {}: {why}. Not evidence that nothing is \
+                             there (§6.20).",
+                            gate.display_path(&child)
+                        ));
+                    }
+                    if boundary.stops_the_walk() {
                         continue;
                     }
                     stack.push(child);

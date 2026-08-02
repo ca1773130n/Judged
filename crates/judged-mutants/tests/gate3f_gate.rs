@@ -227,6 +227,43 @@ fn a_type_whose_only_consumer_is_a_pickled_blob_is_refused() {
         .any(|r| r.conditions.contains(&Condition::Serializable)));
 }
 
+/// m15 is §6.24's canonical queue-payload shape, and this test exists because
+/// the gate built for it originally missed it.
+///
+/// `worker/tasks.py` spells its dependency `from .celery_app import app`, and
+/// framework names were matched at word boundaries — where `_` is an identifier
+/// character, so `celery` inside `celery_app` is not a whole word. The condition
+/// that exists for this class did not fire on this class, and no test said so,
+/// because the naive SUT never claims m15's live artifacts and every measurement
+/// therefore ran past it. Found by review, not by the suite.
+#[test]
+fn the_canonical_queue_payload_class_is_refused() {
+    let materialized = fixture("m15");
+    let (layer, _, after) = run(&materialized);
+    let run = &layer.runs()[0];
+
+    assert!(
+        run.refused
+            .iter()
+            .any(|r| r.claim == "RebuildInvoiceIndex"
+                && r.conditions.contains(&Condition::QueuePayload)),
+        "the worker class named only inside an already-enqueued payload must be \
+         refused; refused {:?}, frameworks {:?}",
+        run.refused.iter().map(|r| &r.claim).collect::<Vec<_>>(),
+        run.frameworks
+    );
+
+    // And the mirror, so this is not a class the gate simply swallowed.
+    let survivors = names(&after);
+    for decoy in &materialized.truth.decoy_dead_paths {
+        assert!(
+            survivors.contains(&decoy.display().to_string()),
+            "3f refused the decoy {}, which is genuinely dead",
+            decoy.display()
+        );
+    }
+}
+
 /// **m11 is not refused, and that is a finding rather than a defect.**
 ///
 /// §7 of the R1 determination expected 3f to *"speak to m11"*. Implemented from

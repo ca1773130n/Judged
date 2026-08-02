@@ -69,8 +69,11 @@ preconditions were computable at all.
 
 ## 3. What to do next, in the order the evidence supports
 
-**1. Gate 0a–0f.** Two of its conjuncts are the cheapest safety work outstanding anywhere in this
-project — **0e never touch `.git/`** and **0a never traverse a symlink** — and both are refusals
+**1. Gate 0a–0f.** Designed and adversarially reviewed since — see
+[`docs/decisions/2026-08-02-gate0-design-record.md`](../decisions/2026-08-02-gate0-design-record.md),
+which carries the fixed contract, forty-one verified corrections to §9.3, and a bug it found in
+`gate1/state.rs:868`. No code shipped; the record says why. Two of its conjuncts are the cheapest
+safety work outstanding anywhere in this project — **0e never touch `.git/`** and **0a never traverse a symlink** — and both are refusals
 with no measurement behind them, so their absence is the difference between a bug and an
 unrecoverable one. 0d and 0f cost nearly as little, and they are what stops a run acting on a tree
 somebody is mid-rebase in. Per line written, nothing else here changes what the tool is permitted

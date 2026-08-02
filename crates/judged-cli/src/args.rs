@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 
 use judged_core::veto::literal::NeedleStrategy;
+use judged_mutants::coverage::DEFAULT_ARTIFACT;
 use judged_mutants::sut::DEFAULT_NEEDLES;
 use judged_ratchet::baseline::BASELINE_PATH;
 
@@ -169,6 +170,23 @@ pub struct MutantsArgs {
     /// combined-only flag would report a rescue without saying which layer
     /// earned it.
     pub roots: bool,
+    /// Ingest an lcov tracefile and let observed execution rescue (§9.5,
+    /// Family X).
+    ///
+    /// The only flag here that turns on a signal from outside Family R. §9.5
+    /// requires a quorum of at least two of {B, R, X} for a Tier-0 action, and
+    /// every other layer in this binary reasons about references — so this is
+    /// the flag that makes a quorum expressible at all.
+    ///
+    /// Off by default like the rest, and for the same reason: the number the
+    /// suite has always published is what the analyzer does unprotected.
+    pub coverage: bool,
+    /// Where the tracefile lives, relative to each graded repository's root.
+    ///
+    /// Relative rather than absolute because the suite hands the layer a
+    /// different repository per class; one absolute artifact would answer every
+    /// class with the same file.
+    pub coverage_artifact: PathBuf,
     /// Emit the report as JSON instead of as text.
     pub json: bool,
 }
@@ -425,8 +443,8 @@ USAGE:
     judged ratchet --sarif <path>... [--baseline <path>] [--update]
                                      [--expected-targets <n>]
     judged mutants [--sut <sut>] [--gate1] [--veto [--needles <strategy>]] [--roots]
-                   [--json]
-    judged mutants --sut command [--gate1] [--veto] [--roots] [--json]
+                   [--coverage [--coverage-artifact <path>]] [--json]
+    judged mutants --sut command [--gate1] [--veto] [--roots] [--coverage] [--json]
                    -- <analyzer> [args...]
     judged show-roots [--json] [<path>]
     judged explain [--json] <path>
@@ -510,6 +528,25 @@ MUTANTS (§10 E2) — inject 19 known-live artifacts and see what gets called de
                                bare, --veto, --roots and both are four measurable
                                configurations, and a combined-only flag would hide
                                which layer earned a rescue.
+    --coverage                 Ingest an lcov tracefile and let OBSERVED EXECUTION
+                               rescue (§9.5, Family X). The only signal here that
+                               is not about references: a hit is proof of use and
+                               drops the claim; a MISS contributes zero at any
+                               tier, because an untested path is systematically
+                               the valuable one — error handlers, recovery paths,
+                               platform branches. Ingests, never collects: running
+                               the target's test suite to produce coverage would
+                               execute its whole lockfile here (§9.10).
+                               An artifact is never believed without a positive
+                               control beside it at <artifact>.control naming
+                               always-live symbols (§3.7). Missing artifact,
+                               missing control, unparseable either, or a failing
+                               control all rescue NOTHING and are reported as a
+                               gap — a zero with no artifact behind it must not
+                               read like a zero over a covered repository.
+    --coverage-artifact <path> Where the tracefile is, relative to each graded
+                               repository. Requires --coverage; refused without it.
+                               Default: coverage/lcov.info
     --json                     Machine-readable report. Under --veto it also
                                carries the conflict list: for every blocked claim,
                                which needle fired and in which file (§9.13, §7.3).
@@ -805,7 +842,13 @@ fn parse_mutants<'a>(
     // run with it silently on would not be comparable to any number this suite
     // has published.
     let mut gate1 = false;
+    // And likewise off by default, though for one extra reason: this is the only
+    // layer whose evidence comes from outside the repository, so a run with it
+    // silently on would publish a number that depends on an artifact the report
+    // never mentioned.
+    let mut coverage = false;
     let mut needles: Option<&str> = None;
+    let mut coverage_artifact: Option<&str> = None;
 
     while let Some(word) = rest.next() {
         match word {
@@ -814,6 +857,10 @@ fn parse_mutants<'a>(
             "--veto" => veto = true,
             "--gate1" => gate1 = true,
             "--roots" => roots = true,
+            "--coverage" => coverage = true,
+            "--coverage-artifact" => {
+                coverage_artifact = Some(value("--coverage-artifact", &mut rest)?)
+            }
             "--needles" => needles = Some(value("--needles", &mut rest)?),
             other => return Err(usage(format!("`{other}` is not a `judged mutants` flag."))),
         }
@@ -832,6 +879,19 @@ fn parse_mutants<'a>(
                 .to_string(),
         ));
     }
+    // Refused rather than ignored, for exactly the reason `--needles` is: it
+    // configures a layer that is not in the stack, so accepting it would let two
+    // command lines that look different produce the same run.
+    if coverage_artifact.is_some() && !coverage {
+        return Err(usage(
+            "`--coverage-artifact` says where the lcov tracefile is, which only matters under \
+             `--coverage`. Without it no artifact is read at all and the flag would change \
+             nothing about the run — so it is refused rather than accepted and ignored."
+                .to_string(),
+        ));
+    }
+    let coverage_artifact = PathBuf::from(coverage_artifact.unwrap_or(DEFAULT_ARTIFACT));
+
     let needles = match needles {
         None => DEFAULT_NEEDLES,
         Some(given) => NEEDLE_STRATEGIES
@@ -880,6 +940,8 @@ fn parse_mutants<'a>(
         veto,
         gate1,
         roots,
+        coverage,
+        coverage_artifact,
         needles,
         json,
     })

@@ -32,12 +32,13 @@
 //! because turning it into an exit code would let a fixture author raise a
 //! green by planting easier decoys.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use judged_core::veto::literal::{NeedleKind, NeedleStrategy};
 use judged_mutants::adapters::{deadcode, knip, shear, vulture};
+use judged_mutants::coverage::{CoverageRescue, CoveredSut};
 use judged_mutants::fixtures;
 use judged_mutants::gate1::{Gate1Sut, RefusedClaim};
 use judged_mutants::mutant::{Ecosystem, Mutant};
@@ -227,9 +228,10 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
     // weigh. Each layer keeps its own per-claim record, which is what lets the
     // report say which layer earned a rescue instead of publishing one combined
     // number.
-    let (report, rescue) = if args.gate1 || args.veto || args.roots {
+    let (report, rescue) = if args.gate1 || args.veto || args.roots || args.coverage {
         let mut stacked: Box<dyn Sut> = build_sut(&args.sut);
         let mut gate_one: Option<Rc<Gate1Sut>> = None;
+        let mut covered: Option<Rc<CoveredSut>> = None;
         let mut rooted: Option<Rc<RootedSut>> = None;
         let mut vetoed: Option<Rc<VetoedSut>> = None;
         // Innermost, so it runs FIRST. §9.3 orders the gates and Gate 1 comes
@@ -241,6 +243,21 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
             let layer = Rc::new(Gate1Sut::new(stacked));
             stacked = Box::new(Rc::clone(&layer));
             gate_one = Some(layer);
+        }
+        // Next, and ahead of both Family-R layers on purpose. Every rescue layer
+        // here is a pure filter, so the order cannot change the final claim set
+        // — but it decides which layer is on the record for a claim that more
+        // than one of them would have dropped, and that attribution is what §11
+        // R1 is asking about. "This function ran 4,281 times" and "some file
+        // spells its name" are not the same evidence, and crediting the second
+        // when the first was available would overstate what a needle earned.
+        if args.coverage {
+            let layer = Rc::new(CoveredSut::with_artifact(
+                stacked,
+                args.coverage_artifact.clone(),
+            ));
+            stacked = Box::new(Rc::clone(&layer));
+            covered = Some(layer);
         }
         if args.roots {
             let layer = Rc::new(RootedSut::new(stacked));
@@ -274,6 +291,9 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
         let mut layers: Vec<Layer> = Vec::new();
         if let Some(layer) = &gate_one {
             layers.push(gate1_layer(layer));
+        }
+        if let Some(layer) = &covered {
+            layers.push(coverage_layer(layer));
         }
         if let Some(layer) = &rooted {
             layers.push(roots_layer(layer));
@@ -368,6 +388,51 @@ fn roots_layer(layer: &RootedSut) -> Layer {
                 claimed: run.claimed,
                 survived: run.survived,
                 dropped: run.rescued.iter().map(Dropped::from_rescued).collect(),
+            })
+            .collect(),
+    }
+}
+
+/// The coverage layer's accounting, normalized.
+///
+/// The `config` string leads with the number of classes that had a **believed**
+/// artifact, and that number is the whole reason this function is not two lines.
+/// A rescue count with no denominator is §6.20's shape at its purest here: zero
+/// rescues over nineteen classes with no tracefile, and zero rescues over
+/// nineteen fully covered ones, are the same integer and opposite findings. The
+/// gaps are printed by cause for the same reason — "no artifact" is an ordinary
+/// fact about a fixture, while "failed its control" is a broken measurement
+/// somebody has to go and fix.
+fn coverage_layer(layer: &CoveredSut) -> Layer {
+    let runs = layer.runs();
+    let believed = runs.iter().filter(|run| run.had_coverage()).count();
+    let mut causes: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for run in runs.iter().filter_map(|run| run.gap.as_ref()) {
+        *causes.entry(run.kind()).or_insert(0) += 1;
+    }
+    let gaps = if causes.is_empty() {
+        "no gaps".to_string()
+    } else {
+        causes
+            .into_iter()
+            .map(|(cause, count)| format!("{count} {cause}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    Layer {
+        name: COVERAGE,
+        config: format!(
+            "lcov {}, {believed} of {} class(es) had an artifact that passed its control ({gaps})",
+            layer.artifact().display(),
+            runs.len()
+        ),
+        runs: runs
+            .iter()
+            .map(|run| LayerRun {
+                claimed: run.claimed,
+                survived: run.survived,
+                dropped: run.rescued.iter().map(Dropped::from_covered).collect(),
             })
             .collect(),
     }
@@ -478,6 +543,39 @@ impl Dropped {
         }
     }
 
+    /// A rescue by observed execution.
+    ///
+    /// `rule` is `fnda` or `lines`, which is the one distinction a reader of this
+    /// layer most needs: `fnda` means the function was entered, and `lines`
+    /// means only that something in the file ran — which in Python, Ruby and
+    /// JavaScript happens at import (§2.3). Collapsing the two into "covered"
+    /// would present the weaker fact with the stronger one's confidence.
+    ///
+    /// `found_in` is the `SF:` path exactly as the tracefile spelled it, which is
+    /// a path on whichever machine ran the tests. Left un-rewritten deliberately:
+    /// a reader checking a rescue needs to see that the evidence came from
+    /// somewhere else, and a locally-plausible path would hide it.
+    fn from_covered(record: &CoverageRescue) -> Dropped {
+        Dropped {
+            layer: COVERAGE,
+            claim: record.claim.clone(),
+            kind: record.kind.as_str(),
+            rule: match record.calls {
+                Some(_) => "fnda".to_string(),
+                None => "lines".to_string(),
+            },
+            gate: None,
+            tier: None,
+            class: None,
+            origin: None,
+            needle: record.function.clone(),
+            needle_kind: record.calls.map(|calls| format!("{calls} call(s)")),
+            found_in: Some(record.source.clone()),
+            declared_in: None,
+            detail: record.detail.clone(),
+        }
+    }
+
     /// A Gate 1 refusal.
     ///
     /// `rule` carries the §9.3 class code, because the class IS the rule that
@@ -535,6 +633,7 @@ struct Layer {
 /// in the SUT name, and three spellings of the same layer is how a consumer ends
 /// up matching on the one this build does not emit.
 const GATE1: &str = "gate1";
+const COVERAGE: &str = "coverage";
 const ROOTS: &str = "roots";
 const VETO: &str = "veto";
 
@@ -1526,6 +1625,25 @@ fn render_text(
                      root is a guess about a framework.\n\n",
                     layer.config
                 ),
+                GATE1 => format!(
+                    "Gate 1 (§9.3) — the never-touch inventory — ran BEFORE anything else, on \
+                     every\nclaim this analyzer made: {}.\nIts refusals are about the cost of \
+                     being wrong, not about usefulness: a claim it\nrefuses is never handed to a \
+                     later layer, so there is no evidence to override it.\n\n",
+                    layer.config
+                ),
+                COVERAGE => format!(
+                    "Observed execution (§9.5, Family X) was ingested for every fixture and ran \
+                     on\nevery claim: {}.\nA HIT is proof of use and drops the claim. A MISS \
+                     contributes ZERO at any tier, because\nthe untested path is systematically \
+                     the valuable one. An artifact with no positive\ncontrol beside it, or one \
+                     that fails it, is discarded whole and rescues nothing (§3.7).\n\n",
+                    layer.config
+                ),
+                // Gate 2. The catch-all rather than a named arm because the veto
+                // is the layer every other one is described relative to, and a
+                // fifth layer arriving with no headline of its own should read
+                // as the generic case rather than silently claim to be Gate 1.
                 _ => format!(
                     "Gate 2 (§9.3) ran on every claim this analyzer made: {}.\n\
                      A veto can only RESCUE, never nominate, so the gated claim set is a subset \
@@ -1834,6 +1952,15 @@ fn render_json(
                 .contains(&GATE1)
                 .then(|| layer_row(GATE1, "refused_claims"))
                 .flatten();
+            // A fourth verb, and it is the one word none of the other three can
+            // carry: this layer does not weigh evidence about a claim, it
+            // reports that the artifact WAS EXECUTED. Calling it "rescued"
+            // alongside the root set would file direct observation under the
+            // same word as a framework convention that was inferred.
+            let coverage_row = layer_names
+                .contains(&COVERAGE)
+                .then(|| layer_row(COVERAGE, "executed_claims"))
+                .flatten();
             let veto_row = layer_names
                 .contains(&VETO)
                 .then(|| layer_row(VETO, "blocked_claims"))
@@ -1862,6 +1989,7 @@ fn render_json(
                 // In the order the layers run (§9.3), so a reader following the
                 // trace reads it the way the pipeline evaluated it.
                 "gate1": gate1_row,
+                "coverage": coverage_row,
                 "veto": veto_row,
                 "roots": roots_row,
             })

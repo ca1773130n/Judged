@@ -12,6 +12,7 @@
 //! weeks rather than after an incident.
 
 pub mod adapters;
+pub mod coverage;
 pub mod fixtures;
 pub mod gate1;
 pub mod mutant;

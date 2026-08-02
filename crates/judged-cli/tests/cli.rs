@@ -1326,6 +1326,44 @@ fn an_unknown_needle_strategy_lists_the_ones_that_exist() {
     }
 }
 
+/// An artifact path with no layer to read it is refused, not ignored — the same
+/// rule `--needles` is held to, and for the same reason.
+#[test]
+fn a_coverage_artifact_without_the_coverage_layer_is_refused() {
+    let repo = scratch("mutants-coverage-no-layer");
+
+    let run = judged(
+        repo.path(),
+        &[
+            "mutants",
+            "--sut",
+            "refusing",
+            "--coverage-artifact",
+            "build/lcov.info",
+        ],
+    );
+    run.expect_code(2, "a flag that configures a layer that is not running");
+    run.expect_says("--coverage");
+}
+
+/// The catalogue ships no coverage artifacts, so the honest report of a
+/// `--coverage` run is nineteen gaps and zero rescues — and this test exists to
+/// pin that it says so rather than printing a bare zero.
+///
+/// §6.20 in its sharpest form: zero rescues over nineteen classes with no
+/// tracefile, and zero rescues over nineteen fully covered ones, are the same
+/// integer and opposite findings. The denominator is what tells them apart, and
+/// a report that dropped it would look like the layer had been measured.
+#[test]
+fn a_coverage_run_with_no_artifacts_reports_the_denominator_not_a_bare_zero() {
+    let repo = scratch("mutants-coverage-no-artifacts");
+
+    let run = judged(repo.path(), &["mutants", "--sut", "refusing", "--coverage"]);
+    run.expect_says("Observed execution");
+    run.expect_says("0 of 19 class(es) had an artifact that passed its control");
+    run.expect_says("19 no-artifact");
+}
+
 // ---------------------------------------------------------------------------
 // judged mutants against an external analyzer
 //

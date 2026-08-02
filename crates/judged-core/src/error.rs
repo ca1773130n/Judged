@@ -53,6 +53,16 @@ pub enum Error {
     /// The ratchet baseline is unusable.
     #[error("baseline: {0}")]
     Baseline(String),
+
+    /// A coverage artifact or its positive control could not be read.
+    ///
+    /// Its own variant rather than [`Error::Io`] or a parse error because the
+    /// remediation is different in kind: a malformed tracefile is not a missing
+    /// file, and neither is a control that asserts nothing. The path is carried
+    /// for the same reason [`Error::Io`] carries one — "malformed" without the
+    /// document is unactionable.
+    #[error("coverage: {path}: {message}")]
+    Coverage { path: PathBuf, message: String },
 }
 
 /// Workspace-wide result alias.

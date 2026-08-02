@@ -43,7 +43,7 @@ use std::path::Path;
 use judged_core::git::Repo;
 use judged_core::{Error, Result};
 
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// `.vscode/settings.json` and `media/customer/.htaccess`: deliberately rescued
 /// from a broad ignore rule, which makes the negation itself the statement
@@ -207,6 +207,12 @@ impl Mutant for GitignoreNegation {
     fn research_ref(&self) -> &str {
         "§10 E2 class 13"
     }
+    /// An `.htaccess` and an editor config, rescued from a broad ignore rule. Neither
+    /// is code, and nothing executes them in a test process.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::nothing()
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         for (relative, body) in FILES.iter().chain(IGNORED_SIBLINGS.iter()) {

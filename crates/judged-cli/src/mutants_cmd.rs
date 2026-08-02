@@ -43,7 +43,9 @@ use judged_mutants::fixtures;
 use judged_mutants::gate1::{Gate1Sut, RefusedClaim};
 use judged_mutants::mutant::{Ecosystem, Mutant};
 use judged_mutants::roots::{RescuedClaim, RootedSut};
-use judged_mutants::runner::{reads_mutant, run_suite, Grade, MutantReport, SuiteReport};
+use judged_mutants::runner::{
+    reads_mutant, run_suite_with, Grade, MutantReport, SuiteOptions, SuiteReport,
+};
 use judged_mutants::sut::{
     BlockedClaim, CommandSut, GateSet, NaiveSut, RefusingSut, Sut, SutVerdict, VetoedSut,
 };
@@ -191,7 +193,20 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
 
     let sut = build_sut(&args.sut);
 
-    let report = match run_suite(sut.as_ref(), &mutants) {
+    // Planted for BOTH runs when `--coverage` is on, never for one of them.
+    // The bare run is the baseline the gated run is subtracted from, so the two
+    // have to differ in the layer and in nothing else — a tracefile present in
+    // only one of them is an extra file for the analyzer to have an opinion
+    // about, and its claims would land in the difference as though a rescue
+    // layer had caused them. It does mean a `--coverage` bare run is not the
+    // same measurement as a bare run without it: the repository genuinely has
+    // one more file in it, which is what a real repository with CI coverage
+    // looks like. The layer's `config` line says so.
+    let options = SuiteOptions {
+        plant_coverage: args.coverage.then(|| args.coverage_artifact.clone()),
+    };
+
+    let report = match run_suite_with(sut.as_ref(), &mutants, &options) {
         Ok(report) => report,
         // A crashed harness is not a passing harness. §3.7: every catastrophic
         // failure in this space presented as an artifact reporting ~0% for
@@ -270,7 +285,7 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
             vetoed = Some(layer);
         }
 
-        let gated = match run_suite(stacked.as_ref(), &mutants) {
+        let gated = match run_suite_with(stacked.as_ref(), &mutants, &options) {
             Ok(gated) => gated,
             Err(error) => {
                 return (

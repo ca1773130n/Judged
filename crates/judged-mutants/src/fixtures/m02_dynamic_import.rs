@@ -37,7 +37,7 @@ use std::path::Path;
 use judged_core::git::Repo;
 use judged_core::{Error, Result};
 
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// Polyglot on purpose: the Python half uses `importlib.import_module` with
 /// a name built at runtime, the TypeScript half uses a template-literal
@@ -235,6 +235,16 @@ impl Mutant for DynamicImport {
     fn research_ref(&self) -> &str {
         "§10 E2 class 2"
     }
+    /// The whole mechanism is that the import happens at runtime, so a test that
+    /// exercises the entry point runs it and both modules load. Both live symbols
+    /// are classes, which carry no `FNDA` record.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::loaded([
+            "app/backends/redis_backend.py",
+            "src/transports/websocketTransport.ts",
+        ])
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         for (relative, body) in FILES {

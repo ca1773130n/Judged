@@ -27,7 +27,7 @@ use judged_core::git::Repo;
 use judged_core::Result;
 
 use crate::fixtures::write;
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// Django's `AppConfig` autoload and Jest's `__mocks__` directory in one
 /// repository: two frameworks, two conventions, neither expressed as an
@@ -55,6 +55,14 @@ impl Mutant for FrameworkConvention {
     fn research_ref(&self) -> &str {
         "§10 E2 class 10"
     }
+    /// Both conventions fire in a test process: Django's boot scans `apps.py` and
+    /// instantiates the config, and Jest substitutes the `__mocks__` file when a
+    /// test imports the mocked package. `ReportingConfig` is a class, so the
+    /// symbol claim — the one Gate 2 also cannot reach — gets nothing.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::loaded(["reporting/apps.py", "__mocks__/redis.js"])
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         let root = repo.root().to_path_buf();

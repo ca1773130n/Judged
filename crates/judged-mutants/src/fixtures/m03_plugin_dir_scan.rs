@@ -25,7 +25,7 @@ use judged_core::git::Repo;
 use judged_core::Result;
 
 use crate::fixtures::write;
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// The loader iterates `plugins/*.py` at startup. Nothing names the plugin;
 /// its liveness is a property of where the file sits on disk, which is
@@ -45,6 +45,13 @@ impl Mutant for PluginDirScan {
     fn research_ref(&self) -> &str {
         "§10 E2 class 3"
     }
+    /// The host scans the directory at startup and imports what it finds, so a test
+    /// process loads the plugin. The live symbol is a **module** name, which is not
+    /// a function and has no `FNDA` record.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::loaded(["pluginhost/plugins/tsvwriter.py"])
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         let root = repo.root().to_path_buf();

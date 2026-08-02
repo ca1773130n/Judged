@@ -1347,21 +1347,24 @@ fn a_coverage_artifact_without_the_coverage_layer_is_refused() {
 }
 
 /// The catalogue ships no coverage artifacts, so the honest report of a
-/// `--coverage` run is nineteen gaps and zero rescues — and this test exists to
-/// pin that it says so rather than printing a bare zero.
+/// `--coverage` run reports **both** halves: how many classes carried a believed
+/// artifact and how many did not.
 ///
-/// §6.20 in its sharpest form: zero rescues over nineteen classes with no
+/// §6.20 in its sharpest form. Zero rescues over nineteen classes with no
 /// tracefile, and zero rescues over nineteen fully covered ones, are the same
-/// integer and opposite findings. The denominator is what tells them apart, and
-/// a report that dropped it would look like the layer had been measured.
+/// integer and opposite findings, so the denominator is the whole report. Twelve
+/// of the nineteen legitimately have no artifact — their mechanisms are reached
+/// by no test process (`judged-mutants/tests/coverage_declarations.rs`) — and
+/// that has to read as a property of the catalogue rather than as a layer that
+/// found nothing.
 #[test]
-fn a_coverage_run_with_no_artifacts_reports_the_denominator_not_a_bare_zero() {
-    let repo = scratch("mutants-coverage-no-artifacts");
+fn a_coverage_run_reports_the_denominator_and_not_a_bare_zero() {
+    let repo = scratch("mutants-coverage-denominator");
 
     let run = judged(repo.path(), &["mutants", "--sut", "refusing", "--coverage"]);
     run.expect_says("Observed execution");
-    run.expect_says("0 of 19 class(es) had an artifact that passed its control");
-    run.expect_says("19 no-artifact");
+    run.expect_says("7 of 19 class(es) had an artifact that passed its control");
+    run.expect_says("12 no-artifact");
 }
 
 // ---------------------------------------------------------------------------

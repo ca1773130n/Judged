@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use judged_core::git::Repo;
 use judged_core::{Error, Result};
 
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// Coverage-guided debloaters removed exactly this and shipped it. The
 /// handler runs on the day the system is already broken, which is the worst
@@ -185,6 +185,14 @@ impl Mutant for ErrorPathOnly {
     fn research_ref(&self) -> &str {
         "§10 E2 class 5"
     }
+    /// The recovery path is imported **inside the `except` branch**, so a run that
+    /// does not fail never loads the module at all — not the symbol, not the file.
+    /// This is §9.5's warning in its sharpest form: the coverage miss here is not
+    /// weak evidence of deadness, it is what a working system looks like.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::nothing()
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         for (rel, body) in FILES {

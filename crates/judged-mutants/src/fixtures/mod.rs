@@ -12,6 +12,8 @@
 //! documented incident, so the catalogue grows every time a new one is
 //! documented. Add classes; never remove one to make a run green.
 
+pub mod coverage;
+
 use std::path::Path;
 
 use judged_core::{Error, Result};

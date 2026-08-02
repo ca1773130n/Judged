@@ -6,9 +6,10 @@
 //! mechanism each**. Any "dead" verdict on an injected artifact is a hard
 //! failure — not a tuning opportunity.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use judged_core::Result;
+use judged_core::{Error, Result};
 
 /// The language ecosystem a mutant exercises.
 ///
@@ -84,6 +85,124 @@ pub struct GroundTruth {
     pub decoy_dead_symbols: Vec<String>,
 }
 
+/// What a test suite exercising one fixture's documented entry point actually
+/// enters.
+///
+/// Empty by default, which is the conservative reading — a class declares no
+/// execution until somebody states the mechanism reaches it. `fixtures::all()`
+/// is pinned by a table in `tests/coverage_declarations.rs` so that a class
+/// which simply forgot to declare fails loudly instead of quietly contributing
+/// nothing (the §6.20 shape: "did not run" and "nobody said" must not share a
+/// row).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Declaration {
+    /// Live paths a test run loads. **Import counts** — a module that is
+    /// imported and never otherwise touched has executed, and a claim that the
+    /// file is dead is therefore wrong.
+    pub covered_paths: Vec<PathBuf>,
+    /// Live symbols a test run calls, each with the live path that declares it.
+    ///
+    /// The declaring file is carried rather than inferred because most fixtures
+    /// have several live paths, and writing a function record into the wrong
+    /// one would make the artifact quietly false about where the code lives.
+    pub called_symbols: Vec<(PathBuf, String)>,
+}
+
+impl Declaration {
+    /// Nothing is entered: the class's live artifacts are all reached by a
+    /// mechanism no test process takes.
+    pub fn nothing() -> Declaration {
+        Declaration::default()
+    }
+
+    /// Files loaded, nothing called.
+    pub fn loaded(paths: impl IntoIterator<Item = &'static str>) -> Declaration {
+        Declaration {
+            covered_paths: paths.into_iter().map(PathBuf::from).collect(),
+            called_symbols: Vec::new(),
+        }
+    }
+
+    /// Add a called symbol, and the file that declares it. The file is covered
+    /// by implication — you cannot call into a module without loading it — so
+    /// this records that too rather than making every caller repeat it.
+    pub fn calling(mut self, file: &'static str, symbol: &'static str) -> Declaration {
+        let file = PathBuf::from(file);
+        if !self.covered_paths.contains(&file) {
+            self.covered_paths.push(file.clone());
+        }
+        self.called_symbols.push((file, symbol.to_string()));
+        self
+    }
+
+    /// Whether this class declares any execution at all.
+    pub fn is_empty(&self) -> bool {
+        self.covered_paths.is_empty() && self.called_symbols.is_empty()
+    }
+
+    /// Reject a declaration that does not describe the fixture it belongs to.
+    ///
+    /// The three constraints from the module docs, checked rather than trusted.
+    /// A generator whose only guard is the care of whoever writes the next
+    /// fixture is a generator that will eventually plant coverage on a decoy,
+    /// and the run that does it will look like a success.
+    pub fn check(&self, mutant_id: &str, truth: &GroundTruth) -> Result<()> {
+        let live_paths: BTreeSet<&Path> = truth.live_paths.iter().map(PathBuf::as_path).collect();
+        let live_symbols: BTreeSet<&str> = truth.live_symbols.iter().map(String::as_str).collect();
+        let decoys: BTreeSet<&Path> = truth
+            .decoy_dead_paths
+            .iter()
+            .map(PathBuf::as_path)
+            .collect();
+
+        let refuse = |message: String| {
+            Err(Error::Fixture {
+                mutant_id: mutant_id.to_string(),
+                message,
+            })
+        };
+
+        for path in &self.covered_paths {
+            // Checked before the live-path membership test, so the message names
+            // the worse mistake when a path is somehow both.
+            if decoys.contains(path.as_path()) {
+                return refuse(format!(
+                    "the coverage declaration marks the decoy {} as executed. A decoy is \
+                     genuinely dead; an artifact showing one executed is a false statement \
+                     about the fixture, and decoy recall would stop meaning anything.",
+                    path.display()
+                ));
+            }
+            if !live_paths.contains(path.as_path()) {
+                return refuse(format!(
+                    "the coverage declaration covers {}, which is not one of this class's \
+                     live paths. A generated artifact may only ever describe what the \
+                     fixture already declares.",
+                    path.display()
+                ));
+            }
+        }
+
+        for (file, symbol) in &self.called_symbols {
+            if !live_symbols.contains(symbol.as_str()) {
+                return refuse(format!(
+                    "the coverage declaration calls {symbol}, which is not one of this \
+                     class's live symbols."
+                ));
+            }
+            if !live_paths.contains(file.as_path()) {
+                return refuse(format!(
+                    "the coverage declaration says {} declares {symbol}, but that file is \
+                     not one of this class's live paths.",
+                    file.display()
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// One injected liveness mechanism.
 pub trait Mutant {
     /// Stable identifier, `m01`..`m19`. Used in reports and in release gating.
@@ -144,4 +263,28 @@ pub trait Mutant {
 
     /// Build the mutant repository under `dir` and declare its ground truth.
     fn materialize(&self, dir: &Path) -> Result<GroundTruth>;
+
+    /// Of this class's live artifacts, which a test suite exercising its
+    /// documented entry point actually enters (§9.5, Family X).
+    ///
+    /// Answered from the injected [`mechanism`](Self::mechanism) and from
+    /// nothing else. It is a property of how the artifact is reached, not a
+    /// threshold and not a knob: m12's `//go:linkname` alias is called through
+    /// at runtime, so a test enters it; m05's recovery handler is entered by no
+    /// test that does not inject a fault; m08's script runs in a pipeline and
+    /// not in a test process. The rule and its pre-commitment are in
+    /// `docs/decisions/2026-08-02-e2-coverage-artifacts.md`.
+    ///
+    /// # The default is nothing, and a missing override is a failure
+    ///
+    /// [`Declaration::nothing`], exactly as [`languages`](Self::languages)
+    /// defaults `Polyglot` to the empty set: silence rather than a guess. And,
+    /// like that one, silence is not allowed to pass unnoticed — every class's
+    /// answer is pinned as a table in `tests/coverage_declarations.rs`, so a
+    /// fixture that simply never declared fails rather than quietly
+    /// contributing no coverage. A class that had nothing to say and a class
+    /// nobody asked are the §6.20 pair, and they must not share a row.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::nothing()
+    }
 }

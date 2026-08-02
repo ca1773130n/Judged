@@ -1,7 +1,7 @@
 //! Running the suite and grading the result.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::mutant::{Ecosystem, GroundTruth, Mutant};
 use crate::sut::{Sut, SutVerdict, SymbolClaim};
@@ -150,6 +150,35 @@ impl SuiteReport {
 /// [`SuiteReport::not_read_count`] and in no other column. The distinction
 /// between that and a pass is the whole of §6.20 — see [`Grade`].
 pub fn run_suite(sut: &dyn Sut, mutants: &[Box<dyn Mutant>]) -> Result<SuiteReport> {
+    run_suite_with(sut, mutants, &SuiteOptions::default())
+}
+
+/// What the runner does to a mutant's repository beyond materializing it.
+///
+/// Everything here is off by default, and that default is what keeps every
+/// number this suite has ever published comparable. A fixture repository whose
+/// file set changes is a different measurement: an extra tracefile is one more
+/// file for an analyzer to claim, for Gate 1 to judge and for the root set to
+/// scan, so planting one unconditionally would silently move results that have
+/// nothing to do with coverage.
+#[derive(Debug, Clone, Default)]
+pub struct SuiteOptions {
+    /// Plant each class's declared coverage artifact
+    /// ([`Mutant::coverage_declaration`]) at this repo-relative path before the
+    /// SUT is spawned. `None` plants nothing, which is the default.
+    ///
+    /// A class that declares no execution plants nothing even when this is set —
+    /// see [`crate::fixtures::coverage::plant`] on why a missing artifact and an
+    /// empty one are different claims.
+    pub plant_coverage: Option<PathBuf>,
+}
+
+/// [`run_suite`], with the runner's optional behaviours spelled out.
+pub fn run_suite_with(
+    sut: &dyn Sut,
+    mutants: &[Box<dyn Mutant>],
+    options: &SuiteOptions,
+) -> Result<SuiteReport> {
     let mut reports = Vec::with_capacity(mutants.len());
 
     for mutant in mutants {
@@ -215,6 +244,22 @@ pub fn run_suite(sut: &dyn Sut, mutants: &[Box<dyn Mutant>]) -> Result<SuiteRepo
                 mutant_id: mutant.id().to_string(),
                 message: e.to_string(),
             })?;
+
+        // After the fixture is built and before the analyzer is spawned, so the
+        // tool sees the tracefile exactly as it would see one a CI job left in
+        // the tree. A planting failure is an error rather than a skip, for the
+        // same reason a failed materialization is: a class that silently got no
+        // artifact would report `no-artifact` — indistinguishable from a class
+        // that legitimately declares no execution (§6.20).
+        if let Some(artifact) = &options.plant_coverage {
+            crate::fixtures::coverage::plant(
+                repo.path(),
+                mutant.id(),
+                &truth,
+                &mutant.coverage_declaration(),
+                artifact,
+            )?;
+        }
 
         // Likewise a crashed SUT. Recording it as "claimed nothing" would score
         // a perfect zero false removals — §3.7's signature of every catastrophic

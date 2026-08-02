@@ -27,7 +27,7 @@ use judged_core::git::Repo;
 use judged_core::Result;
 
 use crate::fixtures::write;
-use crate::mutant::{Ecosystem, GroundTruth, Mutant};
+use crate::mutant::{Declaration, Ecosystem, GroundTruth, Mutant};
 
 /// The field is never read by name anywhere. The serializer walks it
 /// reflectively, and deleting it silently changes the wire format.
@@ -46,6 +46,15 @@ impl Mutant for ReflectiveField {
     fn research_ref(&self) -> &str {
         "§10 E2 class 11"
     }
+    /// Nothing to declare, for two independent reasons, and the second is the
+    /// interesting one. The class declares **no live paths at all**; and its three
+    /// live symbols are model *fields*, which are not functions and therefore have
+    /// no `FNDA` record however thoroughly the serializer runs. An execution
+    /// signal cannot reach a reflectively-read field.
+    fn coverage_declaration(&self) -> Declaration {
+        Declaration::nothing()
+    }
+
     fn materialize(&self, dir: &Path) -> Result<GroundTruth> {
         let repo = Repo::init(dir)?;
         let root = repo.root().to_path_buf();

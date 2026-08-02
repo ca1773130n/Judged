@@ -23,6 +23,7 @@ pub mod boundary;
 pub mod coverage;
 pub mod error;
 pub mod fingerprint;
+pub mod gate0a;
 pub mod gate0e;
 pub mod gate1;
 pub mod gate3f;

@@ -513,10 +513,15 @@ fn walk(root: &Path) -> Result<Vec<PathBuf>> {
                 source,
             })?;
             let path = entry.path();
-            if path.file_name().is_some_and(|name| name == ".git") {
-                continue;
-            }
             if path.is_dir() {
+                // §9.3 0b, through the shared classifier: `name == ".git"` misses a
+                // linked worktree and a submodule (.git is a FILE) and a bare
+                // `vendor/foo.git/` (no .git at all). An unreadable probe stops the
+                // walk too — descending on a failed lstat would read "could not look"
+                // as "nothing here" (§6.20).
+                if crate::boundary::classify(&path).stops_the_walk() {
+                    continue;
+                }
                 stack.push(path);
             } else {
                 out.push(path);

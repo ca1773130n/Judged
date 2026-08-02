@@ -19,6 +19,7 @@
 //! to ask "was this executed" has to agree on the same answer, so it lives here
 //! rather than beside one consumer.
 
+pub mod boundary;
 pub mod coverage;
 pub mod error;
 pub mod fingerprint;

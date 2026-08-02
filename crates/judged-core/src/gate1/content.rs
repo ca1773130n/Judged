@@ -1934,9 +1934,6 @@ fn read_submodules(root: &Path) -> Result<Vec<(String, PathBuf)>> {
 // the .gitattributes walk
 // ---------------------------------------------------------------------------
 
-/// Git's own object store. Never descended into.
-const SKIPPED_DIRECTORY: &str = ".git";
-
 struct AttributeWalk {
     root: PathBuf,
     limit: usize,
@@ -1991,7 +1988,10 @@ impl AttributeWalk {
                 format!("{relative}/{name}")
             };
             if file_type.is_dir() {
-                if name != SKIPPED_DIRECTORY {
+                // §9.3 0b, through the shared classifier rather than a name
+                // comparison: a linked worktree and a submodule carry `.git` as
+                // a FILE, and a bare `vendor/foo.git/` carries none at all.
+                if !crate::boundary::classify(&self.root.join(&child)).stops_the_walk() {
                     subdirectories.push(child);
                 }
             } else if name == ".gitattributes" {

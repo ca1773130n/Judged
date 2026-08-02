@@ -61,9 +61,17 @@ linked worktree, a submodule and a bare `vendor/foo.git/`:
 
 Consequence varies by gate — a root materialized from a nested repository's manifest, a Gate 2
 reference found in a vendored clone, an in-source marker read out of a submodule — but the shape is
-one wrong assumption about git's layout, copied seven times. **0b is not implementable as a
-per-candidate predicate until these share one boundary-aware walk**, and that shared walk is
-probably the first thing to build, before any individual conjunct.
+one wrong assumption about git's layout, copied seven times.
+
+**Fixed.** `judged_core::boundary::classify` is the shared predicate and all seven now call it. It
+recognises all three `.git` shapes plus a bare repository (a widening of 0b, labelled as one, since
+the clause names only `.git` and `vendor/foo.git/` carries none), and its `Unreadable` state stops
+the walk rather than being read as "nothing here". `tests/boundary_walks.rs` tests the **class** —
+one tree holding all three shapes, every walker asked whether it crossed — so a future walker that
+rolls its own skip is caught there rather than in somebody's repository.
+
+That removes the blocker this paragraph named: 0b is now implementable as a per-candidate predicate
+on top of the shared classifier.
 
 ---
 

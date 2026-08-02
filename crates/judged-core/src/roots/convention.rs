@@ -877,6 +877,14 @@ fn walk_dir(root: &Path, rel: &str, out: &mut Vec<String>) -> Result<()> {
             if SKIPPED_DIRS.contains(&name) {
                 continue;
             }
+            // The name list above is noise filtering (node_modules, target).
+            // §9.3 0b is a different question and needs the classifier: a
+            // linked worktree and a submodule carry `.git` as a FILE, and a
+            // bare `vendor/foo.git/` carries none at all, so a name match
+            // alone let this walk materialize roots from another repository.
+            if crate::boundary::classify(&Path::new(root).join(&child)).stops_the_walk() {
+                continue;
+            }
             walk_dir(root, &child, out)?;
         } else if kind.is_file() {
             out.push(child);

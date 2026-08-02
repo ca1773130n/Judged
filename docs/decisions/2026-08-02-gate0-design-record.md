@@ -43,9 +43,27 @@ not a directory — verified here: `git worktree add` produced a 63-byte `.git` 
 silently false in exactly those layouts, and Gate 1's §6.13 store detection is blind there. It must
 use `git rev-parse --git-common-dir`.
 
-Related, and also shipped: `gate3f.rs:673` and `state.rs:989` each skip only a directory literally
-*named* `.git`, so both walkers descend into a nested clone, a linked worktree and a bare
-`vendor/foo.git/`. 0b is unimplementable as a pure per-candidate predicate until they share a walk.
+Fixed, with `Repo::common_dir()`, in `fix/gate1-store-probe-common-dir`.
+
+**The same bug class is in seven more places, and all of them are still shipped.** Every walker in
+the crate skips only a directory literally *named* `.git`, so each descends into a nested clone, a
+linked worktree, a submodule and a bare `vendor/foo.git/`:
+
+| file:line | walker |
+| --- | --- |
+| `gate1/state.rs:1016` | the Gate 1 state survey |
+| `gate1/content.rs:1937` | the Gate 1 content scan |
+| `gate3f.rs:654` | Gate 3f's marker scan |
+| `roots/insource.rs:501` | the §5.2 in-source root scan |
+| `roots/convention.rs:83` | Tier B convention detection |
+| `roots/manifest.rs:2168` | Tier A manifest discovery |
+| `veto/reachability.rs:129` | Gate 2b/2c directory enumeration |
+
+Consequence varies by gate — a root materialized from a nested repository's manifest, a Gate 2
+reference found in a vendored clone, an in-source marker read out of a submodule — but the shape is
+one wrong assumption about git's layout, copied seven times. **0b is not implementable as a
+per-candidate predicate until these share one boundary-aware walk**, and that shared walk is
+probably the first thing to build, before any individual conjunct.
 
 ---
 

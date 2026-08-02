@@ -41,6 +41,7 @@ use judged_mutants::adapters::{deadcode, knip, shear, vulture};
 use judged_mutants::coverage::{CoverageRescue, CoveredSut};
 use judged_mutants::fixtures;
 use judged_mutants::gate1::{Gate1Sut, RefusedClaim};
+use judged_mutants::gate3f::{Gate3fRefusal, Gate3fSut};
 use judged_mutants::mutant::{Ecosystem, Mutant};
 use judged_mutants::roots::{RescuedClaim, RootedSut};
 use judged_mutants::runner::{
@@ -243,9 +244,11 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
     // weigh. Each layer keeps its own per-claim record, which is what lets the
     // report say which layer earned a rescue instead of publishing one combined
     // number.
-    let (report, rescue) = if args.gate1 || args.veto || args.roots || args.coverage {
+    let (report, rescue) = if args.gate1 || args.gate3f || args.veto || args.roots || args.coverage
+    {
         let mut stacked: Box<dyn Sut> = build_sut(&args.sut);
         let mut gate_one: Option<Rc<Gate1Sut>> = None;
+        let mut gate_three_f: Option<Rc<Gate3fSut>> = None;
         let mut covered: Option<Rc<CoveredSut>> = None;
         let mut rooted: Option<Rc<RootedSut>> = None;
         let mut vetoed: Option<Rc<VetoedSut>> = None;
@@ -258,6 +261,16 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
             let layer = Rc::new(Gate1Sut::new(stacked));
             stacked = Box::new(Rc::clone(&layer));
             gate_one = Some(layer);
+        }
+        // Immediately after Gate 1 and before every evidence layer, because
+        // both are about the COST of being wrong rather than about usefulness —
+        // and because §9.3 ends 3f with "No ban count overrides this". A claim it
+        // refuses is never handed to a later layer, so the composition is the
+        // sentence.
+        if args.gate3f {
+            let layer = Rc::new(Gate3fSut::new(stacked));
+            stacked = Box::new(Rc::clone(&layer));
+            gate_three_f = Some(layer);
         }
         // Next, and ahead of both Family-R layers on purpose. Every rescue layer
         // here is a pure filter, so the order cannot change the final claim set
@@ -306,6 +319,9 @@ pub fn run(args: &MutantsArgs) -> (String, i32) {
         let mut layers: Vec<Layer> = Vec::new();
         if let Some(layer) = &gate_one {
             layers.push(gate1_layer(layer));
+        }
+        if let Some(layer) = &gate_three_f {
+            layers.push(gate3f_layer(layer));
         }
         if let Some(layer) = &covered {
             layers.push(coverage_layer(layer));
@@ -403,6 +419,43 @@ fn roots_layer(layer: &RootedSut) -> Layer {
                 claimed: run.claimed,
                 survived: run.survived,
                 dropped: run.rescued.iter().map(Dropped::from_rescued).collect(),
+            })
+            .collect(),
+    }
+}
+
+/// Gate 3f's accounting, normalized.
+///
+/// The detected job frameworks and the unattributed count both ride into
+/// `config`, and neither is decoration. A queue-payload refusal with no named
+/// framework is unfalsifiable from the outside; and a symbol claim the analyzer
+/// attributed to no file is one 3f could not read at all, which is neither a
+/// refusal nor a clearance (§6.20). An analyzer that attributed nothing would
+/// otherwise score a clean pass over claims this gate never examined.
+fn gate3f_layer(layer: &Gate3fSut) -> Layer {
+    let runs = layer.runs();
+    let unattributed: usize = runs.iter().map(|run| run.unattributed).sum();
+    let mut frameworks: Vec<String> = runs.iter().flat_map(|run| run.frameworks.clone()).collect();
+    frameworks.sort();
+    frameworks.dedup();
+    let detected = if frameworks.is_empty() {
+        "no job framework declared in any fixture".to_string()
+    } else {
+        format!("job frameworks {}", frameworks.join(", "))
+    };
+
+    Layer {
+        name: GATE3F,
+        config: format!(
+            "conditions serializable+queue-payload+abi-export, {detected}, \
+             {unattributed} claim(s) unjudgeable for having no declaration site"
+        ),
+        runs: runs
+            .iter()
+            .map(|run| LayerRun {
+                claimed: run.claimed,
+                survived: run.survived,
+                dropped: run.refused.iter().map(Dropped::from_gate3f).collect(),
             })
             .collect(),
     }
@@ -558,6 +611,30 @@ impl Dropped {
         }
     }
 
+    /// A Gate 3f refusal.
+    ///
+    /// `rule` is the condition — `serializable`, `queue-payload`, `abi-export` —
+    /// because the condition IS the rule that fired and there is no narrower one
+    /// underneath it. `class` repeats `3f` so a consumer can group by §9.3
+    /// conjunct without parsing a string it was told is free-form.
+    fn from_gate3f(record: &Gate3fRefusal) -> Dropped {
+        Dropped {
+            layer: GATE3F,
+            claim: record.claim.clone(),
+            kind: record.kind.as_str(),
+            rule: record.condition.as_str().to_string(),
+            gate: None,
+            tier: None,
+            class: Some("3f"),
+            origin: None,
+            needle: Some(record.marker.clone()),
+            needle_kind: Some("marker".to_string()),
+            found_in: Some(record.found_in.clone()),
+            declared_in: record.declared_in.clone(),
+            detail: record.detail.clone(),
+        }
+    }
+
     /// A rescue by observed execution.
     ///
     /// `rule` is `fnda` or `lines`, which is the one distinction a reader of this
@@ -648,6 +725,7 @@ struct Layer {
 /// in the SUT name, and three spellings of the same layer is how a consumer ends
 /// up matching on the one this build does not emit.
 const GATE1: &str = "gate1";
+const GATE3F: &str = "gate3f";
 const COVERAGE: &str = "coverage";
 const ROOTS: &str = "roots";
 const VETO: &str = "veto";
@@ -1640,6 +1718,14 @@ fn render_text(
                      root is a guess about a framework.\n\n",
                     layer.config
                 ),
+                GATE3F => format!(
+                    "Gate 3f (§9.3, §6.24) ran on every claim: {}.\nIt refuses a candidate \
+                     whose type is serializable, whose name can appear in a queue\npayload, or \
+                     whose symbol is exported across an ABI boundary. §9.3 ends that\nsentence \
+                     with NO BAN COUNT OVERRIDES THIS, because the evidence that would refute\n\
+                     deadness is not in any observable system.\n\n",
+                    layer.config
+                ),
                 GATE1 => format!(
                     "Gate 1 (§9.3) — the never-touch inventory — ran BEFORE anything else, on \
                      every\nclaim this analyzer made: {}.\nIts refusals are about the cost of \
@@ -1972,6 +2058,10 @@ fn render_json(
             // reports that the artifact WAS EXECUTED. Calling it "rescued"
             // alongside the root set would file direct observation under the
             // same word as a framework convention that was inferred.
+            let gate3f_row = layer_names
+                .contains(&GATE3F)
+                .then(|| layer_row(GATE3F, "refused_claims"))
+                .flatten();
             let coverage_row = layer_names
                 .contains(&COVERAGE)
                 .then(|| layer_row(COVERAGE, "executed_claims"))
@@ -2004,6 +2094,7 @@ fn render_json(
                 // In the order the layers run (§9.3), so a reader following the
                 // trace reads it the way the pipeline evaluated it.
                 "gate1": gate1_row,
+                "gate3f": gate3f_row,
                 "coverage": coverage_row,
                 "veto": veto_row,
                 "roots": roots_row,

@@ -158,6 +158,17 @@ pub struct MutantsArgs {
     /// uselessness. A `.env`, a `terraform.tfstate` and an analyst's `.RData`
     /// are all genuinely useless to the build, and all irreplaceable.
     pub gate1: bool,
+    /// Run §9.3's Gate 3f — persisted, in-flight and already-shipped references
+    /// (§6.24) — over every claim.
+    ///
+    /// The only conjunct in the design that ends "No ban count overrides this",
+    /// because the evidence that would refute deadness is not in any observable
+    /// system: a queue payload enqueued yesterday, a row pickled last year, a
+    /// binary linked in 2023.
+    ///
+    /// Off by default like every other layer, so the number the suite has always
+    /// published keeps meaning what it meant.
+    pub gate3f: bool,
     /// Materialize the root set (§5) and let it rescue, alongside Gate 2.
     ///
     /// A separate flag from `--veto`, and that is the point rather than an
@@ -442,8 +453,8 @@ judged — evidence about what a repository is still using.
 USAGE:
     judged ratchet --sarif <path>... [--baseline <path>] [--update]
                                      [--expected-targets <n>]
-    judged mutants [--sut <sut>] [--gate1] [--veto [--needles <strategy>]] [--roots]
-                   [--coverage [--coverage-artifact <path>]] [--json]
+    judged mutants [--sut <sut>] [--gate1] [--gate3f] [--veto [--needles <strategy>]]
+                   [--roots] [--coverage [--coverage-artifact <path>]] [--json]
     judged mutants --sut command [--gate1] [--veto] [--roots] [--coverage] [--json]
                    -- <analyzer> [args...]
     judged show-roots [--json] [<path>]
@@ -528,6 +539,16 @@ MUTANTS (§10 E2) — inject 19 known-live artifacts and see what gets called de
                                bare, --veto, --roots and both are four measurable
                                configurations, and a combined-only flag would hide
                                which layer earned a rescue.
+    --gate3f                   Run §9.3's Gate 3f — §6.24's persisted, in-flight and
+                               already-shipped references — over every claim. The
+                               only conjunct the design says NO BAN COUNT OVERRIDES,
+                               because what would refute deadness is not in any
+                               observable system: a queue payload enqueued
+                               yesterday, a row pickled last year, a binary linked
+                               in 2023. Refuses on three conditions — the type is
+                               serializable, its name can appear in a queue payload,
+                               or its symbol is exported across an ABI boundary.
+                               Refuses; never accuses.
     --coverage                 Ingest an lcov tracefile and let OBSERVED EXECUTION
                                rescue (§9.5, Family X). The only signal here that
                                is not about references: a hit is proof of use and
@@ -842,6 +863,7 @@ fn parse_mutants<'a>(
     // run with it silently on would not be comparable to any number this suite
     // has published.
     let mut gate1 = false;
+    let mut gate3f = false;
     // And likewise off by default, though for one extra reason: this is the only
     // layer whose evidence comes from outside the repository, so a run with it
     // silently on would publish a number that depends on an artifact the report
@@ -856,6 +878,7 @@ fn parse_mutants<'a>(
             "--json" => json = true,
             "--veto" => veto = true,
             "--gate1" => gate1 = true,
+            "--gate3f" => gate3f = true,
             "--roots" => roots = true,
             "--coverage" => coverage = true,
             "--coverage-artifact" => {
@@ -939,6 +962,7 @@ fn parse_mutants<'a>(
         sut,
         veto,
         gate1,
+        gate3f,
         roots,
         coverage,
         coverage_artifact,

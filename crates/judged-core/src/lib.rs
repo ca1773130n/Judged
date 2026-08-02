@@ -23,6 +23,7 @@ pub mod coverage;
 pub mod error;
 pub mod fingerprint;
 pub mod gate1;
+pub mod gate3f;
 pub mod git;
 pub mod roots;
 pub mod sarif;

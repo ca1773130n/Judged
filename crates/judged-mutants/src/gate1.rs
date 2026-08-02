@@ -142,7 +142,7 @@ impl Gate1 {
         // given, so that the three modules agree about what a repo-relative path
         // means. On macOS the two differ by `/private`, and a candidate keyed
         // one way and judged the other silently matches nothing.
-        let state = StateGate::survey(repo.root());
+        let state = StateGate::survey_in(repo.root(), Some(&repo));
         let content = ContentGate::build(repo.root())?;
         Ok(Gate1 {
             repo,

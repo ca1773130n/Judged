@@ -1045,3 +1045,91 @@ fn the_annex_store_is_found_through_the_common_git_dir_not_through_root_dot_git(
         .output()
         .expect("cleanup");
 }
+
+/// The other two layouts the same defect covers.
+///
+/// Review noted the first version of this regression named three layouts in its
+/// comments and exercised one. All three fail identically — `.git` is a regular
+/// file holding `gitdir: …` — so testing only the worktree left the claim about
+/// the other two unbacked.
+#[test]
+fn the_store_is_found_in_a_submodule_and_under_separate_git_dir() {
+    // --separate-git-dir: `.git` is an 89-byte FILE pointing anywhere.
+    let outer = tempfile::Builder::new()
+        .prefix("judged-store-sep-")
+        .tempdir()
+        .expect("scratch");
+    let work = outer.path().join("wt");
+    let elsewhere = outer.path().join("real.git");
+    let init = std::process::Command::new("git")
+        .args(["init", "-q", "--separate-git-dir"])
+        .arg(&elsewhere)
+        .arg(&work)
+        .output()
+        .expect("spawn git");
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    assert!(
+        work.join(".git").is_file(),
+        "the point of this layout: .git is a file, not a directory"
+    );
+    fs::create_dir_all(elsewhere.join("annex/objects")).expect("annex");
+
+    let repo = Repo::discover(&work).expect("a working tree");
+    assert!(
+        StateGate::survey_in(&work, Some(&repo))
+            .data_stores()
+            .contains(&DataStore::GitAnnex),
+        "the annex lives in the separate git dir and must still be found"
+    );
+
+    // Submodule: the real directory is under <super>/.git/modules/<name>.
+    let sup = tempfile::Builder::new()
+        .prefix("judged-store-sup-")
+        .tempdir()
+        .expect("scratch");
+    let inner = sup.path().join("inner");
+    let super_wt = sup.path().join("super");
+    for dir in [&inner, &super_wt] {
+        fs::create_dir_all(dir).expect("mkdir");
+        let repo = Repo::init(dir).expect("init");
+        fs::write(dir.join("f.txt"), "x\n").expect("write");
+        repo.add_all().expect("add");
+        repo.commit("initial").expect("commit");
+    }
+    let added = std::process::Command::new("git")
+        .args(["-c", "protocol.file.allow=always", "submodule", "add", "-q"])
+        .arg(&inner)
+        .arg("sub")
+        .current_dir(&super_wt)
+        .output()
+        .expect("spawn git");
+    assert!(
+        added.status.success(),
+        "could not add a submodule, so the case was never exercised: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+
+    let sub = super_wt.join("sub");
+    assert!(
+        sub.join(".git").is_file(),
+        "a submodule's .git is a file too"
+    );
+    let sub_repo = Repo::discover(&sub).expect("a working tree");
+    fs::create_dir_all(
+        sub_repo
+            .common_dir()
+            .expect("common dir")
+            .join("annex/objects"),
+    )
+    .expect("annex");
+    assert!(
+        StateGate::survey_in(&sub, Some(&sub_repo))
+            .data_stores()
+            .contains(&DataStore::GitAnnex),
+        "the annex lives under <super>/.git/modules/sub and must still be found"
+    );
+}

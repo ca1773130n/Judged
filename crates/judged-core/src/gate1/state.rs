@@ -857,7 +857,16 @@ impl StateGate {
     /// error channel a caller could mistake for "no effectors here". A failure
     /// becomes a scan gap, and a scan gap makes the tree ineligible.
     pub fn survey(root: &Path) -> StateGate {
-        StateGate::survey_in(root, None)
+        // Discovers rather than passing `None`, because `None` disables the
+        // §6.13 store probe outright and a caller holding a perfectly good
+        // working tree would get "no annex here" without one ever being looked
+        // for. Review found that footgun immediately after the probe itself was
+        // fixed — the same shape, one layer up.
+        //
+        // A path that is not in a working tree yields `None` honestly: there is
+        // no git directory, so nothing can be inside one.
+        let repo = Repo::discover(root).ok();
+        StateGate::survey_in(root, repo.as_ref())
     }
 
     /// [`StateGate::survey`], told which repository it is surveying.
@@ -865,7 +874,8 @@ impl StateGate {
     /// **The entry point production must use.** §6.13's git-annex and git-lfs
     /// stores live inside the git directory, and locating that directory needs
     /// git — `<root>/.git` is a regular *file* in a linked worktree and in a
-    /// submodule, and does not exist at all under `--separate-git-dir`.
+    /// submodule, and is a file pointing elsewhere under
+    /// `--separate-git-dir`.
     ///
     /// `None` means the caller has no working tree, which is a definite answer
     /// about a directory that is not a repository rather than a failed probe:
@@ -887,13 +897,12 @@ impl StateGate {
         // the git directory — and these two live inside it.
         //
         // Through `git rev-parse --git-common-dir`, never `<root>/.git`. Three
-        // ordinary layouts make the literal path wrong, and this probe was
-        // silently false in all of them: a linked worktree and a submodule both
-        // write `.git` as a regular FILE holding `gitdir: …` (verified — `git
-        // worktree add` produces 63 bytes), and `--separate-git-dir` puts the
-        // directory somewhere with no `.git` component at all. In an annexed
-        // repository checked out as a worktree, §6.13's store went undetected
-        // and the tree was judged as though no annex existed.
+        // ordinary layouts make the literal path wrong and they all fail the
+        // same way: `.git` is a regular FILE holding `gitdir: …`, not a
+        // directory — a linked worktree (63 bytes), a submodule, and
+        // `git init --separate-git-dir` (89 bytes). In an annexed repository
+        // checked out as a worktree, §6.13's store went undetected and the tree
+        // was judged as though no annex existed.
         //
         // A failure to locate it is a GAP, never an absence. "There is no annex
         // here" and "I could not find out" are the §6.20 pair, and only the
@@ -1245,8 +1254,8 @@ impl StateGate {
     /// This probe used to read `root.join(".git/annex")` and was **silently
     /// false in three ordinary layouts**: a linked worktree and a submodule
     /// both write `.git` as a regular FILE holding `gitdir: …` (verified — `git
-    /// worktree add` produces 63 bytes), and `--separate-git-dir` leaves no
-    /// `.git` component in the path at all. An annexed repository checked out
+    /// worktree add` produces 63 bytes), and `git init --separate-git-dir`
+    /// writes an 89-byte file pointing anywhere on the filesystem. An annexed repository checked out
     /// as a worktree reported no annex, and §6.13's whole class of hazard went
     /// unseen.
     ///

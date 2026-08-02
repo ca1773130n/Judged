@@ -457,37 +457,6 @@ impl Repo {
     /// *partial* clone (`--filter=blob:none`) keeps the commits but not the
     /// blobs, so content-level history questions are equally unanswerable
     /// without refetching. Both trip the same abstention.
-    /// The repository's **common** git directory, absolute.
-    ///
-    /// `git rev-parse --git-common-dir`, which is the only portable answer to
-    /// "where does this repository actually keep its objects". Three layouts
-    /// make the obvious `<root>/.git` wrong, and all three are ordinary:
-    ///
-    /// - A **linked worktree** and a **submodule** both write `.git` as a
-    ///   regular *file* holding `gitdir: …`. Verified: `git worktree add`
-    ///   produces a 63-byte file, so `root.join(".git/annex").exists()` is
-    ///   false in a worktree of an annex repository.
-    /// - `git init --separate-git-dir` puts the directory anywhere, with no
-    ///   `.git` component in the path at all.
-    ///
-    /// Relative output is joined onto the working tree root — in a plain
-    /// repository git prints `.git` rather than an absolute path.
-    ///
-    /// Errors rather than guessing. A caller that cannot locate the git
-    /// directory must record a gap, never conclude that what lives inside it is
-    /// absent (§6.20).
-    pub fn common_dir(&self) -> Result<PathBuf> {
-        let run =
-            GitRun::new(&self.root, ["rev-parse", "--git-common-dir"], None)?.require_success()?;
-        let printed = run.stdout_trimmed()?;
-        let path = Path::new(&printed);
-        Ok(if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.root.join(path)
-        })
-    }
-
     pub fn is_shallow(&self) -> Result<bool> {
         let run = GitRun::new(&self.root, ["rev-parse", "--is-shallow-repository"], None)?
             .require_success()?;
@@ -515,6 +484,42 @@ impl Repo {
                 .any(|line| line.split_whitespace().nth(1) == Some("true"))),
             _ => Err(promisor.failure()),
         }
+    }
+
+    /// The repository's **common** git directory, absolute.
+    ///
+    /// `git rev-parse --git-common-dir`, which is the only portable answer to
+    /// "where does this repository actually keep its objects". Joining `.git`
+    /// onto the working tree root is wrong in three ordinary layouts, and they
+    /// all fail the same way: **`.git` is a regular file holding `gitdir: …`,
+    /// not a directory.**
+    ///
+    /// - A **linked worktree** — verified, `git worktree add` writes a 63-byte
+    ///   file — with the real directory under `<common>/worktrees/<name>`.
+    /// - A **submodule**, with the real directory under
+    ///   `<super>/.git/modules/<name>`.
+    /// - **`git init --separate-git-dir`**, which writes an 89-byte file
+    ///   pointing anywhere on the filesystem. (An earlier version of this doc
+    ///   claimed there was no `.git` entry at all in this case. Verified false:
+    ///   the file is there, and it is a file, which is exactly why the naive
+    ///   join fails.)
+    ///
+    /// Relative output is joined onto the working tree root — a plain
+    /// repository prints `.git` rather than an absolute path.
+    ///
+    /// Errors rather than guessing. A caller that cannot locate the git
+    /// directory must record a gap, never conclude that what lives inside it is
+    /// absent (§6.20).
+    pub fn common_dir(&self) -> Result<PathBuf> {
+        let run =
+            GitRun::new(&self.root, ["rev-parse", "--git-common-dir"], None)?.require_success()?;
+        let printed = run.stdout_trimmed()?;
+        let path = Path::new(&printed);
+        Ok(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        })
     }
 
     /// Classify `path` for Gate 0g. See [`RecoverabilityClass`].

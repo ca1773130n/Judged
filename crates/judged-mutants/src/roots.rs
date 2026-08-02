@@ -35,7 +35,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use judged_core::roots::{convention, declared, manifest};
+use judged_core::roots::{convention, declared, insource, manifest};
 use judged_core::Result;
 
 use crate::sut::{ClaimKind, Sut, SutVerdict, SymbolClaim};
@@ -488,6 +488,7 @@ pub fn materialize<S: AsRef<str>>(repo_root: &Path, candidates: &[S]) -> RootSet
     };
 
     collect_manifests(repo_root, &mut set);
+    collect_insource(repo_root, &mut set);
     collect_conventions(repo_root, &mut set);
     collect_declared(repo_root, &mut set);
 
@@ -506,6 +507,62 @@ pub fn materialize<S: AsRef<str>>(repo_root: &Path, candidates: &[S]) -> RootSet
 }
 
 /// Tier A: everything a manifest declares.
+/// Tier A roots declared by a marker in source rather than by a manifest
+/// (§5.2): Go's `//go:linkname` and `//export`, Rust's `#[no_mangle]`,
+/// `#[used]`, `#[export_name]` and `#[ctor]`, Python's `.pth` files and
+/// `sitecustomize.py`.
+///
+/// Tier A rather than B because none of these is a guess about a framework.
+/// `#[no_mangle]` does not suggest the symbol might be exported; it instructs
+/// the linker to emit it under that name. See `judged_core::roots::insource`.
+///
+/// A scan that cannot list a directory is a gap rather than a silent zero, for
+/// the reason every other collector here records one: a root source that found
+/// nothing and a root source that could not look are the §6.20 pair.
+fn collect_insource(repo_root: &Path, set: &mut RootSet) {
+    let found = match insource::scan(repo_root) {
+        Ok(found) => found,
+        Err(error) => {
+            set.gaps.push(Gap {
+                kind: GapKind::ManifestUnreadable,
+                subject: repo_root.display().to_string(),
+                detail: format!(
+                    "{error}. The in-source root scan (§5.2) did not complete, so every \
+                     `//export`, `#[no_mangle]`, `.pth` and `sitecustomize.py` root is \
+                     missing from this list."
+                ),
+            });
+            return;
+        }
+    };
+
+    for root in found {
+        set.roots.push(Root {
+            tier: Tier::A,
+            rule: root.marker().as_str().to_string(),
+            origin: root.origin(),
+            origin_file: root.file().to_path_buf(),
+            // A `.pth` and a `sitecustomize.py` ARE the entry point, so the file
+            // is the root. Every other marker declares a symbol and says nothing
+            // about whether the file around it is reachable — recording the file
+            // as a root there would rescue a whole module on evidence about one
+            // function.
+            path: match root.symbol() {
+                None => Some(normalize_path(root.file())),
+                Some(_) => None,
+            },
+            symbol: root.symbol().map(str::to_string),
+            target: root.target().to_string(),
+            detail: format!(
+                "{} declares it at line {}, read by {}",
+                root.file().display(),
+                root.line(),
+                root.marker().reader()
+            ),
+        });
+    }
+}
+
 fn collect_manifests(repo_root: &Path, set: &mut RootSet) {
     let scanned = match manifest::scan(repo_root) {
         Ok(scanned) => scanned,

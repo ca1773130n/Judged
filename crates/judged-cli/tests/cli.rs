@@ -2509,8 +2509,13 @@ fn roots_rescue_independently_of_the_veto_and_each_layer_is_named() {
         serde_json::from_str(run.stdout.trim()).expect("--json emits JSON under --roots too");
 
     assert_eq!(
-        rooted["sut"], "naive+roots",
-        "the measured system is the pair, and the name says which layer was in it"
+        rooted["sut"],
+        "naive+roots",
+        "the measured system is the pair, and the name says which layer was in it. \
+         Whole document, because a refusal renders as JSON too and its `sut` is the bare \
+         choice — so this assertion firing usually means the run REFUSED and the reason \
+         is below rather than that the label is wrong: {}",
+        serde_json::to_string_pretty(&rooted).unwrap_or_default()
     );
     assert!(
         bare["roots"].is_null(),

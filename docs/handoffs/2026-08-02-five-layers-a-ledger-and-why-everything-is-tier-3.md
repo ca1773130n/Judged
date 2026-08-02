@@ -119,10 +119,12 @@ warned that a bigger, less accurate root set is not an improvement.
 
 **Two CI flakes, both filesystem races in `judged-mutants` on Linux, both diagnosed.**
 
-- `runner_suts::command_sut::*` — `ETXTBSY` spawning a script the test just wrote. A different test
-  thread forks while the write descriptor is open, and the child holds it until its own exec. Fix:
-  retry the spawn on `ETXTBSY`, or serialize write-then-spawn behind a mutex (sufficient — other
-  test binaries are separate processes and never inherit the descriptor).
+- ~~`runner_suts::command_sut::*` — `ETXTBSY`~~ **Fixed.** One mutex covers both sides: `script`
+  holds it while writing, and every spawn in the module goes through `run_locked`. No fork can
+  occur while a write descriptor is open because the two cannot run concurrently, and the scope is
+  sufficient because every other test binary is a separate *process*. The retry alternative was
+  rejected — its natural home is `CommandSut::run`, which is production code, and a silent retry
+  there would hide a genuine "somebody is rewriting this analyzer" condition.
 - `runner_controls::*` — `DirectoryNotEmpty` from `TempDir::close()` in `run_suite`. Fixtures call
   `Repo::init`, so every mutant repo contains a `.git/`, and `remove_dir_all` races. Fix: retry the
   close, preserving the reason it is explicit — a discarded error is a leaked tree per mutant,

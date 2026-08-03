@@ -199,12 +199,20 @@ impl Gate0a {
     pub fn build(repo: &Repo) -> Gate0a {
         let store = match repo.common_dir() {
             Ok(git_dir) => {
-                if git_dir.join("annex").exists() {
-                    StorePresence::Present("git-annex")
-                } else if repo.root().join(".dvc").exists() {
-                    StorePresence::Present("DVC")
-                } else {
-                    StorePresence::Absent
+                // `Path::exists` is wrong twice over here, and review caught
+                // both: it FOLLOWS symlinks — which this gate exists to forbid —
+                // and it returns `false` for a permission error, so an
+                // unreadable probe would have become `Absent` and licensed
+                // reporting every broken symlink in an annexed repository. That
+                // is §6.20's inversion inside §6.13's own safeguard.
+                match (
+                    marker(&git_dir.join("annex")),
+                    marker(&repo.root().join(".dvc")),
+                ) {
+                    (Ok(true), _) => StorePresence::Present("git-annex"),
+                    (_, Ok(true)) => StorePresence::Present("DVC"),
+                    (Ok(false), Ok(false)) => StorePresence::Absent,
+                    (Err(why), _) | (_, Err(why)) => StorePresence::Unreadable(why),
                 }
             }
             Err(source) => StorePresence::Unreadable(format!(
@@ -343,8 +351,20 @@ impl Gate0a {
     /// refusal.
     fn linked_ancestor(&self, candidate: &Path) -> Result<Option<PathBuf>, String> {
         let Ok(relative) = candidate.strip_prefix(&self.root) else {
-            // Outside the tree entirely. 0c owns that question; 0a says nothing.
-            return Ok(None);
+            // NOT `Ok(None)`. Review found that returning "no linked ancestor"
+            // here made `permits_action()` mean "0a did not check this tree" —
+            // and `Repo::discover` canonicalizes the root, so a candidate
+            // spelled through a symlinked root falls outside it and reached
+            // exactly this arm. The ancestor walk is the part of 0a that catches
+            // traversal, so skipping it silently is the one outcome this gate
+            // must not have. 0c owns the containment question; 0a says it could
+            // not answer.
+            return Err(format!(
+                "{} is not under {}, so 0a could not walk its ancestors. That is a question \
+                 for §9.3 0c, and this gate has not established anything about the candidate.",
+                candidate.display(),
+                self.root.display()
+            ));
         };
         let mut cursor = self.root.clone();
         for component in relative.components() {
@@ -366,6 +386,28 @@ impl Gate0a {
             }
         }
         Ok(None)
+    }
+}
+
+/// Whether a store marker is present, without following a link to find out.
+///
+/// `symlink_metadata` rather than `Path::exists` for two independent reasons,
+/// both of which review had to point out. `exists` follows symlinks, and a gate
+/// whose entire subject is "never traverse a symlink" must not traverse one to
+/// answer its own question. And `exists` returns `false` for a permission error,
+/// which would turn "I could not look" into "there is no annex here" — the one
+/// answer that licenses deleting an annexed repository's pointers.
+///
+/// A dangling marker counts as **present**: `.git/annex` as a broken link is
+/// still a repository that has an annex.
+fn marker(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "{} could not be checked for a content store: {error}",
+            path.display()
+        )),
     }
 }
 
@@ -398,6 +440,17 @@ mod tests {
 
     #[test]
     fn trailing_separators_are_stripped_from_the_bytes_and_the_root_survives() {
+        // The empty and multi-slash cases, which review noted were uncovered.
+        assert_eq!(
+            strip_trailing_separators(Path::new("")),
+            (PathBuf::from(""), false),
+            "an empty path has no trailing separator to strip"
+        );
+        assert_eq!(
+            strip_trailing_separators(Path::new("///")),
+            (PathBuf::from("/"), true),
+            "every separator but the root's own is stripped"
+        );
         assert_eq!(
             strip_trailing_separators(Path::new("/a/link//")),
             (PathBuf::from("/a/link"), true)

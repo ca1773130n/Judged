@@ -274,8 +274,7 @@ pub fn run_suite_with(
 
         // Explicit rather than relying on drop, which discards the error. A
         // leaked tree per mutant is nineteen per run.
-        let path = repo.path().to_path_buf();
-        repo.close().map_err(|source| Error::Io { path, source })?;
+        close_repo(repo)?;
     }
 
     let false_removal_count = reports.iter().map(|r| r.false_removals.len()).sum();
@@ -284,6 +283,55 @@ pub fn run_suite_with(
         reports,
         false_removal_count,
     })
+}
+
+/// Remove one mutant's throwaway repository, retrying the one error that is a
+/// race rather than a failure.
+///
+/// # `DirectoryNotEmpty` here is not a leak
+///
+/// Every fixture calls `Repo::init`, so each throwaway tree contains a `.git/`,
+/// and `remove_dir_all` walks a directory whose contents git may still be
+/// settling. On Linux CI that intermittently surfaces as `ENOTEMPTY`: entries
+/// appeared between the listing and the unlink. Retrying the same call succeeds,
+/// because by then nothing is writing.
+///
+/// It cost four CI cycles across two days before being fixed, and it was
+/// diagnosed twice as something else first — under the CLI it makes `run_suite`
+/// return `Err`, the command renders a *refusal*, a refusal renders as JSON, and
+/// the assertion that fires is about a layer name or a needle strategy. Nothing
+/// about the failure points at a temporary directory.
+///
+/// # Why a bounded retry rather than ignoring the error
+///
+/// The explicit `close` exists so a real failure is not discarded — a leaked
+/// tree per mutant is nineteen per run. Swallowing `DirectoryNotEmpty` would
+/// give that up to fix a race. Retrying keeps both: the race resolves, and an
+/// error that persists past every attempt is still returned.
+fn close_repo(repo: tempfile::TempDir) -> Result<()> {
+    const ATTEMPTS: usize = 5;
+    let path = repo.path().to_path_buf();
+
+    for attempt in 1..=ATTEMPTS {
+        match std::fs::remove_dir_all(&path) {
+            // Already gone is success, not an error to report.
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty && attempt < ATTEMPTS =>
+            {
+                // A short pause rather than a spin: the race is another process
+                // finishing a write, and retrying in the same microsecond mostly
+                // reproduces it.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(source) => return Err(Error::Io { path, source }),
+        }
+    }
+    // `repo` is dropped here and on every early return. Its own `Drop` retries
+    // the removal and discards the result, which is correct once this function
+    // has already decided the outcome.
+    unreachable!("the loop returns on the final attempt")
 }
 
 /// Whether `sut` can load `mutant`'s repository at all — the predicate

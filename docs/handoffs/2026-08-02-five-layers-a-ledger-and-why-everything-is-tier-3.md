@@ -125,12 +125,13 @@ warned that a bigger, less accurate root set is not an improvement.
   sufficient because every other test binary is a separate *process*. The retry alternative was
   rejected — its natural home is `CommandSut::run`, which is production code, and a silent retry
   there would hide a genuine "somebody is rewriting this analyzer" condition.
-- `runner_controls::*` — `DirectoryNotEmpty` from `TempDir::close()` in `run_suite`. Fixtures call
-  `Repo::init`, so every mutant repo contains a `.git/`, and `remove_dir_all` races. Fix: retry the
-  close, preserving the reason it is explicit — a discarded error is a leaked tree per mutant,
-  nineteen per run.
+- ~~`runner_controls::*` — `DirectoryNotEmpty`~~ **Fixed.** `runner::close_repo` retries the removal
+  five times with a short pause, and still returns any error that survives all five — so the reason
+  the close is explicit (a discarded error is a leaked tree per mutant, nineteen per run) is kept
+  rather than traded away to silence a race.
 
-  **It does not only surface there, and the second face is unrecognisable as the first.** When it
+  **Its second face is the reason it took four cycles to fix, and is worth keeping in mind for
+  the next flake.** When it
   fires under the CLI it makes `run_suite` return `Err`, the command renders a *refusal*, a refusal
   renders as JSON too, and a refusal document's `sut` is the bare choice. So
   `cli::roots_rescue_independently_of_the_veto_and_each_layer_is_named` fails with

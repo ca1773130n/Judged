@@ -146,10 +146,7 @@ fn load_runs(paths: &[PathBuf]) -> Result<Vec<LoadedRun>> {
             path: path.clone(),
             source,
         })?;
-        let log: SarifLog = serde_json::from_str(&text).map_err(|source| Error::Json {
-            context: path.display().to_string(),
-            source,
-        })?;
+        let log: SarifLog = crate::sarif_input::read(&text, &path.display().to_string())?;
         for (index, run) in log.runs.into_iter().enumerate() {
             loaded.push(LoadedRun {
                 label: format!("{} run {index} (tool `{}`)", path.display(), run.tool.name),

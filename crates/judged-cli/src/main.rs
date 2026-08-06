@@ -26,6 +26,7 @@ mod explain_cmd;
 mod mutants_cmd;
 mod ratchet_cmd;
 mod roots_cmd;
+mod sarif_input;
 
 use std::io::Write;
 

@@ -274,7 +274,7 @@ pub fn run_suite_with(
 
         // Explicit rather than relying on drop, which discards the error. A
         // leaked tree per mutant is nineteen per run.
-        close_repo(repo)?;
+        close_repo(repo, sut.name(), mutant.id())?;
     }
 
     let false_removal_count = reports.iter().map(|r| r.false_removals.len()).sum();
@@ -308,15 +308,43 @@ pub fn run_suite_with(
 /// tree per mutant is nineteen per run. Swallowing `DirectoryNotEmpty` would
 /// give that up to fix a race. Retrying keeps both: the race resolves, and an
 /// error that persists past every attempt is still returned.
-fn close_repo(repo: tempfile::TempDir) -> Result<()> {
+///
+/// # `NotFound` is the suite catching what it exists to catch
+///
+/// Widening the retry to treat an absent tree as success would be the same
+/// mistake in a costlier place. This function is called once, immediately after
+/// grading, on a directory this process created and only the fixture wrote to.
+/// Nothing legitimately removes it in between: [`Sut::run`](crate::sut::Sut::run)
+/// is read-only by contract (§9.2 — adapters read, the orchestrator owns 100% of
+/// mutations), and `TempDir`'s own `Drop` has not run yet because `repo` is still
+/// alive here.
+///
+/// So a missing root means the system under test deleted the repository it was
+/// handed. That is the single most serious thing this suite can observe, and it
+/// is observable *only* here — grading reads the claims the SUT returned, not the
+/// filesystem, so a cleaner that ran `rm -rf` on the fixture would otherwise
+/// score exactly like one that touched nothing.
+fn close_repo(repo: tempfile::TempDir, sut_name: &str, mutant_id: &str) -> Result<()> {
     const ATTEMPTS: usize = 5;
     let path = repo.path().to_path_buf();
 
     for attempt in 1..=ATTEMPTS {
         match std::fs::remove_dir_all(&path) {
-            // Already gone is success, not an error to report.
             Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::Sut {
+                    sut: sut_name.to_string(),
+                    message: format!(
+                        "mutant {mutant_id}'s repository at {} is gone before the suite removed \
+                         it, so the system under test deleted the tree it was handed. §9.2 makes \
+                         an adapter read-only and gives the orchestrator 100% of mutations; \
+                         grading reads returned claims rather than the filesystem, so a run that \
+                         destroyed its fixture scores like one that touched nothing unless this \
+                         is refused",
+                        path.display()
+                    ),
+                })
+            }
             Err(error)
                 if error.kind() == std::io::ErrorKind::DirectoryNotEmpty && attempt < ATTEMPTS =>
             {
@@ -504,4 +532,44 @@ fn normalize(path: &Path, repo_root: &Path) -> String {
         .map(|c| c.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ordinary path: a tree that is there is removed, and its removal is
+    /// reported as having happened.
+    #[test]
+    fn a_present_tree_is_removed() {
+        let repo = tempfile::tempdir().expect("a temporary directory");
+        let path = repo.path().to_path_buf();
+        std::fs::create_dir_all(path.join(".git/objects")).expect("a tree to remove");
+
+        close_repo(repo, "naive", "m01").expect("a present tree closes cleanly");
+        assert!(!path.exists(), "the throwaway repository must not survive");
+    }
+
+    /// The whole reason this is not `Ok`: grading reads the claims a SUT
+    /// returned, never the filesystem, so a cleaner that deleted its fixture
+    /// scores identically to one that touched nothing. This is the only place
+    /// the suite can notice.
+    #[test]
+    fn a_tree_the_sut_deleted_is_refused_rather_than_reported_as_closed() {
+        let repo = tempfile::tempdir().expect("a temporary directory");
+        let path = repo.path().to_path_buf();
+        std::fs::remove_dir_all(&path).expect("stand in for a destructive SUT");
+
+        match close_repo(repo, "naive", "m01") {
+            Err(Error::Sut { sut, message }) => {
+                assert_eq!(sut, "naive");
+                assert!(message.contains("m01"), "{message}");
+                assert!(
+                    message.contains("deleted the tree it was handed"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a refusal naming the SUT, got {other:?}"),
+        }
+    }
 }

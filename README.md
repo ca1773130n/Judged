@@ -90,10 +90,28 @@ documented failure mode of every tool in this shape.
 | 1 | New findings, or baseline rot. |
 | 2 | Refused to judge: unreadable log, failed run, no git repository, refused flag. |
 
-The `--sarif` input is the SARIF 2.1.0 *subset* modelled in
-`judged_core::sarif`, with `tool.driver`, `artifact.location.uri` and
-`result.message.text` already flattened. Adapters that produce it from raw ruff
-or knip output do not exist yet; the contract they will be held to does.
+The `--sarif` input is read in either shape. Wire SARIF 2.1.0 — what ruff,
+vulture or knip actually writes, with `tool.driver`, `artifact.location.uri` and
+`result.message.text` nested — is mapped down onto the *subset* modelled in
+`judged_core::sarif`, which is the same document with those leaves flattened.
+The two are told apart structurally, by whether `tool` carries a `driver`.
+
+Mapping is all that happens, and the refusals are the point. A missing
+`executionSuccessful` is never inferred from an exit code, because §9.2 quotes
+the spec's own warning that exit codes do not mean what a reader expects; a
+missing `analysisTarget` set is never inferred from the paths the findings
+happen to mention, because that set *is* the positive control and deriving it
+from results would make a tool that opened one file look like one that opened
+everything it accused. A log declaring neither is therefore degraded rather than
+healthy — which is the correct reading of knip, whose SARIF reporter emits no
+`invocations` and no `artifacts` at all. A location with no resolvable path is
+refused rather than dropped, an absolute URI is refused because a baseline keyed
+on one machine's checkout is born rotten, and a suppression with no `status` is
+refused because SARIF defaults that to `accepted` and §5.3 does not.
+
+Where SARIF defines a resolution chain, it is followed rather than second-
+guessed: `result.level` falls back to the rule's `defaultConfiguration.level`
+and then to `warning`, and `ruleIndex` resolves against `tool.driver.rules`.
 
 ### `judged mutants` — inject known-live artifacts and see what gets called dead
 

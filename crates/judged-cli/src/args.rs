@@ -463,6 +463,15 @@ USAGE:
 
 RATCHET (§9.14) — baseline today's findings, fail CI only on new ones.
     --sarif <path>             A SARIF 2.1.0 log to judge. Repeatable, required.
+                               Read in either shape: the wire nesting an analyzer
+                               emits (`tool.driver.name`, `result.message.text`),
+                               or the flattened subset `judged_core::sarif`
+                               models. Mapping down from the wire is all that
+                               happens — a missing `executionSuccessful` is never
+                               inferred from an exit code and a missing
+                               `analysisTarget` set is never inferred from the
+                               paths findings mention (§9.2, §6.20), so a log
+                               that declares neither is degraded, not healthy.
     --baseline <path>          Committed baseline. Default: .judged/baseline.jsonl
     --update                   Rewrite the baseline from this run. Default is CHECK.
     --expected-targets <n>     Files the analyzer should have scanned (§9.2

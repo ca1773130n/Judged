@@ -41,23 +41,29 @@
 //!   accused. A log with no `artifacts` array therefore declares no scanned
 //!   universe and assesses as degraded, which is the correct reading of a tool
 //!   that did the work and then declined to say what it looked at.
-//! - A path is never recovered from prose. A location the log spells without a
-//!   `physicalLocation.artifactLocation.uri` is refused rather than dropped:
-//!   silently discarding it would turn a finding about a file into a finding
-//!   about the repository.
-//! - An absolute URI is refused. The baseline is committed and diffed by humans
-//!   (§9.4), and an entry keyed on `/Users/someone/checkout/src/lib.rs` matches
-//!   nothing on any other machine — it is born rotten.
+//! - A path is never recovered from prose. A location the log spells with
+//!   neither a `physicalLocation.artifactLocation.uri` nor an `index` into
+//!   `run.artifacts` is refused rather than dropped: silently discarding it
+//!   would turn a finding about a file into a finding about the repository.
+//! - An absolute URI is refused, in every spelling SARIF carries — POSIX,
+//!   scheme, UNC share and drive letter alike. The baseline is committed and
+//!   diffed by humans (§9.4), and an entry keyed on
+//!   `/Users/someone/checkout/src/lib.rs` or `C:\work\src\lib.rs` matches
+//!   nothing on any other machine; it is born rotten. This reader does not get
+//!   to assume it runs on the machine that wrote the log, and
+//!   `judged_core::fingerprint` already draws the same line for the same
+//!   reason.
 //! - A suppression with no `status` is refused. SARIF defaults that field to
 //!   `accepted`; §5.3 does not, because a suppression nobody reviewed is not
 //!   amnesty, and reading one as amnesty is the direction that loses code.
 //!
 //! Where the specification defines a resolution chain, this follows it, because
-//! *not* following it is its own kind of inference. `result.level` falls back to
-//! the rule's `defaultConfiguration.level` and then to `warning`, and
-//! `ruleIndex` resolves against `tool.driver.rules` — both are what the format
-//! says the bytes mean, and reading them any other way would silently restate
-//! the analyzer's severities.
+//! *not* following it is its own kind of inference — and because refusing a log
+//! that stated something perfectly clearly, in a spelling this reader declined
+//! to learn, turns a healthy run into no run. `result.level` falls back to the
+//! rule's `defaultConfiguration.level` and then to `warning`, `ruleIndex`
+//! resolves against `tool.driver.rules`, and `artifactLocation.index` resolves
+//! against `run.artifacts`. All three are what the format says the bytes mean.
 //!
 //! Violations are [`Error::Sarif`], never [`Error::Json`]. The distinction is
 //! the one `error.rs` already draws: malformed JSON is a broken document, a
@@ -123,6 +129,10 @@ fn wire_run(run: &Value, at: &str) -> Result<Run> {
         .ok_or_else(|| violation(&format!("{at}.tool"), "has no `driver` object"))?;
     let rules = wire_rules(driver, &format!("{at}.tool.driver"))?;
 
+    // Mapped before the results, because a `physicalLocation` may name its file
+    // by index into this table rather than by URI.
+    let artifacts: Vec<Artifact> = mapped(run, "artifacts", at, wire_artifact)?;
+
     Ok(Run {
         tool: Tool {
             name: required_str(driver, "name", &format!("{at}.tool.driver"))?.to_string(),
@@ -130,18 +140,17 @@ fn wire_run(run: &Value, at: &str) -> Result<Run> {
                 .map(str::to_string),
         },
         invocations: mapped(run, "invocations", at, wire_invocation)?,
-        artifacts: mapped(run, "artifacts", at, wire_artifact)?,
         results: mapped(run, "results", at, |result, at| {
-            wire_result(result, at, &rules)
+            wire_result(result, at, &rules, &artifacts)
         })?,
-        // `run.automationDetails.guid` is what a baseline state is relative to.
-        // Absent when the run was not diffed against anything, which is the
-        // normal case for a tool judged puts a ratchet in front of.
-        baseline_guid: match run.get("automationDetails") {
-            None | Some(Value::Null) => None,
-            Some(details) => optional_str(details, "guid", &format!("{at}.automationDetails"))?
-                .map(str::to_string),
-        },
+        // `run.baselineGuid` — the baseline a `result.baselineState` is relative
+        // to, which is what the projection's field means. Deliberately *not*
+        // `run.automationDetails.guid`: that identifies this run, and reading it
+        // here would file every finding against an identifier that names the
+        // wrong thing. Absent when the run was not diffed against anything,
+        // which is the normal case for a tool judged puts a ratchet in front of.
+        baseline_guid: optional_str(run, "baselineGuid", at)?.map(str::to_string),
+        artifacts,
     })
 }
 
@@ -244,7 +253,12 @@ fn wire_rules(driver: &Value, at: &str) -> Result<Rules> {
         .map(Rules)
 }
 
-fn wire_result(result: &Value, at: &str, rules: &Rules) -> Result<SarifResult> {
+fn wire_result(
+    result: &Value,
+    at: &str,
+    rules: &Rules,
+    artifacts: &[Artifact],
+) -> Result<SarifResult> {
     let by_index = match result.get("ruleIndex") {
         None | Some(Value::Null) => None,
         Some(value) => {
@@ -283,7 +297,9 @@ fn wire_result(result: &Value, at: &str, rules: &Rules) -> Result<SarifResult> {
         rule_id,
         level,
         message: message_text(result, at)?,
-        locations: mapped(result, "locations", at, wire_location)?,
+        locations: mapped(result, "locations", at, |location, at| {
+            wire_location(location, at, artifacts)
+        })?,
         partial_fingerprints: wire_fingerprints(result, at)?,
         baseline_state: match result.get("baselineState") {
             None | Some(Value::Null) => None,
@@ -293,21 +309,34 @@ fn wire_result(result: &Value, at: &str, rules: &Rules) -> Result<SarifResult> {
     })
 }
 
-fn wire_location(location: &Value, at: &str) -> Result<Location> {
-    let uri = location
-        .pointer("/physicalLocation/artifactLocation/uri")
-        .ok_or_else(|| {
-            violation(
-                at,
-                "has no `physicalLocation.artifactLocation.uri`. A location this reader cannot \
-                 resolve to a path is refused rather than dropped: a discarded location turns a \
-                 finding about a file into a finding about the repository",
-            )
-        })?;
+fn wire_location(location: &Value, at: &str, artifacts: &[Artifact]) -> Result<Location> {
+    let at_location = format!("{at}.physicalLocation.artifactLocation");
+    let artifact_location = location.pointer("/physicalLocation/artifactLocation");
+
+    // A conforming log may spell the file either way: inline as `uri`, or as an
+    // `index` into `run.artifacts`, which is how a tool avoids repeating a long
+    // path on every finding. Refusing the indexed form would reject logs that
+    // are perfectly explicit about the path — turning a healthy run into no run,
+    // which §6.20 names as the failure that ends in mass deletion. `uri` wins
+    // when a log carries both.
+    let uri = match artifact_location.and_then(|location| location.get("uri")) {
+        Some(uri) => repo_relative_uri(uri, &at_location)?.to_string(),
+        None => match artifact_location.and_then(|location| location.get("index")) {
+            Some(index) => artifact_by_index(index, &at_location, artifacts)?,
+            None => {
+                return Err(violation(
+                    at,
+                    "has no `physicalLocation.artifactLocation.uri` and no `index` into \
+                     `run.artifacts`. A location this reader cannot resolve to a path is refused \
+                     rather than dropped: a discarded location turns a finding about a file into a \
+                     finding about the repository",
+                ))
+            }
+        },
+    };
 
     Ok(Location {
-        uri: repo_relative_uri(uri, &format!("{at}.physicalLocation.artifactLocation"))?
-            .to_string(),
+        uri,
         // Display only. §9.2: fingerprints are content-derived and never
         // line-based, or every reformat resets the stability clock.
         start_line: match location.pointer("/physicalLocation/region/startLine") {
@@ -320,6 +349,35 @@ fn wire_location(location: &Value, at: &str) -> Result<Location> {
             ),
         },
     })
+}
+
+/// Resolve `artifactLocation.index` against the run's artifact table.
+///
+/// An index naming nothing is refused rather than dropped, for the same reason a
+/// missing URI is: the log stated which file it meant and this reader could not
+/// follow it, which is not the same as a finding about no file in particular.
+fn artifact_by_index(index: &Value, at: &str, artifacts: &[Artifact]) -> Result<String> {
+    let index = index
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| violation(at, "`index` is not a non-negative integer"))?;
+
+    artifacts
+        .get(index)
+        .map(|artifact| artifact.location_uri.clone())
+        .ok_or_else(|| {
+            violation(
+                at,
+                &format!(
+                    "`index` {index} does not name an entry in `run.artifacts`, which holds {}",
+                    match artifacts.len() {
+                        0 => "nothing — the run declared no artifacts at all".to_string(),
+                        1 => "one entry".to_string(),
+                        count => format!("{count} entries"),
+                    }
+                ),
+            )
+        })
 }
 
 fn wire_fingerprints(result: &Value, at: &str) -> Result<BTreeMap<String, String>> {
@@ -440,7 +498,7 @@ fn repo_relative_uri<'a>(value: &'a Value, at: &str) -> Result<&'a str> {
         .as_str()
         .ok_or_else(|| violation(at, "`uri` is not a string"))?;
 
-    if uri.starts_with('/') || uri.contains("://") {
+    if is_absolute(uri) {
         return Err(violation(
             at,
             &format!(
@@ -451,6 +509,38 @@ fn repo_relative_uri<'a>(value: &'a Value, at: &str) -> Result<&'a str> {
         ));
     }
     Ok(uri)
+}
+
+/// Rooted outside the repository, in any of the spellings SARIF actually
+/// carries.
+///
+/// The Windows forms are not hypothetical, and this reader does not get to
+/// assume it runs on the machine that produced the log: SARIF is a
+/// cross-platform interchange format, so a log written on Windows is routinely
+/// judged on Linux. `judged_core::fingerprint` already draws exactly this
+/// distinction for the same reason — a drive-lettered path is as
+/// checkout-specific as a POSIX one — and the two must not disagree about what
+/// counts as absolute.
+fn is_absolute(uri: &str) -> bool {
+    let bytes = uri.as_bytes();
+
+    // POSIX root, a UNC share (`\\server\share`), and a Windows root-relative
+    // path (`\repo\src`).
+    if bytes
+        .first()
+        .is_some_and(|byte| matches!(byte, b'/' | b'\\'))
+    {
+        return true;
+    }
+    // A scheme: `file:///home/...`, `https://...`.
+    if uri.contains("://") {
+        return true;
+    }
+    // A drive letter: `C:\repo\src` or `C:/repo/src`.
+    bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
 }
 
 // ---------------------------------------------------------------------------
@@ -693,13 +783,91 @@ mod tests {
     }
 
     #[test]
-    fn an_absolute_uri_is_refused() {
+    fn an_absolute_uri_is_refused_in_every_spelling() {
+        // A log written on Windows is routinely judged on Linux, so this check
+        // cannot assume the running machine's separator.
+        // `judged_core::fingerprint` draws the same line; they must not
+        // disagree about what counts as checkout-specific.
+        for absolute in [
+            "/Users/someone/checkout/app/dead.py",
+            "file:///Users/someone/checkout/app/dead.py",
+            r"C:\work\app\dead.py",
+            "C:/work/app/dead.py",
+            r"\\build-server\share\app\dead.py",
+            r"\work\app\dead.py",
+        ] {
+            let message = refusal(&wire_with(|value| {
+                value["runs"][0]["results"][0]["locations"][0]["physicalLocation"]
+                    ["artifactLocation"]["uri"] = serde_json::json!(absolute);
+            }));
+            assert!(message.contains("absolute"), "{absolute}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_relative_uri_that_merely_looks_windowsy_is_kept() {
+        // The drive-letter check must not eat a real repo-relative path: a
+        // colon is a legal character in a POSIX filename, and one letter before
+        // the separator is what makes a drive letter a drive letter.
+        for relative in ["app/dead.py", "go:generate/main.go", "ab:/c.py"] {
+            let log = read(
+                &wire_with(|value| {
+                    value["runs"][0]["results"][0]["locations"][0]["physicalLocation"]
+                        ["artifactLocation"]["uri"] = serde_json::json!(relative);
+                }),
+                "log.sarif",
+            )
+            .unwrap_or_else(|error| panic!("{relative} should be readable: {error}"));
+            assert_eq!(log.runs[0].results[0].locations[0].uri, relative);
+        }
+    }
+
+    #[test]
+    fn a_location_named_by_artifact_index_resolves_rather_than_refusing() {
+        // The indexed form is how a tool avoids repeating a long path on every
+        // finding. It states the file exactly; refusing it would turn a healthy
+        // run into no run (§6.20).
+        let log = read(
+            &wire_with(|value| {
+                value["runs"][0]["results"][0]["locations"][0]["physicalLocation"]
+                    ["artifactLocation"] = serde_json::json!({ "index": 0 });
+            }),
+            "log.sarif",
+        )
+        .expect("an indexed location is readable");
+        assert_eq!(log.runs[0].results[0].locations[0].uri, "app/dead.py");
+    }
+
+    #[test]
+    fn an_artifact_index_naming_nothing_is_refused() {
         let message = refusal(&wire_with(|value| {
             value["runs"][0]["results"][0]["locations"][0]["physicalLocation"]
-                ["artifactLocation"]["uri"] =
-                serde_json::json!("/Users/someone/checkout/app/dead.py");
+                ["artifactLocation"] = serde_json::json!({ "index": 7 });
         }));
-        assert!(message.contains("absolute"), "{message}");
+        assert!(message.contains("does not name an entry"), "{message}");
+    }
+
+    #[test]
+    fn the_baseline_guid_is_the_baseline_not_this_run() {
+        // `automationDetails.guid` identifies the run; `baselineGuid` identifies
+        // what `baselineState` is relative to. Reading the first as the second
+        // files every finding against an identifier that names the wrong thing.
+        let log = read(
+            &wire_with(|value| {
+                let run = value["runs"][0].as_object_mut().expect("run is an object");
+                run.insert(
+                    "automationDetails".to_string(),
+                    serde_json::json!({ "guid": "this-run" }),
+                );
+                run.insert(
+                    "baselineGuid".to_string(),
+                    serde_json::json!("the-baseline"),
+                );
+            }),
+            "log.sarif",
+        )
+        .expect("readable");
+        assert_eq!(log.runs[0].baseline_guid.as_deref(), Some("the-baseline"));
     }
 
     #[test]

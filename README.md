@@ -523,6 +523,18 @@ them. That is not a style preference. Hand-written subsets shipped first, and a
 parser for a *subset* of a format is a list of valid files you reject: measured
 out of sample, they emptied the Tier A root set of 7 of 9 real repositories.
 
+**Unix only, and the build says so.** `judged-core` fails to compile on a
+non-Unix target, with a message explaining why. The boundary gates read the
+filesystem in raw bytes rather than through `Path` components — component
+iteration normalizes away the very hazards they detect — and that reasoning is
+POSIX throughout: Gate 0a treats `/` as the separator and `\` as an ordinary
+filename character, which is exactly right on Unix and exactly wrong on Windows.
+A library is not confined to the platform its CI runs on, and this one's CI is
+`ubuntu-latest` and nothing else, so a consumer could otherwise build a symlink
+gate that inspects the target while believing it inspected the link. Supporting
+Windows means Windows CI plus prefix-preserving separator handling — `C:\` is a
+root, `C:` is a drive-relative path — not a wider byte comparison.
+
 `judged_core::git::RecoverabilityClass` is worth reading before anything else.
 Git protects the object database, not the working tree: a file that was never
 `git add`-ed leaves nothing behind when you delete it. The highest-volume
